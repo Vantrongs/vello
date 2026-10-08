@@ -398,14 +398,15 @@ impl BufferSizes {
         // The following buffer sizes have been hand picked to accommodate the vello test scenes as
         // well as paris-30k. These should instead get derived from the scene layout using
         // reasonable heuristics.
-        let bin_data = BufferSize::new(1 << 18);
-        let tiles = BufferSize::new(1 << 21);
-        let lines = BufferSize::new(1 << 21);
-        let seg_counts = BufferSize::new(1 << 21);
-        let segments = BufferSize::new(1 << 21);
+        // pdf-splitter: sized for a 300k-path A0 drawing, as these cannot grow at run time.
+        let bin_data = BufferSize::new(1 << 21);
+        let tiles = BufferSize::new(1 << 22);
+        let lines = BufferSize::new(1 << 22);
+        let seg_counts = BufferSize::new(1 << 22);
+        let segments = BufferSize::new(1 << 22);
         // 16 * 16 (1 << 8) is one blend spill, so this allows for 4096 spills.
         let blend_spill = BufferSize::new(1 << 20);
-        let ptcl = BufferSize::new(1 << 23);
+        let ptcl = BufferSize::new(1 << 24);
         Self {
             path_reduced,
             path_reduced2,
