@@ -302,7 +302,16 @@ impl MultiThreadedDispatcher {
 
     fn record_finished_commands(&mut self, abort_empty: bool) {
         loop {
-            match self.recorded_command_receiver.as_mut().unwrap().try_recv() {
+            let receiver = self.recorded_command_receiver.as_mut().unwrap();
+            // While flushing, block until the next task in order arrives (or every worker
+            // has dropped its sender) instead of spinning on `try_recv`: a spinning main
+            // thread takes the CPU from the workers it waits for when cores are scarce.
+            let next = if abort_empty {
+                receiver.try_recv()
+            } else {
+                receiver.recv().map_err(|_| TryRecvError::Disconnected)
+            };
+            match next {
                 Ok(mut task) => {
                     let num_tasks = task.allocation_group.recorded_commands.len();
                     for cmd in task.allocation_group.recorded_commands.drain(0..num_tasks) {
@@ -372,14 +381,8 @@ impl MultiThreadedDispatcher {
                     // Put the allocation group back so it can be reused in future iterations!
                     self.allocations.put(task.allocation_group);
                 }
-                Err(e) => match e {
-                    TryRecvError::Empty => {
-                        if abort_empty {
-                            return;
-                        }
-                    }
-                    TryRecvError::Disconnected => return,
-                },
+                // `Empty` only comes from `try_recv`, outside of flushing.
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
         }
     }
