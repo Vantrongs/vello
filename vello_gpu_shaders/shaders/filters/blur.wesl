@@ -3,8 +3,7 @@
 
 //! Gaussian blur filter passes.
 
-// TODO: Add support for edge modes when blurring. This makes it harder or impossible to use
-// bilinear sampling because image padding is always transparent, so only add it when needed.
+import package::filters::sample::{get_edge_mode, sample_linear};
 
 const BLUR_HORIZONTAL: vec2<f32> = vec2<f32>(1.0, 0.0);
 const BLUR_VERTICAL: vec2<f32> = vec2<f32>(0.0, 1.0);
@@ -37,40 +36,36 @@ fn gaussian_blur(
     source_texture: texture_2d<f32>,
     linear_sampler: sampler,
     source_origin: vec2<u32>,
+    source_size: vec2<u32>,
     source_rel: vec2<f32>,
     direction: vec2<f32>,
     texel0: vec4<u32>,
     texel1: vec4<u32>,
 ) -> vec4<f32> {
-    let source_texel = vec2<f32>(source_origin) + source_rel;
-    let source_texture_size = vec2<f32>(textureDimensions(source_texture));
+    let edge_mode = get_edge_mode(texel0);
     let n_linear_taps = get_n_linear_taps(texel0);
     let center_weight = get_center_weight(texel0);
 
-    var color = textureSampleLevel(
-        source_texture,
-        linear_sampler,
-        (source_texel + 0.5) / source_texture_size,
-        0.0,
-    ) * center_weight;
+    var color = sample_linear(source_texture, linear_sampler, source_origin,
+        source_size, source_rel, vec2(0.0), edge_mode) * center_weight;
 
     let linear_weights = get_linear_weights(texel0, texel1);
     let linear_offsets = get_linear_offsets(texel1);
 
     if n_linear_taps > 0u {
         let distance = direction * linear_offsets.x;
-        color += textureSampleLevel(source_texture, linear_sampler, (source_texel + distance + 0.5) / source_texture_size, 0.0) * linear_weights.x;
-        color += textureSampleLevel(source_texture, linear_sampler, (source_texel - distance + 0.5) / source_texture_size, 0.0) * linear_weights.x;
+        color += sample_linear(source_texture, linear_sampler, source_origin, source_size, source_rel, distance, edge_mode) * linear_weights.x;
+        color += sample_linear(source_texture, linear_sampler, source_origin, source_size, source_rel, -distance, edge_mode) * linear_weights.x;
     }
     if n_linear_taps > 1u {
         let distance = direction * linear_offsets.y;
-        color += textureSampleLevel(source_texture, linear_sampler, (source_texel + distance + 0.5) / source_texture_size, 0.0) * linear_weights.y;
-        color += textureSampleLevel(source_texture, linear_sampler, (source_texel - distance + 0.5) / source_texture_size, 0.0) * linear_weights.y;
+        color += sample_linear(source_texture, linear_sampler, source_origin, source_size, source_rel, distance, edge_mode) * linear_weights.y;
+        color += sample_linear(source_texture, linear_sampler, source_origin, source_size, source_rel, -distance, edge_mode) * linear_weights.y;
     }
     if n_linear_taps > 2u {
         let distance = direction * linear_offsets.z;
-        color += textureSampleLevel(source_texture, linear_sampler, (source_texel + distance + 0.5) / source_texture_size, 0.0) * linear_weights.z;
-        color += textureSampleLevel(source_texture, linear_sampler, (source_texel - distance + 0.5) / source_texture_size, 0.0) * linear_weights.z;
+        color += sample_linear(source_texture, linear_sampler, source_origin, source_size, source_rel, distance, edge_mode) * linear_weights.z;
+        color += sample_linear(source_texture, linear_sampler, source_origin, source_size, source_rel, -distance, edge_mode) * linear_weights.z;
     }
 
     return color;

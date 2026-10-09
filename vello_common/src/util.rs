@@ -3,7 +3,7 @@
 
 //! Utility functions.
 
-use crate::geometry::RectU16;
+use crate::geometry::{RectU16, RectU32};
 use crate::math::{FloatExt, snap_up};
 use crate::strip::{Strip, visit_strip_fill_segments};
 use crate::tile::Tile;
@@ -195,8 +195,8 @@ pub fn extract_scales(transform: &Affine) -> (f32, f32) {
 
 /// Extension methods for rectangles.
 pub trait RectExt {
-    /// Cover the rect with whole tiles. Integer rectangles are intersected with
-    /// the physical `u16` domain, so their last tile can remain partial.
+    /// Cover the rect with whole tiles. Physical `RectU16` bounds retain a partial
+    /// final tile; source `RectU32` bounds reject unrepresentable endpoints.
     fn snap_to_tile_coordinates(self) -> Self;
 }
 
@@ -220,6 +220,13 @@ impl RectExt for Rect {
 }
 
 impl RectExt for RectU16 {
+    #[inline]
+    fn snap_to_tile_coordinates(self) -> Self {
+        Self::from_tile_bounds(self.to_tile_bounds())
+    }
+}
+
+impl RectExt for RectU32 {
     #[inline]
     fn snap_to_tile_coordinates(self) -> Self {
         Self::from_tile_bounds(self.to_tile_bounds())
@@ -385,21 +392,20 @@ impl<T> IndexMut<usize> for RetainVec<T> {
     }
 }
 
-/// Calculate the strips' physical bounding box, intersected with the `u16`
-/// coordinate domain. Its exclusive edge can cut the final tile short.
-pub fn strip_bbox(strips: &[Strip]) -> Option<RectU16> {
+/// Calculate the strips' bounding box in the source coordinate domain.
+pub fn strip_bbox(strips: &[Strip]) -> Option<RectU32> {
     // Fill and alpha fill segments internally store their coordinates in tile units,
     // in order to avoid multiplications in every invocation of the closure we calculate
     // the bbox in tile units first and then convert back to pixel units.
-    let mut tile_bbox = RectU16::INVERTED;
+    let mut tile_bbox = RectU32::INVERTED;
 
     visit_strip_fill_segments(
         strips,
-        RectU16::new(
+        RectU32::new(
             0,
             0,
-            u16::MAX.div_ceil(Tile::WIDTH),
-            u16::MAX.div_ceil(Tile::HEIGHT),
+            u32::MAX.div_ceil(Tile::WIDTH_U32),
+            u32::MAX.div_ceil(Tile::HEIGHT_U32),
         ),
         &mut tile_bbox,
         |bbox, segment| bbox.union(segment.fill.tile_rect()),
@@ -410,7 +416,7 @@ pub fn strip_bbox(strips: &[Strip]) -> Option<RectU16> {
     if tile_bbox.is_empty() {
         None
     } else {
-        Some(RectU16::from_tile_bounds(tile_bbox))
+        Some(RectU32::from_tile_bounds(tile_bbox))
     }
 }
 
@@ -546,14 +552,14 @@ pub(crate) mod unpremultiply {
 
 #[cfg(test)]
 mod tests {
-    use super::RectU16;
     use super::{RectExt, into_fast_path_rect, strip_bbox};
+    use super::{RectU16, RectU32};
     use crate::strip::Strip;
     use crate::tile::Tile;
     use peniko::kurbo::{Affine, Rect};
 
-    fn sentinel(y: u16, alpha_idx: u32) -> Strip {
-        Strip::new(u16::MAX, y, alpha_idx, false)
+    fn sentinel(y: u32, alpha_idx: u32) -> Strip {
+        Strip::new(u32::MAX, y, alpha_idx, false)
     }
 
     #[test]
@@ -616,7 +622,7 @@ mod tests {
             sentinel(4, u32::from(Tile::HEIGHT) * 4),
         ];
 
-        assert_eq!(strip_bbox(&strips), Some(RectU16::new(8, 4, 12, 8)));
+        assert_eq!(strip_bbox(&strips), Some(RectU32::new(8, 4, 12, 8)));
     }
 
     #[test]
@@ -627,7 +633,7 @@ mod tests {
             sentinel(0, u32::from(Tile::HEIGHT) * 8),
         ];
 
-        assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 24, 4)));
+        assert_eq!(strip_bbox(&strips), Some(RectU32::new(4, 0, 24, 4)));
     }
 
     #[test]
@@ -638,7 +644,7 @@ mod tests {
             sentinel(0, u32::from(Tile::HEIGHT) * 4),
         ];
 
-        assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 32, 4)));
+        assert_eq!(strip_bbox(&strips), Some(RectU32::new(4, 0, 32, 4)));
     }
 
     #[test]
@@ -649,6 +655,6 @@ mod tests {
             sentinel(8, u32::from(Tile::HEIGHT) * 8),
         ];
 
-        assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 16, 12)));
+        assert_eq!(strip_bbox(&strips), Some(RectU32::new(4, 0, 16, 12)));
     }
 }

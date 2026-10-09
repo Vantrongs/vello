@@ -3,7 +3,7 @@
 
 use crate::peniko::BlendMode;
 use core::ops::Range;
-use vello_common::geometry::RectU16;
+use vello_common::geometry::RectU32;
 use vello_common::mask::Mask;
 use vello_common::paint::Paint;
 use vello_common::record::Drawable;
@@ -38,7 +38,7 @@ impl RecordedFill {
 }
 
 impl Drawable for RecordedFill {
-    fn bbox(&self, strips: &[Strip]) -> Option<RectU16> {
+    fn bbox(&self, strips: &[Strip]) -> Option<RectU32> {
         strip_bbox(strips)
     }
 

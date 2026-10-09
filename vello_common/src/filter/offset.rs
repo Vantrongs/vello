@@ -17,6 +17,22 @@ pub struct Offset {
 impl Offset {
     /// Create a new offset filter.
     pub fn new(dx: f32, dy: f32) -> Self {
+        super::validate_offset(dx, dy);
         Self { dx, dy }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Offset;
+
+    #[test]
+    fn nonfinite_offsets_are_rejected() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(std::panic::catch_unwind(|| Offset::new(value, 0.0)).is_err());
+            assert!(std::panic::catch_unwind(|| Offset::new(0.0, value)).is_err());
+        }
+        let offset = Offset::new(-70000.5, 70000.5);
+        assert_eq!((offset.dx, offset.dy), (-70000.5, 70000.5));
     }
 }

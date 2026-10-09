@@ -33,7 +33,7 @@
 //! intermediate representation.
 
 use crate::filter::{FilterData, FilterLayerPlacement};
-use crate::geometry::{RectU16, SizeU16};
+use crate::geometry::{RectU32, SizeU32};
 use crate::mask::Mask;
 use crate::peniko::BlendMode;
 use crate::strip::Strip;
@@ -43,9 +43,9 @@ use smallvec::SmallVec;
 
 /// A drawable object that can report its bounding box.
 pub trait Drawable {
-    /// Return the physical tile-covering bounding box of the given object, if it
+    /// Return the source tile-covering bounding box of the given object, if it
     /// has one.
-    fn bbox(&self, strips: &[Strip]) -> Option<RectU16>;
+    fn bbox(&self, strips: &[Strip]) -> Option<RectU32>;
 
     /// Return the blend mode applied directly by this draw, if any.
     fn blend_mode(&self) -> Option<&BlendMode>;
@@ -78,7 +78,10 @@ pub struct RecordedLayer {
     pub kind: RecordedLayerKind,
     /// Nesting depth of the layer.
     pub depth: usize,
-    /// Tile-aligned bounding box of the layer.
+    /// Cumulative translation from root scene coordinates into this layer's contents.
+    /// Masks remain anchored to the physical root scene, independently of filter viewports.
+    pub source_shift: (u32, u32),
+    /// Bounding box of the layer in its parent's source coordinates.
     ///
     /// **IMPORTANT**: This field only indicates the bounding box of visible contents directly
     /// in this layer. It does not mean that any child layer is also strictly contained within
@@ -95,7 +98,7 @@ pub struct RecordedLayer {
     /// This is a completely valid constellation. L1 needs to be rendered at its full resolution,
     /// but since the parent layer has a clip path, we can constrain it's visible region. However,
     /// the child layer must remain unaffected by this.
-    pub bbox: RectU16,
+    pub bbox: RectU32,
 }
 
 /// Properties for a recorded layer.
@@ -119,7 +122,7 @@ pub struct LayerClip {
     /// Index of the thread-local strip storage containing the strips.
     pub thread_idx: u8,
     /// Tile-aligned bounds of the clip path.
-    pub bbox: RectU16,
+    pub bbox: RectU32,
 }
 
 /// Additional metadata for regular and filter layers.
@@ -144,8 +147,9 @@ impl RecordedLayer {
             nodes: SmallVec::new(),
             kind: RecordedLayerKind::Regular,
             depth,
+            source_shift: (0, 0),
             // Will be initialized once we call `pop_layer`.
-            bbox: RectU16::ZERO,
+            bbox: RectU32::ZERO,
         }
     }
 
@@ -159,8 +163,9 @@ impl RecordedLayer {
                 placement: FilterLayerPlacement::EMPTY,
             },
             depth,
+            source_shift: (0, 0),
             // Will be initialized once we call `pop_layer`.
-            bbox: RectU16::ZERO,
+            bbox: RectU32::ZERO,
         }
     }
 }
@@ -170,7 +175,7 @@ impl RecordedLayer {
 #[derive(Debug)]
 pub struct CommandRecorder<D> {
     /// Actual physical dimensions of the root scene.
-    pub scene_size: SizeU16,
+    pub scene_size: SizeU32,
     /// The nodes of the root layer.
     pub nodes: Vec<Node>,
     /// Flat storage for all draw commands that are part of the recording.
@@ -184,9 +189,9 @@ pub struct CommandRecorder<D> {
     /// Maximum layer depth across the whole layer graph.
     pub max_layer_depth: usize,
     /// The largest dimensions of any recorded layer.
-    pub largest_layer_size: Option<SizeU16>,
+    pub largest_layer_size: Option<SizeU32>,
     /// The largest dimensions of any recorded filter layer.
-    pub largest_filter_layer_size: Option<SizeU16>,
+    pub largest_filter_layer_size: Option<SizeU32>,
     /// Whether there exists at least one layer that uses a non-default blend mode.
     pub has_non_default_blend: bool,
     /// The layer whose command stream is currently the base.
@@ -200,7 +205,7 @@ pub struct CommandRecorder<D> {
 impl<D> Default for CommandRecorder<D> {
     fn default() -> Self {
         Self {
-            scene_size: SizeU16::ZERO,
+            scene_size: SizeU32::ZERO,
             nodes: Vec::new(),
             draws: Vec::new(),
             layers: Vec::new(),
@@ -220,7 +225,7 @@ impl<D> Default for CommandRecorder<D> {
 struct OpenLayer {
     id: u32,
     /// The bounding box of the contents recorded into this layer.
-    bbox: RectU16,
+    bbox: RectU32,
     parent_layer: Option<u32>,
 }
 
@@ -228,7 +233,7 @@ impl<D> CommandRecorder<D> {
     /// Create a new command recorder.
     pub fn new(width: u16, height: u16) -> Self {
         Self {
-            scene_size: SizeU16::from_wh(width, height),
+            scene_size: SizeU32::from_wh(width.into(), height.into()),
             ..Self::default()
         }
     }
@@ -241,7 +246,7 @@ impl<D> CommandRecorder<D> {
     /// Reset the command recorder.
     #[inline]
     pub fn reset(&mut self, width: u16, height: u16) {
-        self.scene_size = SizeU16::from_wh(width, height);
+        self.scene_size = SizeU32::from_wh(width.into(), height.into());
         self.nodes.clear();
         self.draws.clear();
 
@@ -279,8 +284,23 @@ impl<D> CommandRecorder<D> {
         self.filter_layers.push(id);
     }
 
-    fn push_recorded_layer(&mut self, layer: RecordedLayer) -> u32 {
+    fn push_recorded_layer(&mut self, mut layer: RecordedLayer) -> u32 {
         let parent_layer = self.active_layer;
+        let parent_shift = parent_layer.map_or((0, 0), |id| self.layers[id as usize].source_shift);
+        let local_shift = match &layer.kind {
+            RecordedLayerKind::Regular => (0, 0),
+            RecordedLayerKind::Filter { filter_data, .. } => filter_data.source_shift(),
+        };
+        layer.source_shift = (
+            parent_shift
+                .0
+                .checked_add(local_shift.0)
+                .expect("cumulative filter source shift exceeds u32"),
+            parent_shift
+                .1
+                .checked_add(local_shift.1)
+                .expect("cumulative filter source shift exceeds u32"),
+        );
         self.max_layer_depth = self.max_layer_depth.max(layer.depth);
 
         if layer.props.blend_mode != BlendMode::default() {
@@ -297,7 +317,7 @@ impl<D> CommandRecorder<D> {
         self.layer_stack.push(OpenLayer {
             id,
             // Will be populated as we record commands.
-            bbox: RectU16::INVERTED,
+            bbox: RectU32::INVERTED,
             parent_layer,
         });
 
@@ -317,7 +337,7 @@ impl<D> CommandRecorder<D> {
 
                     // Turn the potentially still-inverted bbox into a zero-sized one.
                     if bbox.is_empty() {
-                        bbox = RectU16::ZERO;
+                        bbox = RectU32::ZERO;
                     }
 
                     if let Some(clip_path) = &recorded_layer.props.clip_path {
@@ -400,7 +420,7 @@ impl<D> CommandRecorder<D> {
         id
     }
 
-    fn record_bbox(&mut self, bbox: impl FnOnce() -> Option<RectU16>) {
+    fn record_bbox(&mut self, bbox: impl FnOnce() -> Option<RectU32>) {
         let Some(layer) = self.layer_stack.last_mut() else {
             return;
         };
@@ -456,7 +476,7 @@ pub enum PoppedLayer {
 mod tests {
     use super::*;
     use crate::filter_effects::{Filter, FilterPrimitive};
-    use crate::geometry::PaddingU16;
+    use crate::geometry::PaddingU32;
     use crate::kurbo::Affine;
     use crate::peniko::Mix;
     use crate::tile::Tile;
@@ -467,8 +487,8 @@ mod tests {
     struct TestDraw;
 
     impl Drawable for TestDraw {
-        fn bbox(&self, _strips: &[Strip]) -> Option<RectU16> {
-            Some(RectU16::new(0, 0, 64, 4))
+        fn bbox(&self, _strips: &[Strip]) -> Option<RectU32> {
+            Some(RectU32::new(0, 0, 64, 4))
         }
 
         fn blend_mode(&self) -> Option<&BlendMode> {
@@ -480,7 +500,7 @@ mod tests {
     struct EmptyDraw;
 
     impl Drawable for EmptyDraw {
-        fn bbox(&self, _strips: &[Strip]) -> Option<RectU16> {
+        fn bbox(&self, _strips: &[Strip]) -> Option<RectU32> {
             None
         }
 
@@ -493,8 +513,8 @@ mod tests {
     struct BlendedDraw(BlendMode);
 
     impl Drawable for BlendedDraw {
-        fn bbox(&self, _strips: &[Strip]) -> Option<RectU16> {
-            Some(RectU16::new(0, 0, 64, 4))
+        fn bbox(&self, _strips: &[Strip]) -> Option<RectU32> {
+            Some(RectU32::new(0, 0, 64, 4))
         }
 
         fn blend_mode(&self) -> Option<&BlendMode> {
@@ -518,13 +538,17 @@ mod tests {
         }
     }
 
-    fn filter_data(filter_padding: PaddingU16, source_padding: PaddingU16) -> FilterData {
-        FilterData {
-            filter: Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 }),
-            transform: Affine::IDENTITY,
-            filter_padding,
-            source_padding,
-        }
+    fn filter_data(filter_padding: PaddingU32, source_padding: PaddingU32) -> FilterData {
+        let mut data = FilterData::new(
+            Filter::from_primitive(FilterPrimitive::GaussianBlur {
+                std_deviation: 0.0,
+                edge_mode: crate::filter_effects::EdgeMode::None,
+            }),
+            Affine::IDENTITY,
+        );
+        data.filter_padding = filter_padding;
+        data.source_padding = source_padding;
+        data
     }
 
     fn assert_cmds(cmds: &[Node], expected: &[(Range<u32>, Option<u32>)]) {
@@ -543,44 +567,44 @@ mod tests {
     #[test]
     fn scene_size_preserves_physical_dimensions() {
         let mut recorder = CommandRecorder::<TestDraw>::new(10, 10);
-        assert_eq!(recorder.scene_size, SizeU16::new(10));
+        assert_eq!(recorder.scene_size, SizeU32::new(10));
 
         recorder.reset(13, 7);
-        assert_eq!(recorder.scene_size, SizeU16::from_wh(13, 7));
+        assert_eq!(recorder.scene_size, SizeU32::from_wh(13, 7));
 
         recorder.reset(Tile::WIDTH * 5, Tile::HEIGHT * 3);
         assert_eq!(
             recorder.scene_size,
-            SizeU16::from_wh(Tile::WIDTH * 5, Tile::HEIGHT * 3)
+            SizeU32::from_wh(Tile::WIDTH_U32 * 5, Tile::HEIGHT_U32 * 3)
         );
     }
 
     #[test]
     fn filter_placement_padding_expands_bbox() {
         let placement = FilterLayerPlacement::new(
-            RectU16::new(8, 8, 16, 20),
-            &filter_data(PaddingU16::new(2, 4, 6, 8), PaddingU16::ZERO),
+            RectU32::new(8, 8, 16, 20),
+            &filter_data(PaddingU32::new(2, 4, 6, 8), PaddingU32::ZERO),
         );
 
         // Since we are tile-aligned, values are expanded to a multiple of tile-size.
-        assert_eq!(placement.pixmap_bbox(), RectU16::new(4, 4, 24, 28));
-        assert_eq!(placement.dest_bbox(), RectU16::new(4, 4, 24, 28));
+        assert_eq!(placement.pixmap_bbox(), RectU32::new(4, 4, 24, 28));
+        assert_eq!(placement.dest_bbox(), RectU32::new(4, 4, 24, 28));
         assert_eq!(placement.src_origin(), (0, 0));
     }
 
     #[test]
     fn filter_placement_with_source_shift() {
         let placement = FilterLayerPlacement::new(
-            RectU16::new(8, 12, 20, 24),
-            &filter_data(PaddingU16::new(6, 2, 4, 6), PaddingU16::new(12, 16, 0, 0)),
+            RectU32::new(8, 12, 20, 24),
+            &filter_data(PaddingU32::new(6, 2, 4, 6), PaddingU32::new(12, 16, 0, 0)),
         );
 
         // Bbox expanded with padding is [8 - 6, 12 - 2, 20 + 4, 24 + 6]
         // = [2, 10, 24, 30], snappding this gives us [0, 8, 24, 32].
-        assert_eq!(placement.pixmap_bbox(), RectU16::new(0, 8, 24, 32));
+        assert_eq!(placement.pixmap_bbox(), RectU32::new(0, 8, 24, 32));
         // Account for source origin using saturating sub of 12 horizontally and
         // 16 vertically.
-        assert_eq!(placement.dest_bbox(), RectU16::new(0, 0, 12, 16));
+        assert_eq!(placement.dest_bbox(), RectU32::new(0, 0, 12, 16));
         // Source origin is now 12 - 0 = 12 and 16 - 8 = 8.
         assert_eq!(placement.src_origin(), (12, 8));
     }
@@ -589,8 +613,8 @@ mod tests {
     #[should_panic(expected = "filter source shift must be tile-aligned")]
     fn filter_placement_rejects_unaligned_source_shift() {
         FilterLayerPlacement::new(
-            RectU16::new(8, 12, 20, 24),
-            &filter_data(PaddingU16::new(6, 2, 4, 6), PaddingU16::new(10, 16, 0, 0)),
+            RectU32::new(8, 12, 20, 24),
+            &filter_data(PaddingU32::new(6, 2, 4, 6), PaddingU32::new(10, 16, 0, 0)),
         );
     }
 
@@ -600,11 +624,11 @@ mod tests {
 
         recorder.push_layer(
             layer_props(),
-            Some(filter_data(PaddingU16::ZERO, PaddingU16::ZERO)),
+            Some(filter_data(PaddingU32::ZERO, PaddingU32::ZERO)),
         );
         recorder.push_layer(
             layer_props(),
-            Some(filter_data(PaddingU16::ZERO, PaddingU16::ZERO)),
+            Some(filter_data(PaddingU32::ZERO, PaddingU32::ZERO)),
         );
         recorder.push_layer(layer_props(), None);
 
@@ -638,10 +662,10 @@ mod tests {
         );
         assert_eq!(recorder.max_layer_depth, 3);
         assert!(!recorder.has_non_default_blend);
-        assert_eq!(recorder.largest_layer_size, Some(SizeU16::from_wh(64, 4)));
+        assert_eq!(recorder.largest_layer_size, Some(SizeU32::from_wh(64, 4)));
         assert_eq!(
             recorder.largest_filter_layer_size,
-            Some(SizeU16::from_wh(64, 4))
+            Some(SizeU32::from_wh(64, 4))
         );
     }
 
@@ -688,14 +712,14 @@ mod tests {
         props.clip_path = Some(LayerClip {
             strip_range: 0..0,
             thread_idx: 0,
-            bbox: RectU16::new(8, 8, 12, 12),
+            bbox: RectU32::new(8, 8, 12, 12),
         });
 
         recorder.push_layer(props, None);
         recorder.push_draw(TestDraw, &[]);
         recorder.pop_layer();
 
-        assert_eq!(recorder.layers[0].bbox, RectU16::new(8, 8, 12, 8));
+        assert_eq!(recorder.layers[0].bbox, RectU32::new(8, 8, 12, 8));
     }
 
     #[test]
@@ -739,7 +763,7 @@ mod tests {
         recorder.push_layer(blended_layer_props(), None);
         recorder.push_layer(
             layer_props(),
-            Some(filter_data(PaddingU16::ZERO, PaddingU16::ZERO)),
+            Some(filter_data(PaddingU32::ZERO, PaddingU32::ZERO)),
         );
         recorder.push_draw(TestDraw, &[]);
         recorder.pop_layer();
@@ -753,12 +777,81 @@ mod tests {
 
         recorder.reset(13, 7);
 
-        assert_eq!(recorder.scene_size, SizeU16::from_wh(13, 7));
+        assert_eq!(recorder.scene_size, SizeU32::from_wh(13, 7));
         assert!(!recorder.root_is_blend_target);
         assert!(!recorder.has_non_default_blend);
         assert_eq!(recorder.max_layer_depth, 0);
         assert!(recorder.largest_layer_size.is_none());
         assert!(recorder.largest_filter_layer_size.is_none());
         assert!(recorder.filter_layers.is_empty());
+    }
+
+    #[test]
+    fn source_shifts_inherit_through_regular_layers_and_reset() {
+        let mut recorder = CommandRecorder::<TestDraw>::new(16, 16);
+        recorder.push_layer(layer_props(), None);
+        recorder.push_layer(
+            layer_props(),
+            Some(filter_data(PaddingU32::ZERO, PaddingU32::new(8, 12, 0, 0))),
+        );
+        recorder.push_layer(layer_props(), None);
+        recorder.push_layer(
+            layer_props(),
+            Some(filter_data(PaddingU32::ZERO, PaddingU32::new(12, 20, 0, 0))),
+        );
+        assert_eq!(
+            recorder
+                .layers
+                .iter()
+                .map(|layer| layer.source_shift)
+                .collect::<Vec<_>>(),
+            [(0, 0), (8, 12), (8, 12), (20, 32)]
+        );
+        recorder.pop_layer();
+        recorder.pop_layer();
+        recorder.push_layer(
+            layer_props(),
+            Some(filter_data(PaddingU32::ZERO, PaddingU32::new(4, 4, 0, 0))),
+        );
+        assert_eq!(recorder.layers[4].source_shift, (12, 16));
+        recorder.reset(16, 16);
+        recorder.push_layer(
+            layer_props(),
+            Some(filter_data(PaddingU32::ZERO, PaddingU32::new(4, 4, 0, 0))),
+        );
+        assert_eq!(recorder.layers[0].source_shift, (4, 4));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn source_shift_overflow_leaves_recorder_state_unchanged() {
+        let mut recorder = CommandRecorder::<TestDraw>::new(16, 16);
+        recorder.push_layer(
+            layer_props(),
+            Some(filter_data(
+                PaddingU32::ZERO,
+                PaddingU32::new(u32::MAX - 3, 0, 0, 0),
+            )),
+        );
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recorder.push_layer(
+                blended_layer_props(),
+                Some(filter_data(PaddingU32::ZERO, PaddingU32::new(4, 0, 0, 0))),
+            );
+        }));
+        assert!(
+            error.is_err(),
+            "overflowing source shift must fail before recording the layer"
+        );
+        assert_eq!(recorder.layers.len(), 1);
+        assert_eq!(recorder.nodes.len(), 1);
+        assert_eq!(recorder.layer_stack.len(), 1);
+        assert_eq!(recorder.active_layer, Some(0));
+        assert_eq!(recorder.max_layer_depth, 1);
+        assert!(
+            !recorder.has_non_default_blend,
+            "rejected layer must not alter blend metadata"
+        );
+        assert_eq!(recorder.filter_layers, [0]);
     }
 }

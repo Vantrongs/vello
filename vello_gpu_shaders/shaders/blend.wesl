@@ -77,7 +77,7 @@ fn vs_main(
     out.blend_config = instance.blend_config;
     out.tex_coord = vec2<f32>(
         f32(instance.geometry_alpha_col_idx) + corner.x * geometry_size.x,
-        corner.y * geometry_size.y,
+        f32((instance.blend_config >> 27u) & 3u) + corner.y * geometry_size.y,
     );
 
     let ndc = pixel_to_ndc(parent_texture_xy, vec2<f32>(parent_texture_size));

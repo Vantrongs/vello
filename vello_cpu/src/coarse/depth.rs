@@ -17,9 +17,9 @@
 //! save 50% pixel work.
 //!
 //! Therefore, the CPU-based depth buffer acts at a much coarser granularity. Vertically, it comes
-//! very natural to simply decide that one depth buffer entry covers a range of [`Tile::HEIGHT`]
+//! very natural to simply decide that one depth buffer entry covers a range of [`Tile::HEIGHT_U32`]
 //! pixels, since all commands are executed at this height anyway. Choosing a width is much trickier:
-//! Similarly, the width should be a multiple of [`Tile::WIDTH`], but using this as the granularity
+//! Similarly, the width should be a multiple of [`Tile::WIDTH_U32`], but using this as the granularity
 //! is still to narrow. After some empirical measurements, it was decided that a width of
 //! [`DEPTH_BUCKET_WIDTH`] overall represents a good compromise across different paint types.
 //!
@@ -40,22 +40,22 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use vello_common::tile::Tile;
 
-pub(crate) const DEPTH_BUCKET_WIDTH: u16 = 128;
-const DEPTH_BUCKET_TILE_WIDTH: u16 = DEPTH_BUCKET_WIDTH / Tile::WIDTH;
+pub(crate) const DEPTH_BUCKET_WIDTH: u32 = 128;
+const DEPTH_BUCKET_TILE_WIDTH: u32 = DEPTH_BUCKET_WIDTH / Tile::WIDTH_U32;
 const _: () = assert!(
-    DEPTH_BUCKET_WIDTH.is_multiple_of(Tile::WIDTH),
+    DEPTH_BUCKET_WIDTH.is_multiple_of(Tile::WIDTH_U32),
     "depth bucket width must be a multiple of tile width"
 );
 
 /// A horizontal range in depth-bucket coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BucketRange {
-    pub(crate) start: u16,
-    pub(crate) end: u16,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
 }
 
 impl BucketRange {
-    pub(crate) fn new(start: u16, end: u16) -> Self {
+    pub(crate) fn new(start: u32, end: u32) -> Self {
         Self { start, end }
     }
 
@@ -170,7 +170,7 @@ pub(crate) struct DepthBuffer {
 impl DepthBuffer {
     pub(crate) fn new(buffer_width: usize) -> Self {
         Self {
-            data: vec![0; buffer_width.div_ceil(usize::from(DEPTH_BUCKET_WIDTH))],
+            data: vec![0; buffer_width.div_ceil(DEPTH_BUCKET_WIDTH as usize)],
         }
     }
 
@@ -197,14 +197,14 @@ impl DepthBuffer {
         mut f: impl FnMut(BucketRange),
     ) {
         let bounds = bucket_range.span();
-        let mut idx = usize::from(bucket_range.start);
-        let depth_end = usize::from(bucket_range.end);
+        let mut idx = bucket_range.start as usize;
+        let depth_end = bucket_range.end as usize;
 
         while let Some((_, depth_range)) = self.next_unset_run(&mut idx, depth_end, bounds) {
             let bucket_start =
-                u16::try_from(depth_range.start).expect("depth bucket range start overflow");
+                u32::try_from(depth_range.start).expect("depth bucket range start overflow");
             let bucket_end =
-                u16::try_from(depth_range.end).expect("depth bucket range end overflow");
+                u32::try_from(depth_range.end).expect("depth bucket range end overflow");
             f(BucketRange::new(bucket_start, bucket_end));
             self.mark(depth_range, draw_id);
         }
@@ -228,8 +228,8 @@ impl DepthBuffer {
     /// Returns the depth-bucket index range touched by `span`.
     fn range(&self, span: TileAlignedSpan) -> (usize, usize) {
         (
-            usize::from(span.tile_x() / DEPTH_BUCKET_TILE_WIDTH),
-            usize::from(span.tile_end().div_ceil(DEPTH_BUCKET_TILE_WIDTH)).min(self.data.len()),
+            (span.tile_x() / DEPTH_BUCKET_TILE_WIDTH) as usize,
+            (span.tile_end().div_ceil(DEPTH_BUCKET_TILE_WIDTH) as usize).min(self.data.len()),
         )
     }
 
@@ -290,8 +290,8 @@ impl DepthBuffer {
 }
 
 fn bucket_span(start: usize, end: usize, bounds: TileAlignedSpan) -> Option<TileAlignedSpan> {
-    let start = (start as u16 * DEPTH_BUCKET_TILE_WIDTH).max(bounds.tile_x());
-    let end = (end as u16 * DEPTH_BUCKET_TILE_WIDTH).min(bounds.tile_end());
+    let start = (start as u32 * DEPTH_BUCKET_TILE_WIDTH).max(bounds.tile_x());
+    let end = (end as u32 * DEPTH_BUCKET_TILE_WIDTH).min(bounds.tile_end());
     (start < end).then(|| TileAlignedSpan::from_tiles(start, end - start))
 }
 
@@ -302,17 +302,17 @@ mod tests {
     use core::ops::Range;
 
     fn buffer(bucket_count: usize) -> DepthBuffer {
-        DepthBuffer::new(bucket_count * usize::from(DEPTH_BUCKET_WIDTH))
+        DepthBuffer::new(bucket_count * (DEPTH_BUCKET_WIDTH as usize))
     }
 
     fn buckets(start: usize, end: usize) -> TileAlignedSpan {
-        BucketRange::new(start as u16, end as u16).span()
+        BucketRange::new(start as u32, end as u32).span()
     }
 
     fn bucket_range(span: TileAlignedSpan) -> (usize, usize) {
         (
-            usize::from(span.tile_x() / DEPTH_BUCKET_TILE_WIDTH),
-            usize::from(span.tile_end() / DEPTH_BUCKET_TILE_WIDTH),
+            (span.tile_x() / DEPTH_BUCKET_TILE_WIDTH) as usize,
+            ((span.tile_end() / DEPTH_BUCKET_TILE_WIDTH) as usize),
         )
     }
 
@@ -338,7 +338,7 @@ mod tests {
 
     fn write_buckets(buffer: &mut DepthBuffer, range: Range<usize>, draw_id: u32) {
         buffer.for_each_unset_run_and_write(
-            BucketRange::new(range.start as u16, range.end as u16),
+            BucketRange::new(range.start as u32, range.end as u32),
             draw_id,
             |_| {},
         );
@@ -410,7 +410,7 @@ mod tests {
 
         let mut written_runs = Vec::new();
         buffer.for_each_unset_run_and_write(BucketRange::new(0, 5), 7, |range| {
-            written_runs.push((usize::from(range.start), usize::from(range.end)));
+            written_runs.push(((range.start as usize), (range.end as usize)));
         });
         assert_eq!(written_runs, [(0, 1), (2, 3), (4, 5)]);
         assert_depth(
@@ -442,8 +442,8 @@ mod tests {
         assert_eq!(
             runs,
             [(
-                usize::from(Tile::WIDTH * 2),
-                usize::from(DEPTH_BUCKET_WIDTH + Tile::WIDTH * 5)
+                ((Tile::WIDTH_U32 * 2) as usize),
+                ((DEPTH_BUCKET_WIDTH + Tile::WIDTH_U32 * 5) as usize)
             )]
         );
     }
@@ -465,10 +465,10 @@ mod tests {
 
     #[test]
     fn partial_final_bucket_is_clipped_before_converting_to_pixels() {
-        let last_bucket_x = u16::MAX / DEPTH_BUCKET_WIDTH * DEPTH_BUCKET_WIDTH;
-        let max_aligned_width = u16::MAX / Tile::WIDTH * Tile::WIDTH;
+        let last_bucket_x = u32::from(u16::MAX) / DEPTH_BUCKET_WIDTH * DEPTH_BUCKET_WIDTH;
+        let max_aligned_width = u32::from(u16::MAX) / Tile::WIDTH_U32 * Tile::WIDTH_U32;
         for width in last_bucket_x..=max_aligned_width {
-            let mut buffer = DepthBuffer::new(usize::from(width));
+            let mut buffer = DepthBuffer::new(width as usize);
             let span = crate::span::Span::new(0, width).tile_aligned();
             let mut runs = Vec::new();
             buffer.for_each_unset_run(span, |run| runs.push(run));
@@ -479,7 +479,7 @@ mod tests {
 
             write_buckets(
                 &mut buffer,
-                0..usize::from(last_bucket_x / DEPTH_BUCKET_WIDTH),
+                0..((last_bucket_x / DEPTH_BUCKET_WIDTH) as usize),
                 2,
             );
             runs.clear();

@@ -35,7 +35,7 @@ use crate::util::{RangedSlice, Ranges, VecExt};
 use crate::{GpuStrip, blend::BlendStrip};
 use alloc::vec::Vec;
 use core::ops::Range;
-use vello_common::geometry::RectU16;
+use vello_common::geometry::{RectU16, RectU32};
 use vello_common::peniko::BlendMode;
 
 /// Completed rounds in execution order.
@@ -523,7 +523,7 @@ pub(crate) struct BlendOp {
     /// Child layer serving as the blend source.
     pub(crate) child_region: LayerTextureRegion,
     /// Scene-space bounds affected by the blend.
-    pub(crate) blend_bbox: RectU16,
+    pub(crate) blend_bbox: RectU32,
     /// The blend mode that should be applied.
     pub(crate) blend_mode: BlendMode,
     /// Opacity applied to the child before sampling.
@@ -545,7 +545,7 @@ mod tests {
     };
     use crate::util::VecExt;
     use bytemuck::Zeroable;
-    use vello_common::geometry::RectU16;
+    use vello_common::geometry::{RectU16, RectU32};
     use vello_common::peniko::BlendMode;
 
     fn layer_id(texture_parity: TextureParity, page_index: u16) -> LayerTextureId {
@@ -562,7 +562,7 @@ mod tests {
     fn layer_region(texture_parity: TextureParity, page_index: u16) -> LayerTextureRegion {
         LayerTextureRegion {
             texture: region(texture_parity, page_index),
-            layer_bbox: RectU16::new(0, 0, 16, 16),
+            layer_bbox: RectU32::new(0, 0, 16, 16),
         }
     }
 
@@ -814,7 +814,7 @@ mod tests {
             BlendOp {
                 parent_region: layer_region(TextureParity::Odd, 0),
                 child_region: layer_region(TextureParity::Even, 0),
-                blend_bbox: RectU16::new(0, 0, 16, 16),
+                blend_bbox: RectU32::new(0, 0, 16, 16),
                 blend_mode: BlendMode::default(),
                 opacity: 1.0,
                 clip_strips: None,

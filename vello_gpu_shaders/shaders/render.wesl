@@ -21,6 +21,8 @@
 // - If color source is payload and the paint type is solid, the fragment shader uses the color directly.
 // - If color source is payload and the paint type is image, the fragment shader samples the image.
 // - If color source is layer, the fragment shader samples the layer texture and applies layer opacity.
+// Wide sources use bit 25 to supply a transformed f32 paint origin, avoiding cancellation
+// of large scene coordinates against an inverse paint translation.
 // More details in the `StripInstance` documentation below.
 
 import package::helpers::alpha::unpack_alphas_from_channel;
@@ -32,6 +34,7 @@ import package::helpers::gradient::{
     calculate_radial_gradient,
     get_gradient_extend_mode,
     get_gradient_start,
+    get_gradient_transform,
     get_gradient_texture_width,
     get_sweep_inv_angle_delta,
     get_sweep_start_angle,
@@ -70,6 +73,7 @@ const PAINT_TEXTURE_INDEX_MASK: u32 = 0x00FFFFFFu;
 const EXTERNAL_TEXTURE_SLOT_SHIFT: u32 = 24u;
 
 const RECT_STRIP_FLAG: u32 = 0x80000000u;
+const LOCAL_PAINT_FLAG: u32 = 1u << 25u;
 
 struct Config {
     // Width of the rendering target
@@ -109,7 +113,8 @@ struct Config {
 //   xy                    | Strip position                    | Rect top-left (snapped outward)
 //   widths_or_rect_height | [width, dense_width]              | [width, height] (both snapped)
 //   col_idx_or_rect_frac  | Alpha column index                | Packed AA edge fractions (4 × u8)
-//   payload               | Color / scene coords / layer xy   | Color / scene coords / layer xy
+//   payload               | Color / scene x / layer xy        | Color / scene x / layer xy
+//   payload_y             | Scene y / layer strip crop        | Scene y for non-solid paint
 //   paint_and_rect_flag   | Paint encoding                    | Paint encoding | RECT_STRIP_FLAG
 //
 //
@@ -123,7 +128,8 @@ struct Config {
 //       - Bits 0-25:
 //         - If paint_type = 0: unused
 //         - Bits 0-23: `paint_texture_idx` for every non-solid paint
-//         - Bits 24-25: reserved
+//         - Bit 24: external texture slot
+//         - Bit 25: payload is a transformed f32 paint origin for wide sources
 //
 //     When color_source = 1 (COLOR_SOURCE_LAYER):
 //       - Bits 0-7: opacity (0-255)
@@ -136,19 +142,20 @@ struct Config {
 // │   └── payload = [r, g, b, a] RGBA (packed as u8s)
 // │
 // ├── paint_type = 1 (PAINT_TYPE_IMAGE) - Image rendering
-// │   └── payload = packed image parameters
+// │   └── payload, payload_y = [x, y] scene coordinates as u32s
 // │
 // ├── paint_type = 2 (PAINT_TYPE_LINEAR_GRADIENT) - Linear gradient rendering
 // ├── paint_type = 3 (PAINT_TYPE_RADIAL_GRADIENT) - Radial gradient (with kind discriminator)
 // ├── paint_type = 4 (PAINT_TYPE_SWEEP_GRADIENT) - Sweep gradient rendering
-//     ├── payload = [x, y] scene coordinates (packed as u16s)
+//     ├── payload, payload_y = [x, y] scene coordinates as u32s
 //     └── bits 0-23 = paint_texture_idx
 // └── paint_type = 5 (PAINT_TYPE_BLURRED_ROUNDED_RECT) - Analytic blurred rounded rectangle
-//     ├── payload = [x, y] scene coordinates (packed as u16s)
+//     ├── payload, payload_y = [x, y] scene coordinates as u32s
 //     └── bits 0-23 = paint_texture_idx
 //
 // color_source = 1 (COLOR_SOURCE_LAYER) - Use rendered layer texture
 // ├── payload = [x, y] source layer texture origin (packed as u16s)
+// ├── payload_y = height << 8 | first alpha row for clipped strips (0 means a full tile)
 // └── bits 0-7 = opacity
 struct StripInstance {
     // [x, y] packed as u16's
@@ -176,9 +183,12 @@ struct StripInstance {
     payload: u32,
     // See StripInstance documentation above.
     @location(4)
+    payload_y: u32,
+    // See StripInstance documentation above.
+    @location(5)
     paint_and_rect_flag: u32,
     // Painter's-order index for z-depth computation.
-    @location(5)
+    @location(6)
     depth_index: u32,
 }
 
@@ -204,6 +214,9 @@ struct VertexOutput {
     // Zero for normal strips.
     @location(5) @interpolate(flat)
     rect_frac: u32,
+    // Already transformed paint origin for wide source strips.
+    @location(6) @interpolate(flat)
+    paint_origin: vec2<f32>,
     // Normalized device coordinates (NDC) for the current vertex
     @builtin(position)
     position: vec4<f32>,
@@ -229,6 +242,7 @@ fn vs_main(
 ) -> VertexOutput {
     var out: VertexOutput;
     out.sample_xy = vec2(0.0);
+    out.paint_origin = vec2(0.0);
     // Map vertex_index (0-3) to quad corners:
     // 0 → (0,0), 1 → (1,0), 2 → (0,1), 3 → (1,1)
     let corner = quad_corner(in_vertex_index);
@@ -244,6 +258,12 @@ fn vs_main(
 
     let is_rect = (instance.paint_and_rect_flag & RECT_STRIP_FLAG) != 0u;
     var height = config.strip_height;
+    var alpha_row = 0u;
+    let color_source = (instance.paint_and_rect_flag >> 29u) & 0x3u;
+    if !is_rect && color_source == COLOR_SOURCE_LAYER && instance.payload_y != 0u {
+        height = instance.payload_y >> 8u;
+        alpha_row = instance.payload_y & 0xffu;
+    }
     if is_rect {
         height = dense_width;
         out.dense_end_or_rect_size = width | (dense_width << 16u);
@@ -262,11 +282,13 @@ fn vs_main(
     // NDC ranges from -1 to 1, with (0,0) at the center of the viewport
     let ndc = pixel_to_ndc(pixel, vec2<f32>(f32(config.width), f32(config.height)));
 
-    let color_source = (instance.paint_and_rect_flag >> 29u) & 0x3u;
     if color_source == COLOR_SOURCE_PAYLOAD {
         let paint_type = (instance.paint_and_rect_flag >> 26u) & 0x7u;
         // Unpack view coordinates for image sampling and gradient calculations
-        let scene_strip = unpack_u16_pair(instance.payload);
+        let scene_strip = vec2<u32>(instance.payload, instance.payload_y);
+        let local_paint = (instance.paint_and_rect_flag & LOCAL_PAINT_FLAG) != 0u;
+        let local_position = vec2<f32>(x * f32(width), y * f32(height));
+        if local_paint { out.paint_origin = bitcast<vec2<f32>>(scene_strip); }
 
         if paint_type == PAINT_TYPE_IMAGE {
             let paint_tex_idx = instance.paint_and_rect_flag & PAINT_TEXTURE_INDEX_MASK;
@@ -278,14 +300,22 @@ fn vs_main(
                 f32(scene_strip.x) + x * f32(width),
                 f32(scene_strip.y) + y * f32(height),
             );
-            out.sample_xy = get_image_translate(image_texel1, image_texel2)
-                + get_image_transform(image_texel0, image_texel1) * pos;
+            if local_paint {
+                out.sample_xy = out.paint_origin + get_image_transform(image_texel0, image_texel1) * local_position;
+            } else {
+                out.sample_xy = get_image_translate(image_texel1, image_texel2)
+                    + get_image_transform(image_texel0, image_texel1) * pos;
+            }
         } else if paint_type == PAINT_TYPE_LINEAR_GRADIENT || paint_type == PAINT_TYPE_RADIAL_GRADIENT || paint_type == PAINT_TYPE_SWEEP_GRADIENT || paint_type == PAINT_TYPE_BLURRED_ROUNDED_RECT {
             // Use view coordinates for gradient transform (always in global view space)
-            out.sample_xy = vec2<f32>(
-                f32(scene_strip.x) + x * f32(width),
-                f32(scene_strip.y) + y * f32(height)
-            );
+            if local_paint {
+                out.sample_xy = local_position;
+            } else {
+                out.sample_xy = vec2<f32>(
+                    f32(scene_strip.x) + x * f32(width),
+                    f32(scene_strip.y) + y * f32(height)
+                );
+            }
         }
     } else if color_source == COLOR_SOURCE_LAYER {
         let source = unpack_u16_pair(instance.payload);
@@ -296,7 +326,7 @@ fn vs_main(
     }
 
     let col_offset = select(f32(instance.col_idx_or_rect_frac), 0.0, is_rect);
-    out.tex_coord = vec2<f32>(col_offset + x * f32(width), y * f32(height));
+    out.tex_coord = vec2<f32>(col_offset + x * f32(width), f32(alpha_row) + y * f32(height));
 
     // Divide by a power of 2 to ensure exact f32 arithmetic (and divide by the expected depth
     // buffer precision of 24 bits).
@@ -324,9 +354,11 @@ fn fs_main(
     @location(3) @interpolate(flat) dense_end_or_rect_size: u32,
     @location(4) @interpolate(flat) payload: u32,
     @location(5) @interpolate(flat) rect_frac: u32,
+    @location(6) @interpolate(flat) paint_origin: vec2<f32>,
     @builtin(position) position: vec4<f32>,
 ) -> @location(0) vec4<f32> {
     var alpha = 1.0;
+    let local_paint = (paint_and_rect_flag & LOCAL_PAINT_FLAG) != 0u;
     let is_rect = (paint_and_rect_flag & RECT_STRIP_FLAG) != 0u;
     // TODO: Explore doing these calculations only for rectangle parts that actually need anti-aliasing. See
     // https://github.com/linebender/vello/pull/1482#discussion_r2861311034
@@ -421,7 +453,10 @@ fn fs_main(
 
             // Calculate fragment position and apply affine transform
             let fragment_pos = sample_xy;
-            let grad_pos = apply_gradient_transform(gradient_texel0, gradient_texel1, fragment_pos);
+            var grad_pos = apply_gradient_transform(gradient_texel0, gradient_texel1, fragment_pos);
+            if local_paint {
+                grad_pos = get_gradient_transform(gradient_texel0, gradient_texel1) * fragment_pos + paint_origin;
+            }
 
             // For linear gradient, t-value is just the x coordinate in gradient space
             let t_value = grad_pos.x + 0.00001;
@@ -442,7 +477,10 @@ fn fs_main(
 
             // Calculate fragment position and apply affine transform
             let fragment_pos = sample_xy;
-            let grad_pos = apply_gradient_transform(gradient_texel0, gradient_texel1, fragment_pos);
+            var grad_pos = apply_gradient_transform(gradient_texel0, gradient_texel1, fragment_pos);
+            if local_paint {
+                grad_pos = get_gradient_transform(gradient_texel0, gradient_texel1) * fragment_pos + paint_origin;
+            }
 
             // For radial gradient, calculate distance from center
             let gradient_result = calculate_radial_gradient(grad_pos, gradient_texel2, gradient_texel3);
@@ -467,6 +505,9 @@ fn fs_main(
             // Calculate fragment position and apply affine transform
             let fragment_pos = sample_xy;
             var grad_pos = apply_gradient_transform(gradient_texel0, gradient_texel1, fragment_pos);
+            if local_paint {
+                grad_pos = get_gradient_transform(gradient_texel0, gradient_texel1) * fragment_pos + paint_origin;
+            }
 
             // Before passing the position to the angle calculation, we bias
             // very small coordinates to 0. Otherwise the sweep gradient's seam
@@ -501,6 +542,8 @@ fn fs_main(
             let blurred_texel4 = load_encoded_paint_texel(paint_tex_idx, 4u);
             final_color = alpha * calculate_blurred_rounded_rect(
                 sample_xy,
+                paint_origin,
+                local_paint,
                 blurred_texel0,
                 blurred_texel1,
                 blurred_texel2,

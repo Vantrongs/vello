@@ -57,7 +57,7 @@ only break in edge cases, and some of them are also only related to conversions 
 use libm as _;
 
 extern crate alloc;
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test))]
 extern crate std;
 
 pub mod blurred_rounded_rect;

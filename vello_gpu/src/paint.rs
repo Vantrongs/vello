@@ -3,10 +3,10 @@
 
 //! GPU paint packing for scheduled strip draws.
 
-use crate::util::pack_u16_pair;
 use vello_common::TextureId;
 use vello_common::encode::{EncodedKind, EncodedPaint};
 use vello_common::image_cache::ImageCache;
+use vello_common::kurbo::{Affine, Point};
 use vello_common::multi_atlas::AtlasId;
 use vello_common::paint::{ImageSource, Paint};
 
@@ -24,6 +24,7 @@ const PAINT_TYPE_BLURRED_ROUNDED_RECT: u32 = 5;
 pub(crate) const COLOR_SOURCE_SHIFT: u32 = 29;
 const PAINT_TYPE_SHIFT: u32 = 26;
 pub(crate) const EXTERNAL_TEXTURE_SLOT_SHIFT: u32 = 24;
+const LOCAL_PAINT_FLAG: u32 = 1 << 25;
 const PAINT_TEXTURE_INDEX_MASK: u32 = (1 << EXTERNAL_TEXTURE_SLOT_SHIFT) - 1;
 
 /// Texture sampled by an image paint.
@@ -49,10 +50,25 @@ pub(crate) struct PackedPaint {
 }
 
 impl PackedPaint {
-    pub(crate) fn payload_at(self, x: u16, y: u16) -> u32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "GPU paint origins use f32 after cancellation is performed in f64"
+    )]
+    pub(crate) fn payload_at(self, x: u32, y: u32) -> ([u32; 2], u32) {
         match self.payload {
-            PaintPayload::Solid(rgba) => rgba,
-            PaintPayload::Position => pack_u16_pair(x, y),
+            PaintPayload::Solid(rgba) => ([rgba, 0], self.paint),
+            PaintPayload::Position(transform)
+                if x > u32::from(u16::MAX) || y > u32::from(u16::MAX) =>
+            {
+                // Preserve small paint coordinates when a wide source origin cancels a large
+                // inverse-transform translation; doing that subtraction in f32 loses color precision.
+                let origin = transform * Point::new(f64::from(x), f64::from(y));
+                (
+                    [(origin.x as f32).to_bits(), (origin.y as f32).to_bits()],
+                    self.paint | LOCAL_PAINT_FLAG,
+                )
+            }
+            PaintPayload::Position(_) => ([x, y], self.paint),
         }
     }
 }
@@ -63,7 +79,7 @@ enum PaintPayload {
     /// Premultiplied RGBA value for a solid paint.
     Solid(u32),
     /// Scene-space position used to evaluate a non-solid paint.
-    Position,
+    Position(Affine),
 }
 
 /// Resolves recorded paints to their encoded GPU offsets.
@@ -137,7 +153,11 @@ impl<'a> PaintResolver<'a> {
                     "paint offsets fit in 24 bits because resource textures are capped at 4096×4096"
                 );
                 PackedPaint {
-                    payload: PaintPayload::Position,
+                    payload: PaintPayload::Position(match encoded_paint {
+                        EncodedPaint::Image(image) => image.transform,
+                        EncodedPaint::Gradient(gradient) => gradient.transform,
+                        EncodedPaint::BlurredRoundedRect(rect) => rect.transform,
+                    }),
                     paint: (COLOR_SOURCE_PAYLOAD << COLOR_SOURCE_SHIFT)
                         | (paint_type << PAINT_TYPE_SHIFT)
                         | (gpu_offset & PAINT_TEXTURE_INDEX_MASK),

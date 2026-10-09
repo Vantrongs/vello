@@ -6,11 +6,11 @@
 use crate::clip::{ClipRef, ClipShape, PathDataRef, intersect};
 use crate::fearless_simd::Level;
 use crate::flatten::{FlattenCtx, Line};
-use crate::geometry::RectU16;
+use crate::geometry::RectU32;
 use crate::kurbo::{Affine, PathEl, Rect, Stroke};
 use crate::peniko::Fill;
-use crate::strip::Strip;
-use crate::tile::Tiles;
+use crate::strip::{Strip, StripFillSegment, visit_strip_fill_segments};
+use crate::tile::{Tile, Tiles};
 use crate::util::strip_bbox;
 use crate::{flatten, rect, strip};
 use alloc::vec::Vec;
@@ -82,20 +82,54 @@ impl StripStorage {
 pub struct StripGenerator {
     pub(crate) level: Level,
     line_buf: Vec<Line>,
+    source_path: Vec<PathEl>,
+    source_storage: StripStorage,
+    source_segments: Vec<SourceSegment>,
+    #[cfg(test)]
+    source_window_replays: usize,
     flatten_ctx: FlattenCtx,
     stroke_ctx: StrokeCtx,
     temp_storage: StripStorage,
     tiles: Tiles,
-    width: u16,
-    height: u16,
+    width: u32,
+    height: u32,
+}
+
+// Windows only partition geometry generation; filter images and filter phases remain whole.
+const SOURCE_WINDOW: u32 = 65532;
+
+// Restrict iteration to intersecting windows without changing the source grid's phase.
+fn source_window_grid(bounds: RectU32, cull_bbox: RectU32) -> RectU32 {
+    let visible = bounds.intersect(cull_bbox);
+    if visible.is_empty() {
+        return RectU32::ZERO;
+    }
+    let start = |origin: u32, first: u32| origin + (first - origin) / SOURCE_WINDOW * SOURCE_WINDOW;
+    RectU32::new(
+        start(bounds.x0, visible.x0),
+        start(bounds.y0, visible.y0),
+        visible.x1,
+        visible.y1,
+    )
+}
+
+#[derive(Debug)]
+struct SourceSegment {
+    fill: StripFillSegment,
+    alpha_idx: Option<u32>,
 }
 
 impl StripGenerator {
     /// Create a new strip generator.
-    pub fn new(width: u16, height: u16, level: Level) -> Self {
+    pub fn new(width: u32, height: u32, level: Level) -> Self {
         Self {
             level,
             line_buf: Vec::new(),
+            source_path: Vec::new(),
+            source_storage: StripStorage::default(),
+            source_segments: Vec::new(),
+            #[cfg(test)]
+            source_window_replays: 0,
             tiles: Tiles::new(level, width, height),
             flatten_ctx: FlattenCtx::default(),
             stroke_ctx: StrokeCtx::default(),
@@ -107,13 +141,13 @@ impl StripGenerator {
 
     /// Get this strip generator's viewport width.
     #[inline(always)]
-    pub fn width(&self) -> u16 {
+    pub fn width(&self) -> u32 {
         self.width
     }
 
     /// Get this strip generator's viewport height.
     #[inline(always)]
-    pub fn height(&self) -> u16 {
+    pub fn height(&self) -> u32 {
         self.height
     }
 
@@ -129,17 +163,52 @@ impl StripGenerator {
     ) {
         let cull_bbox = clip_path
             .map(|clip_path| clip_path.bbox)
-            .unwrap_or(RectU16::new(0, 0, self.width, self.height));
+            .unwrap_or(RectU32::new(0, 0, self.width, self.height));
+        let mut path = path.into_iter();
+        let bounds = self.source_bounds(&mut path, transform, None);
+        if let Some(bounds) = bounds
+            .filter(|bounds| bounds.width() > SOURCE_WINDOW || bounds.height() > SOURCE_WINDOW)
+        {
+            self.generate_source_windows(
+                bounds,
+                cull_bbox,
+                transform,
+                None,
+                fill_rule,
+                aliasing_threshold,
+                strip_storage,
+                clip_path,
+            );
+            self.source_path.clear();
+            return;
+        }
+        let origin = bounds.map_or((0, 0), |bounds| (bounds.x0, bounds.y0));
+        let local_transform = if origin == (0, 0) {
+            transform
+        } else {
+            Affine::translate((-f64::from(origin.0), -f64::from(origin.1))) * transform
+        };
         flatten::fill(
             self.level,
-            path,
-            transform,
+            self.source_path.iter().copied().chain(path),
+            local_transform,
             &mut self.line_buf,
             &mut self.flatten_ctx,
-            cull_bbox,
+            if origin == (0, 0) {
+                cull_bbox
+            } else {
+                cull_bbox.relative_to_origin(origin)
+            },
         );
+        self.source_path.clear();
 
-        self.generate_with_clip(aliasing_threshold, strip_storage, fill_rule, clip_path);
+        self.generate_with_clip(
+            aliasing_threshold,
+            strip_storage,
+            fill_rule,
+            clip_path,
+            origin,
+        );
     }
 
     /// Generate the strips for a stroked path.
@@ -154,18 +223,257 @@ impl StripGenerator {
     ) {
         let cull_bbox = clip_path
             .map(|clip_path| clip_path.bbox)
-            .unwrap_or(RectU16::new(0, 0, self.width, self.height));
+            .unwrap_or(RectU32::new(0, 0, self.width, self.height));
+        let mut path = path.into_iter();
+        let bounds = self.source_bounds(&mut path, transform, Some(stroke));
+        if let Some(bounds) = bounds
+            .filter(|bounds| bounds.width() > SOURCE_WINDOW || bounds.height() > SOURCE_WINDOW)
+        {
+            self.generate_source_windows(
+                bounds,
+                cull_bbox,
+                transform,
+                Some(stroke),
+                Fill::NonZero,
+                aliasing_threshold,
+                strip_storage,
+                clip_path,
+            );
+            self.source_path.clear();
+            return;
+        }
+        let origin = bounds.map_or((0, 0), |bounds| (bounds.x0, bounds.y0));
+        let local_transform = if origin == (0, 0) {
+            transform
+        } else {
+            Affine::translate((-f64::from(origin.0), -f64::from(origin.1))) * transform
+        };
         flatten::stroke(
             self.level,
-            path,
+            self.source_path.iter().copied().chain(path),
             stroke,
-            transform,
+            local_transform,
             &mut self.line_buf,
             &mut self.flatten_ctx,
             &mut self.stroke_ctx,
-            cull_bbox,
+            if origin == (0, 0) {
+                cull_bbox
+            } else {
+                cull_bbox.relative_to_origin(origin)
+            },
         );
-        self.generate_with_clip(aliasing_threshold, strip_storage, Fill::NonZero, clip_path);
+        self.source_path.clear();
+        self.generate_with_clip(
+            aliasing_threshold,
+            strip_storage,
+            Fill::NonZero,
+            clip_path,
+            origin,
+        );
+    }
+
+    fn source_bounds(
+        &mut self,
+        path: &mut impl Iterator<Item = PathEl>,
+        transform: Affine,
+        stroke: Option<&Stroke>,
+    ) -> Option<RectU32> {
+        #[cfg(test)]
+        {
+            self.source_window_replays = 0;
+        }
+        if self.width <= u32::from(u16::MAX) && self.height <= u32::from(u16::MAX) {
+            return None;
+        }
+        self.source_path.clear();
+        self.source_path.extend(path);
+        let mut bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let mut finite = true;
+        let mut include = |point: crate::kurbo::Point| {
+            finite &= point.x.is_finite() && point.y.is_finite();
+            bounds[0] = bounds[0].min(point.x);
+            bounds[1] = bounds[1].min(point.y);
+            bounds[2] = bounds[2].max(point.x);
+            bounds[3] = bounds[3].max(point.y);
+        };
+        for element in &self.source_path {
+            match transform * *element {
+                PathEl::MoveTo(p) | PathEl::LineTo(p) => include(p),
+                PathEl::QuadTo(a, b) => {
+                    include(a);
+                    include(b);
+                }
+                PathEl::CurveTo(a, b, c) => {
+                    include(a);
+                    include(b);
+                    include(c);
+                }
+                PathEl::ClosePath => {}
+            }
+        }
+        if let Some(stroke) = stroke {
+            let expansion =
+                flatten::stroke_cull_rect(RectU32::ZERO, stroke, flatten::max_scale(transform));
+            for i in 0..4 {
+                bounds[i] += expansion[i];
+            }
+        }
+        if !finite || bounds.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let minimum =
+            |value: f64, size: u32, tile: u32| (value.max(0.0) as u32).min(size) / tile * tile;
+        // Retain the boundary tile, including zero coverage: it is part of the
+        // existing tight filter-image bounds and therefore of blur decimation phase.
+        let maximum = |value: f64, size: u32, tile: u32| {
+            (value.max(0.0) + f64::from(tile)).min(f64::from(size)) as u32
+        };
+        let x0 = minimum(bounds[0], self.width, Tile::WIDTH_U32);
+        let y0 = minimum(bounds[1], self.height, Tile::HEIGHT_U32);
+        Some(RectU32::new(
+            x0,
+            y0,
+            maximum(bounds[2], self.width, Tile::WIDTH_U32).max(x0),
+            maximum(bounds[3], self.height, Tile::HEIGHT_U32).max(y0),
+        ))
+    }
+
+    fn generate_source_windows(
+        &mut self,
+        bounds: RectU32,
+        cull_bbox: RectU32,
+        transform: Affine,
+        stroke: Option<&Stroke>,
+        fill_rule: Fill,
+        aliasing_threshold: Option<u8>,
+        strip_storage: &mut StripStorage,
+        clip_path: Option<PathDataRef<'_>>,
+    ) {
+        self.source_storage.clear();
+        self.source_segments.clear();
+        let grid = source_window_grid(bounds, cull_bbox);
+        let mut y = grid.y0;
+        while y < grid.y1 {
+            let y1 = y.saturating_add(SOURCE_WINDOW).min(bounds.y1);
+            let mut x = grid.x0;
+            while x < grid.x1 {
+                let x1 = x.saturating_add(SOURCE_WINDOW).min(bounds.x1);
+                let window = RectU32::new(x, y, x1, y1);
+                let local_cull = cull_bbox.intersect(window).relative_to_origin((x, y));
+                if !local_cull.is_empty() {
+                    #[cfg(test)]
+                    {
+                        self.source_window_replays += 1;
+                    }
+                    let local_transform =
+                        Affine::translate((-f64::from(x), -f64::from(y))) * transform;
+                    if let Some(stroke) = stroke {
+                        flatten::stroke(
+                            self.level,
+                            self.source_path.iter().copied(),
+                            stroke,
+                            local_transform,
+                            &mut self.line_buf,
+                            &mut self.flatten_ctx,
+                            &mut self.stroke_ctx,
+                            local_cull,
+                        );
+                    } else {
+                        flatten::fill(
+                            self.level,
+                            self.source_path.iter().copied(),
+                            local_transform,
+                            &mut self.line_buf,
+                            &mut self.flatten_ctx,
+                            local_cull,
+                        );
+                    }
+                    self.tiles
+                        .make_tiles_analytic_aa(self.level, &self.line_buf, x1 - x, y1 - y);
+                    self.tiles.sort_tiles();
+                    self.source_storage.strips.clear();
+                    strip::render(
+                        self.level,
+                        &self.tiles,
+                        &mut self.source_storage.strips,
+                        &mut self.source_storage.alphas,
+                        fill_rule,
+                        aliasing_threshold,
+                        &self.line_buf,
+                    );
+                    let global = |mut fill: StripFillSegment| {
+                        fill.tile_x0 += x / Tile::WIDTH_U32;
+                        fill.tile_x1 += x / Tile::WIDTH_U32;
+                        fill.tile_y += y / Tile::HEIGHT_U32;
+                        fill
+                    };
+                    visit_strip_fill_segments(
+                        &self.source_storage.strips,
+                        RectU32::new(0, 0, x1 - x, y1 - y).to_tile_bounds(),
+                        &mut self.source_segments,
+                        |segments, alpha| {
+                            segments.push(SourceSegment {
+                                fill: global(alpha.fill),
+                                alpha_idx: Some(alpha.alpha_idx),
+                            });
+                        },
+                        |segments, fill| {
+                            segments.push(SourceSegment {
+                                fill: global(fill),
+                                alpha_idx: None,
+                            });
+                        },
+                    );
+                }
+                x = x1;
+            }
+            y = y1;
+        }
+        self.source_segments
+            .sort_unstable_by_key(|segment| (segment.fill.tile_y, segment.fill.tile_x0));
+        render_with_clip(
+            self.level,
+            &mut self.temp_storage,
+            strip_storage,
+            clip_path,
+            |strips, alphas| {
+                for segment in &self.source_segments {
+                    let fill = segment.fill;
+                    let index = Strip::alpha_index(alphas.len());
+                    strips.push(Strip::new(fill.x0(), fill.y(), index, false));
+                    if let Some(start) = segment.alpha_idx {
+                        let len = (fill.x1() - fill.x0()) as usize * Tile::HEIGHT_U32 as usize;
+                        alphas.extend_from_slice(
+                            &self.source_storage.alphas[start as usize..start as usize + len],
+                        );
+                    } else {
+                        alphas.extend([255; 16]);
+                        if fill.tile_x1 - fill.tile_x0 > 1 {
+                            strips.push(Strip::new(
+                                fill.x1() - Tile::WIDTH_U32,
+                                fill.y(),
+                                Strip::alpha_index(alphas.len()),
+                                true,
+                            ));
+                            alphas.extend([255; 16]);
+                        }
+                    }
+                }
+                if let Some(last) = self.source_segments.last() {
+                    strips.push(Strip::sentinel(
+                        last.fill.y(),
+                        Strip::alpha_index(alphas.len()),
+                    ));
+                }
+            },
+        );
+        self.source_segments.clear();
+        self.source_storage.clear();
     }
 
     fn generate_with_clip(
@@ -174,9 +482,14 @@ impl StripGenerator {
         strip_storage: &mut StripStorage,
         fill_rule: Fill,
         clip_path: Option<PathDataRef<'_>>,
+        origin: (u32, u32),
     ) {
-        self.tiles
-            .make_tiles_analytic_aa(self.level, &self.line_buf, self.width, self.height);
+        self.tiles.make_tiles_analytic_aa(
+            self.level,
+            &self.line_buf,
+            self.width - origin.0,
+            self.height - origin.1,
+        );
 
         self.tiles.sort_tiles();
 
@@ -189,6 +502,7 @@ impl StripGenerator {
             strip_storage,
             clip_path,
             |strips, alphas| {
+                let start = strips.len();
                 strip::render(
                     level,
                     tiles,
@@ -198,6 +512,18 @@ impl StripGenerator {
                     aliasing_threshold,
                     line_buf,
                 );
+                for strip in &mut strips[start..] {
+                    if !strip.is_sentinel() {
+                        strip.x = strip
+                            .x
+                            .checked_add(origin.0)
+                            .expect("source strip coordinate overflow");
+                    }
+                    strip.y = strip
+                        .y
+                        .checked_add(origin.1)
+                        .expect("source strip coordinate overflow");
+                }
             },
         );
     }
@@ -258,7 +584,7 @@ impl StripGenerator {
     }
 
     /// Reset the strip generator for a viewport size, resizing only when needed.
-    pub fn reset(&mut self, width: u16, height: u16) {
+    pub fn reset(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
         self.line_buf.clear();
@@ -306,7 +632,7 @@ fn render_with_clip(
         }) {
             #[cfg(test)]
             CLIP_BYPASSES.with(|count| count.set(count.get() + 1));
-            let alpha_offset = strip_storage.alphas.len() as u32;
+            let alpha_offset = Strip::alpha_index(strip_storage.alphas.len());
             strip_storage
                 .strips
                 .extend(temp_storage.strips.iter().map(|strip| {
@@ -321,7 +647,7 @@ fn render_with_clip(
         let path_data = PathDataRef {
             strips: &temp_storage.strips,
             alphas: &temp_storage.alphas,
-            bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
+            bbox: RectU32::new(0, 0, u32::MAX, u32::MAX),
             opaque_bbox: None,
         };
         intersect(level, clip_path, path_data, strip_storage);
@@ -486,5 +812,278 @@ mod tests {
     #[test]
     fn rect_inverted_both_axes() {
         assert_rect_fast_eq_path(Rect::new(18.0, 18.0, 2.0, 2.0), "inverted_both_axes");
+    }
+}
+
+#[cfg(test)]
+mod wide_tests {
+    use super::{StripGenerator, StripStorage};
+    use crate::{
+        fearless_simd::Level,
+        kurbo::{Affine, Rect, Shape},
+        peniko::Fill,
+    };
+
+    fn sample(storage: &StripStorage, x: u32, y: u32) -> u8 {
+        let row = y / 4 * 4;
+        let start = storage.strips.partition_point(|strip| strip.y < row);
+        for pair in storage.strips[start..].windows(2) {
+            let (strip, next) = (pair[0], pair[1]);
+            if strip.y != row || strip.is_sentinel() {
+                break;
+            }
+            let end = strip.x + strip.width_to(&next);
+            if strip.x <= x && x < end {
+                return storage.alphas
+                    [strip.alpha_idx() as usize + (x - strip.x) as usize * 4 + (y - row) as usize];
+            }
+            if end <= x && x < next.x && next.y == row && next.fill_gap() {
+                return 255;
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn tiny_far_clip_visits_only_its_source_window_and_preserves_grid_phase() {
+        use crate::geometry::RectU32;
+        let end = u32::MAX - 3;
+        let grid = super::source_window_grid(
+            RectU32::new(0, 0, end, end),
+            RectU32::new(end - 4, end - 4, end, end),
+        );
+        assert_eq!(grid, RectU32::new(4294967280, 4294967280, end, end));
+        assert_eq!(
+            grid.width().div_ceil(super::SOURCE_WINDOW)
+                * grid.height().div_ceil(super::SOURCE_WINDOW),
+            1
+        );
+        assert_eq!(
+            super::source_window_grid(
+                RectU32::new(4, 8, 140000, 140000),
+                RectU32::new(65538, 65542, 65540, 65544)
+            ),
+            RectU32::new(65536, 65540, 65540, 65544)
+        );
+        assert!(
+            super::source_window_grid(RectU32::new(0, 0, 4, 4), RectU32::new(8, 8, 12, 12))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fractional_edges_across_source_windows_keep_local_precision_on_both_axes() {
+        for fraction in [0.002, 0.003, 1.0 / 256.0] {
+            for vertical in [false, true] {
+                let edge = super::SOURCE_WINDOW + 4;
+                let end = f64::from(edge) + fraction;
+                let rect = if vertical {
+                    Rect::new(0.0, 0.0, 4.0, end)
+                } else {
+                    Rect::new(0.0, 0.0, end, 4.0)
+                };
+                let (width, height) = if vertical {
+                    (4, edge + 4)
+                } else {
+                    (edge + 4, 4)
+                };
+                let mut generator = StripGenerator::new(width, height, Level::baseline());
+                let mut storage = StripStorage::default();
+                generator.generate_filled_path(
+                    rect.to_path(0.1),
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    None,
+                    &mut storage,
+                    None,
+                );
+                let at = if vertical { (0, edge) } else { (edge, 0) };
+                assert_eq!(
+                    sample(&storage, at.0, at.1),
+                    (fraction * 255.0 + 0.5) as u8,
+                    "fraction={fraction} vertical={vertical}"
+                );
+                for coordinate in super::SOURCE_WINDOW - 2..super::SOURCE_WINDOW + 2 {
+                    let at = if vertical {
+                        (0, coordinate)
+                    } else {
+                        (coordinate, 0)
+                    };
+                    assert_eq!(sample(&storage, at.0, at.1), 255);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_dimensional_window_merge_preserves_holes_and_left_winding() {
+        for rule in [Fill::NonZero, Fill::EvenOdd] {
+            let mut path = Rect::new(-16.0, -16.0, 70000.0, 70000.0).to_path(0.1);
+            let (lo, hi) = (65528.0, 65540.0);
+            if rule == Fill::NonZero {
+                path.move_to((lo, lo));
+                path.line_to((lo, hi));
+                path.line_to((hi, hi));
+                path.line_to((hi, lo));
+                path.close_path();
+            } else {
+                path.extend(Rect::new(lo, lo, hi, hi).path_elements(0.1));
+            }
+            let mut generator = StripGenerator::new(70004, 70004, Level::baseline());
+            let mut storage = StripStorage::default();
+            generator.generate_filled_path(path, rule, Affine::IDENTITY, None, &mut storage, None);
+            assert_eq!(
+                generator.source_window_replays, 4,
+                "a two-by-two source grid replays the geometry exactly four times"
+            );
+            for y in 65524..65544 {
+                for x in 65524..65544 {
+                    let expected = if (65528..65540).contains(&x) && (65528..65540).contains(&y) {
+                        0
+                    } else {
+                        255
+                    };
+                    assert_eq!(sample(&storage, x, y), expected, "{rule:?} ({x},{y})");
+                }
+            }
+            assert_eq!(sample(&storage, 0, 0), 255);
+            assert_eq!(sample(&storage, 69999, 69999), 255);
+            assert_eq!(sample(&storage, 70000, 69999), 0);
+        }
+    }
+
+    #[test]
+    fn nonrectangular_clip_is_applied_after_global_window_merge() {
+        let mut triangle = crate::kurbo::BezPath::new();
+        triangle.move_to((65528.25, 65528.5));
+        triangle.line_to((65540.75, 65529.25));
+        triangle.line_to((65530.5, 65540.75));
+        triangle.close_path();
+        let mut generator = StripGenerator::new(70004, 70004, Level::baseline());
+        let mut clip = StripStorage::default();
+        generator.generate_filled_path(
+            triangle,
+            Fill::NonZero,
+            Affine::IDENTITY,
+            None,
+            &mut clip,
+            None,
+        );
+        let clip_ref = crate::clip::PathDataRef {
+            strips: &clip.strips,
+            alphas: &clip.alphas,
+            bbox: crate::util::strip_bbox(&clip.strips).unwrap(),
+            opaque_bbox: None,
+        };
+        let mut storage = StripStorage::default();
+        generator.generate_filled_path(
+            Rect::new(-16.0, -16.0, 70000.0, 70000.0).to_path(0.1),
+            Fill::NonZero,
+            Affine::IDENTITY,
+            None,
+            &mut storage,
+            Some(clip_ref),
+        );
+        for y in 65524..65544 {
+            for x in 65524..65544 {
+                assert_eq!(sample(&storage, x, y), sample(&clip, x, y), "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn stroked_path_has_no_seam_between_source_windows() {
+        let mut path = crate::kurbo::BezPath::new();
+        path.move_to((-16.0, 3.25));
+        path.line_to((70000.0, 3.25));
+        let mut generator = StripGenerator::new(70004, 8, Level::baseline());
+        let mut storage = StripStorage::default();
+        generator.generate_stroked_path(
+            path,
+            &crate::kurbo::Stroke::new(1.0),
+            Affine::IDENTITY,
+            None,
+            &mut storage,
+            None,
+        );
+        for x in super::SOURCE_WINDOW - 2..super::SOURCE_WINDOW + 2 {
+            assert_eq!(sample(&storage, x, 2), 64, "x={x}");
+            assert_eq!(sample(&storage, x, 3), 191, "x={x}");
+            assert_eq!(sample(&storage, x, 4), 0, "x={x}");
+        }
+    }
+
+    #[test]
+    fn wide_extent_path_keeps_far_fractional_edge() {
+        let mut generator = StripGenerator::new(70004, 4, Level::baseline());
+        let mut storage = StripStorage::default();
+        generator.generate_filled_path(
+            Rect::new(0.0, 0.0, 70000.0 + 1.0 / 256.0, 4.0).to_path(0.1),
+            Fill::NonZero,
+            Affine::IDENTITY,
+            None,
+            &mut storage,
+            None,
+        );
+        let mut coverage = 0;
+        for pair in storage.strips.windows(2) {
+            let strip = pair[0];
+            let width = strip.width_to(&pair[1]);
+            if strip.x <= 70000 && 70000 < strip.x + width {
+                coverage =
+                    storage.alphas[strip.alpha_idx() as usize + (70000 - strip.x) as usize * 4];
+            }
+        }
+        assert_eq!(coverage, 1);
+    }
+
+    #[test]
+    fn wide_source_strips_keep_exact_translated_coverage() {
+        for fast_rect in [false, true] {
+            for (dx, dy) in [(70000, 0), (0, 70000), (70000, 70000)] {
+                let mut small = StripGenerator::new(40, 40, Level::baseline());
+                let mut wide = StripGenerator::new(dx + 40, dy + 40, Level::baseline());
+                let mut reference = StripStorage::default();
+                let mut translated = StripStorage::default();
+                let rect = Rect::new(4.25, 4.5, 24.75, 12.25);
+                let shifted = rect + crate::kurbo::Vec2::new(f64::from(dx), f64::from(dy));
+                if fast_rect {
+                    small.generate_filled_rect_fast(&rect, &mut reference, None);
+                    wide.generate_filled_rect_fast(&shifted, &mut translated, None);
+                } else {
+                    small.generate_filled_path(
+                        rect.to_path(0.1),
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        None,
+                        &mut reference,
+                        None,
+                    );
+                    wide.generate_filled_path(
+                        shifted.to_path(0.1),
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        None,
+                        &mut translated,
+                        None,
+                    );
+                }
+                assert!(!translated.strips.is_empty());
+                for strip in &mut translated.strips {
+                    if !strip.is_sentinel() {
+                        strip.x -= dx;
+                    }
+                    strip.y -= dy;
+                }
+                assert_eq!(
+                    translated.strips, reference.strips,
+                    "fast_rect={fast_rect}, dx={dx}, dy={dy}"
+                );
+                assert_eq!(
+                    translated.alphas, reference.alphas,
+                    "fast_rect={fast_rect}, dx={dx}, dy={dy}"
+                );
+            }
+        }
     }
 }

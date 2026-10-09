@@ -66,6 +66,7 @@ impl DropShadow {
         color: AlphaColor<Srgb>,
         composite_original: bool,
     ) -> Self {
+        super::validate_offset(dx, dy);
         // Precompute blur plan (same logic as GaussianBlur::new)
         let (n_decimations, kernel, kernel_size) = plan_decimated_blur(std_deviation);
 
@@ -108,4 +109,38 @@ pub(crate) fn transform_shadow_params(
     let scaled_std_dev = transform_blur_params(std_deviation, transform);
 
     (scaled_dx, scaled_dy, scaled_std_dev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DropShadow;
+    use crate::{color::palette::css::BLACK, filter_effects::EdgeMode};
+
+    #[test]
+    fn both_shadow_constructors_reject_nonfinite_offsets() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for (dx, dy) in [(value, 0.0), (0.0, value)] {
+                assert!(
+                    std::panic::catch_unwind(|| DropShadow::new(
+                        dx,
+                        dy,
+                        0.0,
+                        EdgeMode::None,
+                        BLACK
+                    ))
+                    .is_err()
+                );
+                assert!(
+                    std::panic::catch_unwind(|| DropShadow::new_shadow_only(
+                        dx,
+                        dy,
+                        0.0,
+                        EdgeMode::None,
+                        BLACK
+                    ))
+                    .is_err()
+                );
+            }
+        }
+    }
 }

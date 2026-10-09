@@ -7,7 +7,7 @@ use crate::dispatch::multi_threaded::{
 };
 use std::vec::Vec;
 use vello_common::clip::{ClipRef, PathDataRef};
-use vello_common::geometry::RectU16;
+use vello_common::geometry::RectU32;
 use vello_common::strip_generator::{GenerationMode, StripGenerator, StripStorage};
 use vello_common::util::strip_bbox;
 
@@ -20,7 +20,7 @@ pub(crate) struct Worker {
 
 impl Worker {
     pub(crate) fn new(width: u16, height: u16, thread_id: u8, level: Level) -> Self {
-        let strip_generator = StripGenerator::new(width, height, level);
+        let strip_generator = StripGenerator::new(u32::from(width), u32::from(height), level);
         let strip_storage = StripStorage::default();
 
         Self {
@@ -39,7 +39,8 @@ impl Worker {
     }
 
     pub(crate) fn reset(&mut self, width: u16, height: u16) {
-        self.strip_generator.reset(width, height);
+        self.strip_generator
+            .reset(u32::from(width), u32::from(height));
     }
 
     pub(crate) fn run_render_task(
@@ -74,14 +75,16 @@ impl Worker {
                     blend_mode,
                     mask,
                 } => {
-                    let start = self.strip_storage.strips.len() as u32;
+                    let start = u32::try_from(self.strip_storage.strips.len())
+                        .expect("strip range exceeds u32");
 
                     self.strip_generator.generate_filled_rect_fast(
                         &rect,
                         &mut self.strip_storage,
                         path_clip,
                     );
-                    let end = self.strip_storage.strips.len() as u32;
+                    let end = u32::try_from(self.strip_storage.strips.len())
+                        .expect("strip range exceeds u32");
 
                     render_task.allocation_group.recorded_commands.push(
                         RecordedCommand::RenderPath {
@@ -102,7 +105,8 @@ impl Worker {
                     aliasing_threshold,
                     mask,
                 } => {
-                    let start = self.strip_storage.strips.len() as u32;
+                    let start = u32::try_from(self.strip_storage.strips.len())
+                        .expect("strip range exceeds u32");
                     let path = &render_task.allocation_group.path
                         [path_range.start as usize..path_range.end as usize];
 
@@ -114,7 +118,8 @@ impl Worker {
                         &mut self.strip_storage,
                         path_clip.map(|clip| clip.path),
                     );
-                    let end = self.strip_storage.strips.len() as u32;
+                    let end = u32::try_from(self.strip_storage.strips.len())
+                        .expect("strip range exceeds u32");
 
                     let recorded_command = RecordedCommand::RenderPath {
                         thread_id: self.thread_id,
@@ -138,7 +143,8 @@ impl Worker {
                     aliasing_threshold,
                     mask,
                 } => {
-                    let start = self.strip_storage.strips.len() as u32;
+                    let start = u32::try_from(self.strip_storage.strips.len())
+                        .expect("strip range exceeds u32");
                     let path = &render_task.allocation_group.path
                         [path_range.start as usize..path_range.end as usize];
 
@@ -150,7 +156,8 @@ impl Worker {
                         &mut self.strip_storage,
                         path_clip.map(|clip| clip.path),
                     );
-                    let end = self.strip_storage.strips.len() as u32;
+                    let end = u32::try_from(self.strip_storage.strips.len())
+                        .expect("strip range exceeds u32");
 
                     let recorded_command = RecordedCommand::RenderPath {
                         thread_id: self.thread_id,
@@ -174,7 +181,8 @@ impl Worker {
                     aliasing_threshold,
                 } => {
                     let (clip, clip_bbox) = if let Some((path_range, transform)) = clip_path {
-                        let start = self.strip_storage.strips.len() as u32;
+                        let start = u32::try_from(self.strip_storage.strips.len())
+                            .expect("strip range exceeds u32");
                         let path = &render_task.allocation_group.path
                             [path_range.start as usize..path_range.end as usize];
 
@@ -187,12 +195,13 @@ impl Worker {
                             path_clip.map(|clip| clip.path),
                         );
 
-                        let end = self.strip_storage.strips.len() as u32;
+                        let end = u32::try_from(self.strip_storage.strips.len())
+                            .expect("strip range exceeds u32");
                         let range = start..end;
                         let bbox = strip_bbox(
                             &self.strip_storage.strips[range.start as usize..range.end as usize],
                         )
-                        .unwrap_or(RectU16::ZERO);
+                        .unwrap_or(RectU32::ZERO);
 
                         (Some(range), Some(bbox))
                     } else {

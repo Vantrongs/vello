@@ -20,15 +20,15 @@
 
 use super::FilterEffect;
 use crate::filter::context::ScratchBuffer;
+use crate::filter::pixmap::FilterPixmap;
 use vello_common::filter::gaussian_blur::{DecimationSizer, GaussianBlur};
 use vello_common::filter_effects::EdgeMode;
 use vello_common::peniko::color::PremulRgba8;
 #[cfg(not(feature = "std"))]
 use vello_common::peniko::kurbo::common::FloatFuncs as _;
-use vello_common::pixmap::Pixmap;
 
 impl FilterEffect for GaussianBlur {
-    fn execute_lowp(&self, pixmap: &mut Pixmap, filter_scratch: &mut ScratchBuffer) {
+    fn execute_lowp(&self, pixmap: &mut FilterPixmap, filter_scratch: &mut ScratchBuffer) {
         // No blur if std_deviation is zero or negative
         if self.std_deviation <= 0.0 {
             return;
@@ -44,7 +44,7 @@ impl FilterEffect for GaussianBlur {
         );
     }
 
-    fn execute_highp(&self, pixmap: &mut Pixmap, filter_scratch: &mut ScratchBuffer) {
+    fn execute_highp(&self, pixmap: &mut FilterPixmap, filter_scratch: &mut ScratchBuffer) {
         // TODO: Currently only lowp is implemented and used for highp as well.
         // This needs to be updated to use proper high-precision arithmetic.
         Self::execute_lowp(self, pixmap, filter_scratch);
@@ -60,8 +60,8 @@ impl FilterEffect for GaussianBlur {
 /// The `scratch` buffer is used for separable convolution and must be at least as
 /// large as the source pixmap.
 pub(crate) fn apply_blur(
-    pixmap: &mut Pixmap,
-    scratch: &mut Pixmap,
+    pixmap: &mut FilterPixmap,
+    scratch: &mut FilterPixmap,
     n_decimations: usize,
     kernel: &[f32],
     edge_mode: EdgeMode,
@@ -69,6 +69,10 @@ pub(crate) fn apply_blur(
     let radius = (kernel.len() / 2) as u8;
     let width = pixmap.width();
     let height = pixmap.height();
+
+    if width == 0 || height == 0 {
+        return;
+    }
 
     // Small blur: apply direct convolution at full resolution
     if n_decimations == 0 {
@@ -93,8 +97,8 @@ pub(crate) fn apply_blur(
     // Upsample back to original resolution (each step doubles resolution by 2×)
     for _ in 0..n_decimations {
         let (w, h) = sizer.current();
-        upscale(pixmap, w, h, edge_mode);
-        sizer.upscale();
+        let (dst_width, dst_height) = sizer.upscale();
+        upscale(pixmap, w, h, dst_width, dst_height, edge_mode);
     }
 
     debug_assert_eq!(
@@ -110,10 +114,10 @@ pub(crate) fn apply_blur(
 /// of the pixmap, using only the top-left region defined by width × height.
 /// The `temp` buffer is provided by the caller to avoid allocations.
 pub(crate) fn convolve(
-    src: &mut Pixmap,
-    scratch: &mut Pixmap,
-    width: u16,
-    height: u16,
+    src: &mut FilterPixmap,
+    scratch: &mut FilterPixmap,
+    width: u32,
+    height: u32,
     kernel: &[f32],
     radius: u8,
     edge_mode: EdgeMode,
@@ -128,10 +132,10 @@ pub(crate) fn convolve(
 /// using the Gaussian kernel. Handles edge cases according to the specified edge mode.
 /// Writes results to a destination buffer to avoid overwriting source data.
 pub(crate) fn convolve_x(
-    src: &Pixmap,
-    dst: &mut Pixmap,
-    src_width: u16,
-    src_height: u16,
+    src: &FilterPixmap,
+    dst: &mut FilterPixmap,
+    src_width: u32,
+    src_height: u32,
     kernel: &[f32],
     radius: u8,
     edge_mode: EdgeMode,
@@ -146,8 +150,8 @@ pub(crate) fn convolve_x(
                     clippy::cast_possible_wrap,
                     reason = "This cast never wraps because `kernel.len()` is never greater than `u8::MAX` due to the restriction on `MAX_KERNEL_SIZE`"
                 )]
-                let j = j as i32;
-                let src_x = x as i32 + j - radius as i32;
+                let j = j as i64;
+                let src_x = x as i64 + j - radius as i64;
                 let p = sample_x(src, src_x, y, src_width, edge_mode);
 
                 rgba[0] += p.r as f32 * k;
@@ -177,10 +181,10 @@ pub(crate) fn convolve_x(
 /// using the Gaussian kernel. Handles edge cases according to the specified edge mode.
 /// Writes results to a destination buffer to avoid overwriting source data.
 pub(crate) fn convolve_y(
-    src: &Pixmap,
-    dst: &mut Pixmap,
-    src_width: u16,
-    src_height: u16,
+    src: &FilterPixmap,
+    dst: &mut FilterPixmap,
+    src_width: u32,
+    src_height: u32,
     kernel: &[f32],
     radius: u8,
     edge_mode: EdgeMode,
@@ -195,8 +199,8 @@ pub(crate) fn convolve_y(
                     clippy::cast_possible_wrap,
                     reason = "This cast never wraps because `kernel.len()` is never greater than `u8::MAX` due to the restriction on `MAX_KERNEL_SIZE`"
                 )]
-                let j = j as i32;
-                let src_y = y as i32 + j - radius as i32;
+                let j = j as i64;
+                let src_y = y as i64 + j - radius as i64;
                 let p = sample_y(src, x, src_y, src_height, edge_mode);
 
                 rgba[0] += p.r as f32 * k;
@@ -225,11 +229,11 @@ pub(crate) fn convolve_y(
 /// Performs horizontal and vertical decimation in sequence. Returns the new
 /// logical dimensions (ceil(width/2), ceil(height/2)).
 pub(crate) fn downscale(
-    src: &mut Pixmap,
-    src_width: u16,
-    src_height: u16,
+    src: &mut FilterPixmap,
+    src_width: u32,
+    src_height: u32,
     edge_mode: EdgeMode,
-) -> (u16, u16) {
+) -> (u32, u32) {
     let dst_width = src_width.div_ceil(2);
     let dst_height = src_height.div_ceil(2);
     downscale_x(src, src_width, src_height, dst_width, edge_mode);
@@ -244,10 +248,10 @@ pub(crate) fn downscale(
 /// Reduces width by 2x while applying a binomial blur kernel. The \[1,3,3,1\] weights
 /// approximate a Gaussian and contribute variance=0.75 before the 2x downsampling.
 fn downscale_x(
-    src: &mut Pixmap,
-    src_width: u16,
-    src_height: u16,
-    dst_width: u16,
+    src: &mut FilterPixmap,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
     edge_mode: EdgeMode,
 ) {
     for y in 0..src_height {
@@ -255,13 +259,25 @@ fn downscale_x(
         // with current pixels (x2, x3). Start with sample at -1 for implicit left padding.
         let mut p0 = sample_x(src, -1, y, src_width, edge_mode);
         let mut p1 = sample_x(src, 0, y, src_width, edge_mode);
+        // Wrapped edge taps can refer to pixels already overwritten by decimation.
+        let right = [
+            sample_x(src, i64::from(src_width), y, src_width, edge_mode),
+            sample_x(src, i64::from(src_width) + 1, y, src_width, edge_mode),
+        ];
 
         for x in 0..dst_width {
             // Sample 4 horizontally adjacent pixels for [1,3,3,1] kernel
             // Pattern: [x*2-1, x*2, x*2+1, x*2+2]
-            let src_x = (x * 2) as i32;
-            let p2 = sample_x(src, src_x + 1, y, src_width, edge_mode);
-            let p3 = sample_x(src, src_x + 2, y, src_width, edge_mode);
+            let src_x = (x * 2) as i64;
+            let tap = |coord| {
+                if coord >= i64::from(src_width) {
+                    right[(coord - i64::from(src_width)) as usize]
+                } else {
+                    sample_x(src, coord, y, src_width, edge_mode)
+                }
+            };
+            let p2 = tap(src_x + 1);
+            let p3 = tap(src_x + 2);
 
             // Apply [1,3,3,1]/8 weights → output = (p0 + 3×p1 + 3×p2 + p3) / 8
             src.set_pixel(x, y, decimate_weighted(p0, p1, p2, p3));
@@ -278,10 +294,10 @@ fn downscale_x(
 /// Reduces logical height by 2x while applying a binomial blur kernel.
 /// Operates in-place by writing to the beginning of the same buffer.
 fn downscale_y(
-    src: &mut Pixmap,
-    src_width: u16,
-    src_height: u16,
-    dst_height: u16,
+    src: &mut FilterPixmap,
+    src_width: u32,
+    src_height: u32,
+    dst_height: u32,
     edge_mode: EdgeMode,
 ) {
     for x in 0..src_width {
@@ -289,13 +305,24 @@ fn downscale_y(
         // with current pixels (y2, y3). Start with sample at -1 for implicit top padding.
         let mut p0 = sample_y(src, x, -1, src_height, edge_mode);
         let mut p1 = sample_y(src, x, 0, src_height, edge_mode);
+        let bottom = [
+            sample_y(src, x, i64::from(src_height), src_height, edge_mode),
+            sample_y(src, x, i64::from(src_height) + 1, src_height, edge_mode),
+        ];
 
         for y in 0..dst_height {
             // Sample 4 vertically adjacent pixels for [1,3,3,1] kernel
             // Pattern: [y*2-1, y*2, y*2+1, y*2+2]
-            let src_y = (y * 2) as i32;
-            let p2 = sample_y(src, x, src_y + 1, src_height, edge_mode);
-            let p3 = sample_y(src, x, src_y + 2, src_height, edge_mode);
+            let src_y = (y * 2) as i64;
+            let tap = |coord| {
+                if coord >= i64::from(src_height) {
+                    bottom[(coord - i64::from(src_height)) as usize]
+                } else {
+                    sample_y(src, x, coord, src_height, edge_mode)
+                }
+            };
+            let p2 = tap(src_y + 1);
+            let p3 = tap(src_y + 2);
 
             // Apply [1,3,3,1]/8 weights → output = (p0 + 3×p1 + 3×p2 + p3) / 8
             src.set_pixel(x, y, decimate_weighted(p0, p1, p2, p3));
@@ -326,15 +353,15 @@ fn downscale_y(
 /// - Position `2k+1`: distance 0.5 from center at `2k+0.5`, distance 1.5 from center at `2k+2.5`
 ///   → weights: 0.75×pixel\[k\] + 0.25×pixel\[k+1\]
 pub(crate) fn upscale(
-    src: &mut Pixmap,
-    src_width: u16,
-    src_height: u16,
+    src: &mut FilterPixmap,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
     edge_mode: EdgeMode,
-) -> (u16, u16) {
-    let dst_width = src_width * 2;
-    let dst_height = src_height * 2;
-    upscale_x(src, src_width, src_height, edge_mode);
-    upscale_y(src, dst_width, src_height, edge_mode);
+) -> (u32, u32) {
+    upscale_x(src, src_width, src_height, dst_width, edge_mode);
+    upscale_y(src, dst_width, src_height, dst_height, edge_mode);
     (dst_width, dst_height)
 }
 
@@ -344,24 +371,38 @@ pub(crate) fn upscale(
 /// generates two output pixels with different weights based on their distance from
 /// the downsampled pixel's center position.
 /// Operates in-place by processing backwards to avoid overwriting source data.
-fn upscale_x(src: &mut Pixmap, src_width: u16, src_height: u16, edge_mode: EdgeMode) {
+fn upscale_x(
+    src: &mut FilterPixmap,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    edge_mode: EdgeMode,
+) {
     // Process backwards (right to left) to avoid overwriting source data
     for y in 0..src_height {
         // Maintain sliding window of three pixels: prev, current, next
         // This allows us to compute both output pixels that depend on current pixel x
-        let mut p0 = sample_x(src, src_width as i32, y, src_width, edge_mode);
-        let mut p1 = sample_x(src, src_width as i32 - 1, y, src_width, edge_mode);
+        // Preserve the opposite edge before the backwards pass overwrites it.
+        let left = sample_x(src, -1, y, src_width, edge_mode);
+        let mut p0 = sample_x(src, src_width as i64, y, src_width, edge_mode);
+        let mut p1 = sample_x(src, src_width as i64 - 1, y, src_width, edge_mode);
 
         for x in (0..src_width).rev() {
-            let src_x = x as i32;
-            let p2 = sample_x(src, src_x - 1, y, src_width, edge_mode);
+            let src_x = x as i64;
+            let p2 = if x == 0 {
+                left
+            } else {
+                sample_x(src, src_x - 1, y, src_width, edge_mode)
+            };
 
             // Generate two output pixels per input with phase-aligned interpolation:
             // output[2x]   = 0.25×p2 + 0.75×p1  (position 2x   is 0.5 from center at 2x+0.5)
             // output[2x+1] = 0.75×p1 + 0.25×p0  (position 2x+1 is 0.5 from center at 2x+0.5)
             let dst_x = x * 2;
             src.set_pixel(dst_x, y, interpolate_25_75(p2, p1));
-            src.set_pixel(dst_x + 1, y, interpolate_75_25(p1, p0));
+            if dst_x + 1 < dst_width {
+                src.set_pixel(dst_x + 1, y, interpolate_75_25(p1, p0));
+            }
 
             // Advance sliding window for next iteration
             p0 = p1;
@@ -376,24 +417,37 @@ fn upscale_x(src: &mut Pixmap, src_width: u16, src_height: u16, edge_mode: EdgeM
 /// generates two output pixels with different weights based on their distance from
 /// the downsampled pixel's center position.
 /// Operates in-place by processing backwards to avoid overwriting source data.
-fn upscale_y(src: &mut Pixmap, src_width: u16, src_height: u16, edge_mode: EdgeMode) {
+fn upscale_y(
+    src: &mut FilterPixmap,
+    src_width: u32,
+    src_height: u32,
+    dst_height: u32,
+    edge_mode: EdgeMode,
+) {
     // Process backwards (bottom to top) to avoid overwriting source data
     for x in 0..src_width {
         // Maintain sliding window of three pixels: prev, current, next
         // This allows us to compute both output pixels that depend on current pixel y
-        let mut p0 = sample_y(src, x, src_height as i32, src_height, edge_mode);
-        let mut p1 = sample_y(src, x, src_height as i32 - 1, src_height, edge_mode);
+        let top = sample_y(src, x, -1, src_height, edge_mode);
+        let mut p0 = sample_y(src, x, src_height as i64, src_height, edge_mode);
+        let mut p1 = sample_y(src, x, src_height as i64 - 1, src_height, edge_mode);
 
         for y in (0..src_height).rev() {
-            let src_y = y as i32;
-            let p2 = sample_y(src, x, src_y - 1, src_height, edge_mode);
+            let src_y = y as i64;
+            let p2 = if y == 0 {
+                top
+            } else {
+                sample_y(src, x, src_y - 1, src_height, edge_mode)
+            };
 
             // Generate two output rows per input with phase-aligned interpolation:
             // output[2y]   = 0.25×p2 + 0.75×p1  (position 2y   is 0.5 from center at 2y+0.5)
             // output[2y+1] = 0.75×p1 + 0.25×p0  (position 2y+1 is 0.5 from center at 2y+0.5)
             let dst_y = y * 2;
             src.set_pixel(x, dst_y, interpolate_25_75(p2, p1));
-            src.set_pixel(x, dst_y + 1, interpolate_75_25(p1, p0));
+            if dst_y + 1 < dst_height {
+                src.set_pixel(x, dst_y + 1, interpolate_75_25(p1, p0));
+            }
 
             // Advance sliding window for next iteration
             p0 = p1;
@@ -412,13 +466,13 @@ const TRANSPARENT_BLACK: PremulRgba8 = PremulRgba8 {
 
 /// Sample a pixel with edge mode handling for horizontal sampling.
 #[inline(always)]
-fn sample_x(src: &Pixmap, x: i32, y: u16, width: u16, edge_mode: EdgeMode) -> PremulRgba8 {
+fn sample_x(src: &FilterPixmap, x: i64, y: u32, width: u32, edge_mode: EdgeMode) -> PremulRgba8 {
     sample(x, width, edge_mode, |src_x| src.sample(src_x, y))
 }
 
 /// Sample a pixel with edge mode handling for vertical sampling.
 #[inline(always)]
-fn sample_y(src: &Pixmap, x: u16, y: i32, height: u16, edge_mode: EdgeMode) -> PremulRgba8 {
+fn sample_y(src: &FilterPixmap, x: u32, y: i64, height: u32, edge_mode: EdgeMode) -> PremulRgba8 {
     sample(y, height, edge_mode, |src_y| src.sample(x, src_y))
 }
 
@@ -428,12 +482,12 @@ fn sample_y(src: &Pixmap, x: u16, y: i32, height: u16, edge_mode: EdgeMode) -> P
 /// The `sample_fn` closure receives the clamped/extended coordinate and returns the pixel.
 /// For `EdgeMode::None`, returns transparent black if the coordinate is out of bounds.
 #[inline(always)]
-fn sample<F>(coord: i32, size: u16, edge_mode: EdgeMode, sample_fn: F) -> PremulRgba8
+fn sample<F>(coord: i64, size: u32, edge_mode: EdgeMode, sample_fn: F) -> PremulRgba8
 where
-    F: FnOnce(u16) -> PremulRgba8,
+    F: FnOnce(u32) -> PremulRgba8,
 {
     // For EdgeMode::None, return transparent black if out of bounds
-    if edge_mode == EdgeMode::None && (coord < 0 || coord >= size as i32) {
+    if edge_mode == EdgeMode::None && (coord < 0 || coord >= size as i64) {
         return TRANSPARENT_BLACK;
     }
     let extended_coord = extend(coord, size, edge_mode);
@@ -446,35 +500,35 @@ where
 /// depending on the mode. For `EdgeMode::None`, the coordinate is guaranteed to be
 /// in-bounds (already checked by caller, which returns transparent black for out-of-bounds).
 #[inline(always)]
-fn extend(coord: i32, size: u16, edge_mode: EdgeMode) -> u16 {
+fn extend(coord: i64, size: u32, edge_mode: EdgeMode) -> u32 {
     match edge_mode {
         EdgeMode::Duplicate => {
             // Clamp to image bounds: pixels outside use nearest edge pixel
-            coord.clamp(0, size as i32 - 1) as u16
+            coord.clamp(0, size as i64 - 1) as u32
         }
         EdgeMode::None => {
             // Coordinate is already validated as in-bounds by caller
-            coord as u16
+            coord as u32
         }
         EdgeMode::Wrap => {
             // Wrap around using modulo: image tiles infinitely
-            let mut c = coord % size as i32;
+            let mut c = coord % size as i64;
             if c < 0 {
-                c += size as i32;
+                c += size as i64;
             }
-            c as u16
+            c as u32
         }
         EdgeMode::Mirror => {
             // Mirror at boundaries: image reflects across edges
-            let period = size as i32 * 2;
+            let period = size as i64 * 2;
             let mut c = coord % period;
             if c < 0 {
                 c += period;
             }
-            if c >= size as i32 {
+            if c >= size as i64 {
                 c = period - c - 1;
             }
-            c as u16
+            c as u32
         }
     }
 }
@@ -529,6 +583,7 @@ fn interpolate_75_25(p0: PremulRgba8, p1: PremulRgba8) -> PremulRgba8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
     use vello_common::filter::gaussian_blur::{
         MAX_KERNEL_SIZE, compute_gaussian_kernel, plan_decimated_blur,
     };
@@ -599,7 +654,7 @@ mod tests {
     #[test]
     fn test_extend_none() {
         let size = 10;
-        // None mode just passes the coordinate as u16
+        // None mode just passes the coordinate as u32
         assert_eq!(extend(5, size, EdgeMode::None), 5);
         assert_eq!(extend(9, size, EdgeMode::None), 9);
         assert_eq!(extend(10, size, EdgeMode::None), 10);
@@ -727,21 +782,21 @@ mod tests {
         let r2 = interpolate_75_25(p1, p0);
 
         // Should be symmetric
-        assert!((r1.r as i32 - r2.r as i32).abs() <= 0);
-        assert!((r1.g as i32 - r2.g as i32).abs() <= 0);
-        assert!((r1.b as i32 - r2.b as i32).abs() <= 0);
-        assert!((r1.a as i32 - r2.a as i32).abs() <= 0);
+        assert!((r1.r as i64 - r2.r as i64).abs() <= 0);
+        assert!((r1.g as i64 - r2.g as i64).abs() <= 0);
+        assert!((r1.b as i64 - r2.b as i64).abs() <= 0);
+        assert!((r1.a as i64 - r2.a as i64).abs() <= 0);
     }
 
     /// Test that very small image sizes don't panic.
     #[test]
     fn test_small_image_sizes() {
-        let mut pixmap = Pixmap::new(1, 1);
+        let mut pixmap = FilterPixmap::new(1, 1);
         let (n_decimations, kernel, kernel_size) = plan_decimated_blur(2.0);
 
         // Should not panic
         let result = std::panic::catch_unwind(move || {
-            let mut scratch = Pixmap::new(1, 1);
+            let mut scratch = FilterPixmap::new(1, 1);
             apply_blur(
                 &mut pixmap,
                 &mut scratch,
@@ -757,7 +812,7 @@ mod tests {
     /// Test downscale with odd dimensions.
     #[test]
     fn test_downscale_odd_dimensions() {
-        let mut pixmap = Pixmap::new(5, 5);
+        let mut pixmap = FilterPixmap::new(5, 5);
         // Fill with white
         for y in 0..5 {
             for x in 0..5 {
@@ -783,8 +838,8 @@ mod tests {
     /// Test upscale dimensions.
     #[test]
     fn test_upscale_dimensions() {
-        let mut pixmap = Pixmap::new(6, 6);
-        let (new_width, new_height) = upscale(&mut pixmap, 3, 3, EdgeMode::Duplicate);
+        let mut pixmap = FilterPixmap::new(6, 6);
+        let (new_width, new_height) = upscale(&mut pixmap, 3, 3, 6, 6, EdgeMode::Duplicate);
         // 3 * 2 = 6
         assert_eq!(new_width, 6);
         assert_eq!(new_height, 6);
@@ -793,8 +848,8 @@ mod tests {
     /// Test that horizontal convolution preserves uniform colors.
     #[test]
     fn test_convolve_x_uniform() {
-        let mut src = Pixmap::new(5, 3);
-        let mut dst = Pixmap::new(5, 3);
+        let mut src = FilterPixmap::new(5, 3);
+        let mut dst = FilterPixmap::new(5, 3);
         // Fill with uniform gray
         src.data_mut().fill(PremulRgba8 {
             r: 128,
@@ -834,8 +889,8 @@ mod tests {
     /// Test that vertical convolution preserves uniform colors.
     #[test]
     fn test_convolve_y_uniform() {
-        let mut src = Pixmap::new(3, 5);
-        let mut dst = Pixmap::new(3, 5);
+        let mut src = FilterPixmap::new(3, 5);
+        let mut dst = FilterPixmap::new(3, 5);
         // Fill with uniform gray
         src.data_mut().fill(PremulRgba8 {
             r: 128,
@@ -875,8 +930,8 @@ mod tests {
     /// Test that convolution with identity kernel is a no-op.
     #[test]
     fn test_convolve_identity_kernel() {
-        let mut src = Pixmap::new(3, 3);
-        let mut dst = Pixmap::new(3, 3);
+        let mut src = FilterPixmap::new(3, 3);
+        let mut dst = FilterPixmap::new(3, 3);
         src.set_pixel(
             1,
             1,
@@ -919,7 +974,7 @@ mod tests {
     /// Test sampling behavior at exact boundaries for each edge mode.
     #[test]
     fn test_sample_x_at_boundaries() {
-        let mut pixmap = Pixmap::new(3, 1);
+        let mut pixmap = FilterPixmap::new(3, 1);
         pixmap.set_pixel(
             0,
             0,
@@ -967,7 +1022,7 @@ mod tests {
     /// Test sampling behavior at exact boundaries for vertical sampling.
     #[test]
     fn test_sample_y_at_boundaries() {
-        let mut pixmap = Pixmap::new(1, 3);
+        let mut pixmap = FilterPixmap::new(1, 3);
         pixmap.set_pixel(
             0,
             0,
@@ -1030,7 +1085,7 @@ mod tests {
     /// Test that downscale → upscale preserves dimensions.
     #[test]
     fn test_downscale_upscale_roundtrip() {
-        let mut pixmap = Pixmap::new(8, 8);
+        let mut pixmap = FilterPixmap::new(8, 8);
         // Fill with a pattern
         pixmap.data_mut().fill(PremulRgba8 {
             r: 128,
@@ -1043,18 +1098,18 @@ mod tests {
         assert_eq!(w1, 4);
         assert_eq!(h1, 4);
 
-        let (w2, h2) = upscale(&mut pixmap, w1, h1, EdgeMode::Duplicate);
+        let (w2, h2) = upscale(&mut pixmap, w1, h1, 8, 8, EdgeMode::Duplicate);
         assert_eq!(w2, 8);
         assert_eq!(h2, 8);
     }
 
-    fn pixmap_from_red(width: u16, height: u16, values: &[&[u8]]) -> Pixmap {
-        let mut pixmap = Pixmap::new(width, height);
+    fn pixmap_from_red(width: u32, height: u32, values: &[&[u8]]) -> FilterPixmap {
+        let mut pixmap = FilterPixmap::new(width, height);
         for (y, row) in values.iter().enumerate() {
             for (x, &r) in row.iter().enumerate() {
                 pixmap.set_pixel(
-                    x as u16,
-                    y as u16,
+                    x as u32,
+                    y as u32,
                     PremulRgba8 {
                         r,
                         g: 0,
@@ -1067,10 +1122,13 @@ mod tests {
         pixmap
     }
 
-    fn assert_red_values<const W: usize, const H: usize>(pixmap: &Pixmap, expected: [[u8; W]; H]) {
+    fn assert_red_values<const W: usize, const H: usize>(
+        pixmap: &FilterPixmap,
+        expected: [[u8; W]; H],
+    ) {
         for (y, row) in expected.iter().enumerate() {
             for (x, &want) in row.iter().enumerate() {
-                let got = pixmap.sample(x as u16, y as u16).r;
+                let got = pixmap.sample(x as u32, y as u32).r;
 
                 assert_eq!(
                     got, want,
@@ -1086,7 +1144,7 @@ mod tests {
         //   (0,1)=20   (1,1)=60   (2,1)=100  (3,1)=140
         let mut pixmap = pixmap_from_red(4, 2, &[&[0, 40, 80, 120], &[20, 60, 100, 140]]);
 
-        let dst_width = 4_u16.div_ceil(2);
+        let dst_width = 4_u32.div_ceil(2);
         downscale_x(&mut pixmap, 4, 2, dst_width, EdgeMode::Duplicate);
 
         // Row 0: p[-1]=0,p[0]=0,p[1]=40,p[2]=80    → (0+0*3+40*3+80+4)>>3       = 25
@@ -1105,7 +1163,7 @@ mod tests {
         //   (0,3)=55   (1,3)=125
         let mut pixmap = pixmap_from_red(2, 4, &[&[25, 95], &[45, 115], &[35, 105], &[55, 125]]);
 
-        let dst_height = 4_u16.div_ceil(2);
+        let dst_height = 4_u32.div_ceil(2);
         downscale_y(&mut pixmap, 2, 4, dst_height, EdgeMode::Duplicate);
 
         // Col 0: p[-1]=25,p[0]=25,p[1]=45,p[2]=35 → (25+25*3+45*3+35+4)>>3   = 34
@@ -1119,7 +1177,7 @@ mod tests {
     fn test_upscale_x_non_uniform() {
         let mut pixmap = pixmap_from_red(4, 2, &[&[34, 104], &[46, 116]]);
 
-        upscale_x(&mut pixmap, 2, 2, EdgeMode::Duplicate);
+        upscale_x(&mut pixmap, 2, 2, 4, EdgeMode::Duplicate);
 
         // Row 0 [34, 104]:
         //   x=0: interp25_75(34,34)=34,  interp75_25(34,104)=(34*3+104+2)>>2 = 52
@@ -1134,7 +1192,7 @@ mod tests {
     fn test_upscale_y_non_uniform() {
         let mut pixmap = pixmap_from_red(4, 4, &[&[34, 52, 87, 104], &[46, 64, 99, 116]]);
 
-        upscale_y(&mut pixmap, 4, 2, EdgeMode::Duplicate);
+        upscale_y(&mut pixmap, 4, 2, 4, EdgeMode::Duplicate);
 
         #[rustfmt::skip]
         assert_red_values(&pixmap, [
@@ -1143,5 +1201,192 @@ mod tests {
             [ 43,  61,  96, 113],
             [ 46,  64,  99, 116],
         ]);
+    }
+    fn reference_sample(line: &[PremulRgba8], coord: i64, mode: EdgeMode) -> PremulRgba8 {
+        let len = line.len() as i64;
+        let index = match mode {
+            EdgeMode::None if !(0..len).contains(&coord) => return TRANSPARENT_BLACK,
+            EdgeMode::None => coord,
+            EdgeMode::Duplicate => coord.max(0).min(len - 1),
+            EdgeMode::Wrap => coord.rem_euclid(len),
+            EdgeMode::Mirror => {
+                let folded = coord.rem_euclid(2 * len);
+                if folded < len {
+                    folded
+                } else {
+                    2 * len - 1 - folded
+                }
+            }
+        };
+        line[index as usize]
+    }
+
+    fn reference_resample_line(
+        line: &[PremulRgba8],
+        len: usize,
+        up: bool,
+        mode: EdgeMode,
+    ) -> Vec<PremulRgba8> {
+        (0..len)
+            .map(|out| {
+                let (positions, weights, denominator) = if up {
+                    let center = (out / 2) as i64;
+                    (
+                        [center, center + if out % 2 == 0 { -1 } else { 1 }, 0, 0],
+                        [3, 1, 0, 0],
+                        4,
+                    )
+                } else {
+                    let center = (out * 2) as i64;
+                    (
+                        [center - 1, center, center + 1, center + 2],
+                        [1, 3, 3, 1],
+                        8,
+                    )
+                };
+                let mut channels = [denominator / 2; 4];
+                for (position, weight) in positions.into_iter().zip(weights) {
+                    let p = reference_sample(line, position, mode);
+                    for (sum, value) in channels.iter_mut().zip([p.r, p.g, p.b, p.a]) {
+                        *sum += u32::from(value) * weight;
+                    }
+                }
+                let [r, g, b, a] = channels.map(|sum| (sum / denominator) as u8);
+                PremulRgba8 { r, g, b, a }
+            })
+            .collect()
+    }
+
+    fn reference_resample(
+        src: &FilterPixmap,
+        width: u32,
+        height: u32,
+        dst_width: u32,
+        dst_height: u32,
+        up: bool,
+        mode: EdgeMode,
+    ) -> FilterPixmap {
+        let mut horizontal = FilterPixmap::new(dst_width, height);
+        for y in 0..height {
+            let line: Vec<_> = (0..width).map(|x| src.sample(x, y)).collect();
+            for (x, p) in reference_resample_line(&line, dst_width as usize, up, mode)
+                .into_iter()
+                .enumerate()
+            {
+                horizontal.set_pixel(x as u32, y, p);
+            }
+        }
+        let mut result = FilterPixmap::new(dst_width, dst_height);
+        for x in 0..dst_width {
+            let line: Vec<_> = (0..height).map(|y| horizontal.sample(x, y)).collect();
+            for (y, p) in reference_resample_line(&line, dst_height as usize, up, mode)
+                .into_iter()
+                .enumerate()
+            {
+                result.set_pixel(x, y as u32, p);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn resampling_matches_out_of_place_oracle_for_all_edges_and_odd_sizes() {
+        for mode in [
+            EdgeMode::None,
+            EdgeMode::Duplicate,
+            EdgeMode::Wrap,
+            EdgeMode::Mirror,
+        ] {
+            for width in 1..=9 {
+                for height in 1..=7 {
+                    let mut actual = FilterPixmap::new(width, height);
+                    for y in 0..height {
+                        for x in 0..width {
+                            let value = ((x * 41 + y * 67 + 19) % 256) as u8;
+                            actual.set_pixel(
+                                x,
+                                y,
+                                PremulRgba8 {
+                                    r: value,
+                                    g: value / 2,
+                                    b: value / 3,
+                                    a: 255,
+                                },
+                            );
+                        }
+                    }
+                    let reduced_width = width.div_ceil(2);
+                    let reduced_height = height.div_ceil(2);
+                    let expected_down = reference_resample(
+                        &actual,
+                        width,
+                        height,
+                        reduced_width,
+                        reduced_height,
+                        false,
+                        mode,
+                    );
+                    downscale(&mut actual, width, height, mode);
+                    for y in 0..reduced_height {
+                        for x in 0..reduced_width {
+                            assert_eq!(
+                                actual.sample(x, y),
+                                expected_down.sample(x, y),
+                                "down {mode:?} {width}x{height} at {x},{y}"
+                            );
+                        }
+                    }
+                    let expected_up = reference_resample(
+                        &expected_down,
+                        reduced_width,
+                        reduced_height,
+                        width,
+                        height,
+                        true,
+                        mode,
+                    );
+                    upscale(
+                        &mut actual,
+                        reduced_width,
+                        reduced_height,
+                        width,
+                        height,
+                        mode,
+                    );
+                    assert_eq!(
+                        actual.data(),
+                        expected_up.data(),
+                        "up {mode:?} {width}x{height}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn odd_wide_and_tall_blur_preserves_constant_duplicate_edges() {
+        let color = PremulRgba8 {
+            r: 53,
+            g: 107,
+            b: 149,
+            a: 255,
+        };
+        for (width, height) in [(65_535, 1), (65_537, 1), (1, 65_535), (1, 65_537)] {
+            let mut pixels = FilterPixmap::new(width, height);
+            pixels.data_mut().fill(color);
+            let mut scratch = FilterPixmap::new(width, height);
+            let (levels, kernel, count) = plan_decimated_blur(5.0);
+            apply_blur(
+                &mut pixels,
+                &mut scratch,
+                levels,
+                &kernel[..usize::from(count)],
+                EdgeMode::Duplicate,
+            );
+            assert!(
+                pixels.data().iter().all(|&pixel| pixel == color),
+                "{width}x{height}"
+            );
+        }
     }
 }

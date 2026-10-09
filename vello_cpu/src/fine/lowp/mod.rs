@@ -22,11 +22,9 @@ use crate::region::Region;
 use crate::util::NormalizedMulExt;
 use crate::util::scalar::div_255;
 use bytemuck::{cast_slice, cast_slice_mut};
-use core::iter;
 use vello_common::encode::{EncodedGradient, EncodedImage};
 use vello_common::fearless_simd::*;
-use vello_common::filter_effects::Filter;
-use vello_common::kurbo::Affine;
+use vello_common::filter::PreparedFilter;
 use vello_common::mask::Mask;
 use vello_common::paint::{PremulColor, Tint, TintMode};
 use vello_common::pixmap::Pixmap;
@@ -56,12 +54,11 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
         reason = "`FineKernel` is public but this specific method is not needed."
     )]
     fn filter_layer(
-        pixmap: &mut Pixmap,
-        filter: &Filter,
+        pixmap: &mut crate::filter::pixmap::FilterPixmap,
+        filter: PreparedFilter,
         filter_scratch: &mut ScratchBuffer,
-        transform: Affine,
     ) {
-        filter_lowp(filter, pixmap, filter_scratch, transform);
+        filter_lowp(filter, pixmap, filter_scratch);
     }
 
     /// Fills a buffer with a solid color using SIMD operations.
@@ -241,8 +238,8 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        mut start_x: usize,
-        start_y: u16,
+        mut start_x: i64,
+        start_y: i64,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
         alphas: Option<&[u8]>,
@@ -251,28 +248,18 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
         let alpha_iter = alphas.map(|a| cast_slice::<u8, [u8; 8]>(a).iter().copied());
 
         let mask_iter = mask.map(|m| {
-            iter::from_fn(|| {
-                let sample = |x: usize, y: u16| {
-                    if x < usize::from(m.width()) && y < m.height() {
-                        m.sample(u16::try_from(x).unwrap(), y)
-                    } else {
-                        255
-                    }
-                };
-
+            core::iter::from_fn(move || {
                 let samples = [
-                    sample(start_x, start_y),
-                    sample(start_x, start_y + 1),
-                    sample(start_x, start_y + 2),
-                    sample(start_x, start_y + 3),
-                    sample(start_x + 1, start_y),
-                    sample(start_x + 1, start_y + 1),
-                    sample(start_x + 1, start_y + 2),
-                    sample(start_x + 1, start_y + 3),
+                    super::sample_mask(m, start_x, start_y),
+                    super::sample_mask(m, start_x, start_y + 1),
+                    super::sample_mask(m, start_x, start_y + 2),
+                    super::sample_mask(m, start_x, start_y + 3),
+                    super::sample_mask(m, start_x + 1, start_y),
+                    super::sample_mask(m, start_x + 1, start_y + 1),
+                    super::sample_mask(m, start_x + 1, start_y + 2),
+                    super::sample_mask(m, start_x + 1, start_y + 3),
                 ];
-
                 start_x += 2;
-
                 Some(samples)
             })
         });
@@ -323,7 +310,7 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
 
 #[inline(always)]
 fn pack<S: Simd>(simd: S, scratch: &[u8], width: usize, region: &mut Region<'_>) {
-    let block_width = if region.height == Tile::HEIGHT {
+    let block_width = if region.height == Tile::HEIGHT_U32 {
         (width / Tile::WIDTH as usize) * Tile::WIDTH as usize
     } else {
         0
@@ -383,7 +370,7 @@ fn pack_tail(scratch: &[u8], x: usize, width: usize, region: &mut Region<'_>) {
     for y in 0..region.height {
         let row = &mut region.row_mut(y)[x * COLOR_COMPONENTS..(x + width) * COLOR_COMPONENTS];
         for (dx, pixel) in row.chunks_exact_mut(COLOR_COMPONENTS).enumerate() {
-            let idx = COLOR_COMPONENTS * (Tile::HEIGHT as usize * dx + usize::from(y));
+            let idx = COLOR_COMPONENTS * (Tile::HEIGHT as usize * dx + y as usize);
             pixel.copy_from_slice(&scratch[idx..idx + COLOR_COMPONENTS]);
         }
     }
@@ -391,7 +378,7 @@ fn pack_tail(scratch: &[u8], x: usize, width: usize, region: &mut Region<'_>) {
 
 #[inline(always)]
 fn unpack<S: Simd>(simd: S, region: &mut Region<'_>, width: usize, scratch: &mut [u8]) {
-    let block_width = if region.height == Tile::HEIGHT {
+    let block_width = if region.height == Tile::HEIGHT_U32 {
         width / Tile::WIDTH as usize * Tile::WIDTH as usize
     } else {
         0
@@ -450,7 +437,7 @@ fn unpack_tail(region: &mut Region<'_>, x: usize, width: usize, scratch: &mut [u
     for y in 0..region.height {
         let row = &region.row_mut(y)[x * COLOR_COMPONENTS..(x + width) * COLOR_COMPONENTS];
         for (dx, pixel) in row.chunks_exact(COLOR_COMPONENTS).enumerate() {
-            let idx = COLOR_COMPONENTS * (Tile::HEIGHT as usize * dx + usize::from(y));
+            let idx = COLOR_COMPONENTS * (Tile::HEIGHT as usize * dx + y as usize);
             scratch[idx..idx + COLOR_COMPONENTS].copy_from_slice(pixel);
         }
     }

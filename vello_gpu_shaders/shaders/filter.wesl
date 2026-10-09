@@ -8,6 +8,7 @@ import package::filters::drop_shadow::{
     get_drop_shadow_offset
 };
 import package::filters::scale::{downscale, upscale};
+import package::filters::sample::get_edge_mode;
 import package::helpers::geometry::{pixel_to_ndc, quad_corner};
 import package::helpers::texture::flat_index_to_texture_coord;
 import package::helpers::util::unpack_u16_pair;
@@ -48,7 +49,7 @@ const FILTER_ATLAS_PADDING: u32 = 6u;
 
 // The layout of the header:
 //   bits [0:4]   = filter_type   (5 bits)
-//   bits [5:6]   = edge_mode     (2 bits, only for blur filters), currently ignored.
+//   bits [5:6]   = edge_mode     (2 bits, only for blur filters).
 //   bits [7:10]  = n_decimations (4 bits, only for blur filters), only read on the CPU side.
 //   bits [11:12] = n_linear_taps (2 bits, only for blur filters)
 //   bit  [13]    = composite_original (only for drop shadows), only read on the CPU side.
@@ -203,8 +204,9 @@ fn fs_main(
                 dxdy = vec2<f32>(get_offset_dx(filter_texel0), get_offset_dy(filter_texel0));
             }
 
-            // CPU version uses normal round but WGSL round with ties even, so we use floor + 0.5 instead.
-            return sample_source_checked(source_origin, source_size, rel_coord - floor(dxdy + 0.5));
+            // Rust rounds ties away from zero; WGSL round uses ties to even.
+            let offset = sign(dxdy) * floor(abs(dxdy) + 0.5);
+            return sample_source_checked(source_origin, source_size, rel_coord - offset);
         }
         case PASS_DOWNSCALE: {
             return downscale(
@@ -212,6 +214,8 @@ fn fs_main(
                 linear_sampler,
                 position,
                 source_origin,
+                source_size,
+                get_edge_mode(load_filter_texel(filter_data_offset, 0u)),
                 dest_origin,
             );
         }
@@ -222,6 +226,7 @@ fn fs_main(
                 source_texture,
                 linear_sampler,
                 source_origin,
+                source_size,
                 rel_coord,
                 BLUR_HORIZONTAL,
                 filter_texel0,
@@ -235,6 +240,7 @@ fn fs_main(
                 source_texture,
                 linear_sampler,
                 source_origin,
+                source_size,
                 rel_coord,
                 BLUR_VERTICAL,
                 filter_texel0,
@@ -247,6 +253,8 @@ fn fs_main(
                 linear_sampler,
                 position,
                 source_origin,
+                source_size,
+                get_edge_mode(load_filter_texel(filter_data_offset, 0u)),
                 dest_origin,
             );
         }

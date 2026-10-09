@@ -17,7 +17,7 @@ use vello_common::encode::{EncodeExt, EncodedPaint, invert_paint_transform};
 use vello_common::fearless_simd::Level;
 use vello_common::filter::FilterData;
 use vello_common::filter_effects::Filter;
-use vello_common::geometry::{RectU16, SizeU16};
+use vello_common::geometry::{RectU32, SizeU16};
 use vello_common::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
 use vello_common::mask::Mask;
 use vello_common::multi_atlas::AtlasConfig;
@@ -77,9 +77,9 @@ impl RecordedDraw {
 impl Drawable for RecordedDraw {
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "recorded fast rectangles are clipped to the u16 viewport"
+        reason = "recorded fast rectangles are clipped to the u32 source viewport"
     )]
-    fn bbox(&self, strips: &[Strip]) -> Option<RectU16> {
+    fn bbox(&self, strips: &[Strip]) -> Option<RectU32> {
         match self {
             // TODO: The bbox trait should take a reference to _all_ strips, and then we select
             // the correct strips here. Otherwise, callers of this method always have to make sure
@@ -91,11 +91,11 @@ impl Drawable for RecordedDraw {
                 let rect = rect.rect;
 
                 (!rect.is_zero_area()).then(|| {
-                    RectU16::new(
-                        rect.x0.floor() as u16,
-                        rect.y0.floor() as u16,
-                        rect.x1.ceil() as u16,
-                        rect.y1.ceil() as u16,
+                    RectU32::new(
+                        rect.x0.floor() as u32,
+                        rect.y0.floor() as u32,
+                        rect.x1.ceil() as u32,
+                        rect.y1.ceil() as u32,
                     )
                     .snap_to_tile_coordinates()
                 })
@@ -242,7 +242,7 @@ impl Scene {
         Self {
             width,
             height,
-            viewport_state: ViewportState::new(width, height, level),
+            viewport_state: ViewportState::new(width.into(), height.into(), level),
             render_state: RenderState::default(),
             root_transforms: RootTransforms::default(),
             aliasing_threshold: None,
@@ -633,7 +633,7 @@ impl Scene {
     /// # Panics
     ///
     /// Panics if `mask` is provided because mask layers are not yet supported.
-    /// Also panics if the filter's required source viewport exceeds `u16` dimensions.
+    /// Also panics if the filter's required source viewport exceeds the supported source coordinate domain.
     pub fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,
@@ -678,7 +678,7 @@ impl Scene {
                     let strip_range = strip_start..strip_storage.strips.len();
                     LayerClip {
                         bbox: strip_bbox(&strip_storage.strips[strip_range.clone()])
-                            .unwrap_or(RectU16::ZERO),
+                            .unwrap_or(RectU32::ZERO),
                         strip_range,
                         thread_idx: 0,
                     }
@@ -856,7 +856,8 @@ impl Scene {
 
     /// Reset scene to default values.
     pub fn reset(&mut self) {
-        self.viewport_state.reset(self.width, self.height);
+        self.viewport_state
+            .reset(self.width.into(), self.height.into());
         {
             let mut ss = self.strip_storage.borrow_mut();
             ss.clear();
@@ -906,7 +907,7 @@ mod tests {
     #[cfg(feature = "text")]
     use glifo::Glyph;
     use vello_common::TextureId;
-    use vello_common::geometry::RectU16;
+    use vello_common::geometry::{RectU16, RectU32};
     use vello_common::kurbo::{BezPath, Rect};
     use vello_common::paint::{Image, ImageSource, Paint, PremulColor};
     use vello_common::peniko::ImageSampler;
@@ -916,35 +917,39 @@ mod tests {
     use vello_common::record::Drawable;
 
     #[test]
+    fn filter_source_viewport_can_exceed_root_u16_dimensions() {
+        use vello_common::filter_effects::{Filter, FilterFunction};
+        for (width, height) in [(u16::MAX, 4), (4, u16::MAX)] {
+            let mut scene = Scene::new(width, height);
+            scene.push_filter_layer(Filter::from_function(FilterFunction::Blur { radius: 1.5 }));
+            assert!(scene.viewport_state.width() > u32::from(width));
+            assert!(scene.viewport_state.height() > u32::from(height));
+            scene.fill_rect(&Rect::new(0.0, 0.0, 4.0, 4.0));
+            scene.pop_layer();
+            assert!(!scene.viewport_state.has_root_viewports());
+            assert!(!scene.recorder.has_layers());
+        }
+    }
+
+    #[test]
     fn rejected_filter_extent_preserves_scene_state() {
         extern crate std;
         use std::panic::{AssertUnwindSafe, catch_unwind};
         use vello_common::filter_effects::{Filter, FilterFunction};
-
-        for (width, height) in [(u16::MAX, 4), (4, u16::MAX)] {
-            let mut scene = Scene::new(width, height);
-            let error = catch_unwind(AssertUnwindSafe(|| {
-                scene
-                    .push_filter_layer(Filter::from_function(FilterFunction::Blur { radius: 1.5 }));
-            }))
-            .unwrap_err();
-            let message = error.downcast_ref::<&str>().copied().or_else(|| {
-                error
-                    .downcast_ref::<alloc::string::String>()
-                    .map(|s| s.as_str())
-            });
-            assert_eq!(
-                message,
-                Some("filter source viewport exceeds u16 coordinate domain")
-            );
-            assert!(!scene.viewport_state.has_root_viewports());
-            assert!(!scene.recorder.has_layers());
-            scene.fill_rect(&Rect::new(0.0, 0.0, 4.0, 4.0));
-            let RecordedDraw::Rect(draw) = &scene.recorder.draws[0] else {
-                panic!("expected a rectangle draw after rejected filter");
-            };
-            assert_eq!(draw.rect, Rect::new(0.0, 0.0, 4.0, 4.0));
-        }
+        let mut scene = Scene::new(4, 4);
+        let error = catch_unwind(AssertUnwindSafe(|| {
+            scene.push_filter_layer(Filter::from_function(FilterFunction::Blur {
+                radius: f32::MAX,
+            }));
+        }));
+        assert!(error.is_err());
+        assert!(!scene.viewport_state.has_root_viewports());
+        assert!(!scene.recorder.has_layers());
+        scene.fill_rect(&Rect::new(0.0, 0.0, 4.0, 4.0));
+        let RecordedDraw::Rect(draw) = &scene.recorder.draws[0] else {
+            panic!("expected a rectangle draw after rejected filter");
+        };
+        assert_eq!(draw.rect, Rect::new(0.0, 0.0, 4.0, 4.0));
     }
 
     #[test]
@@ -954,7 +959,7 @@ mod tests {
             Paint::Solid(PremulColor::from_alpha_color(BLUE)),
         );
 
-        assert_eq!(draw.bbox(&[]), Some(RectU16::new(0, 0, 8, 8)));
+        assert_eq!(draw.bbox(&[]), Some(RectU32::new(0, 0, 8, 8)));
     }
 
     #[test]

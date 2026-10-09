@@ -161,9 +161,9 @@ pub enum IntermediateTextureError {
     )]
     TooLarge {
         /// The requested allocation width.
-        width: u32,
+        width: u64,
         /// The requested allocation height.
-        height: u32,
+        height: u64,
         /// The maximum intermediate texture width.
         max_width: u16,
         /// The maximum intermediate texture height.

@@ -54,6 +54,8 @@ fn erf7(x: f32) -> f32 {
 // after vello_cpu's blurred rounded rectangle painter rather than the Vello Classic shader.
 fn calculate_blurred_rounded_rect(
     fragment_pos: vec2<f32>,
+    paint_origin: vec2<f32>,
+    local_paint: bool,
     texel0: vec4<u32>,
     texel1: vec4<u32>,
     texel2: vec4<u32>,
@@ -75,7 +77,8 @@ fn calculate_blurred_rounded_rect(
     let width = get_blurred_rounded_rect_width(texel4);
     let height = get_blurred_rounded_rect_height(texel4);
 
-    let local_xy = transform * fragment_pos + translate;
+    var local_xy = transform * fragment_pos + translate;
+    if local_paint { local_xy = transform * fragment_pos + paint_origin; }
     // The 0.5 and 0.0 constants correspond to vello_cpu's v1 and v0 respectively.
     let y = local_xy.y - 0.5 * height;
     let y0 = r1 + abs(y) - 0.5 * h;

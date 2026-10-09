@@ -153,7 +153,7 @@ mod tests {
         let kind = RecordedLayerKind::Regular;
         let bbox = RectU16::new(0, 0, size.width(), size.height());
 
-        LayerAllocationRequest::new(bbox, &kind, texture_parity)
+        LayerAllocationRequest::new(bbox.into(), &kind, texture_parity)
     }
 
     #[test]
@@ -236,8 +236,8 @@ mod tests {
             else {
                 panic!("expected an explicit oversized allocation error");
             };
-            assert_eq!(width, u32::from(size.width()).next_multiple_of(4));
-            assert_eq!(height, u32::from(size.height()).next_multiple_of(4));
+            assert_eq!(width, u64::from(size.width()).next_multiple_of(4));
+            assert_eq!(height, u64::from(size.height()).next_multiple_of(4));
         }
     }
 

@@ -5,19 +5,19 @@ use super::cmd::{DepthFill, LayerFill, LayerFillAttrs, PaintFill, PaintFillAttrs
 use super::depth::{DepthSegment, DepthState};
 use crate::coarse::depth;
 use crate::filter::context::FilterContext;
-use crate::kurbo::{Affine, Vec2};
-use crate::peniko::{BlendMode, Extend, ImageQuality, ImageSampler};
+use crate::filter::pixmap::FilterPixmap;
+use crate::fine::FilterPaint;
+use crate::peniko::BlendMode;
 use crate::record::RecordedFill;
 use crate::span::TileAlignedSpan;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use vello_common::encode::{EncodedImage, EncodedPaint};
+use vello_common::encode::EncodedPaint;
 use vello_common::filter::FilterLayerPlacement;
-use vello_common::geometry::RectU16;
+use vello_common::geometry::RectU32;
 use vello_common::mask::Mask;
-use vello_common::paint::{ImageSource, IndexedPaint, Paint};
-use vello_common::pixmap::Pixmap;
+use vello_common::paint::{IndexedPaint, Paint};
 use vello_common::record::{LayerClip, LayerProps, Node, RecordedLayer, RecordedLayerKind};
 use vello_common::strip::{Strip, visit_strip_fill_segments};
 use vello_common::tile::Tile;
@@ -134,14 +134,14 @@ impl Clear for RowState {
     }
 }
 
-fn debug_assert_tile_aligned(point: (u16, u16), description: &str) {
+fn debug_assert_tile_aligned(point: (u32, u32), description: &str) {
     debug_assert_eq!(
-        point.0 % Tile::WIDTH,
+        point.0 % Tile::WIDTH_U32,
         0,
         "{description} must be tile-width aligned",
     );
     debug_assert_eq!(
-        point.1 % Tile::HEIGHT,
+        point.1 % Tile::HEIGHT_U32,
         0,
         "{description} must be tile-height aligned",
     );
@@ -151,7 +151,9 @@ fn debug_assert_tile_aligned(point: (u16, u16), description: &str) {
 #[derive(Debug)]
 pub(crate) struct CommandBucketer {
     /// The viewport of the root/filter layer in tile coordinates.
-    viewport: RectU16,
+    viewport: RectU32,
+    /// Translation from target-local pixels to physical mask coordinates.
+    mask_offset: (i64, i64),
     /// The active clip bboxes in tile coordinates, always anchored at the
     /// (0, 0) origin, regardless of the viewport, tracked for two reasons:
     /// - So we can clamp fill commands to the bbox and avoid unnecessary rendering work.
@@ -164,7 +166,7 @@ pub(crate) struct CommandBucketer {
     ///      of the filter layer is visible.
     ///   3) Pop the intermediate layer, which will take care of doing the fine-grained clipping
     ///      (e.g. applying anti-aliasing from the clip path).
-    pub(super) clip_bboxes: Vec<RectU16>,
+    pub(super) clip_bboxes: Vec<RectU32>,
     /// The actual render commands for each strip row.
     ///
     /// Since this is essentially a 2D-array, we use [`RetainVec`] to preserve inner allocations
@@ -172,7 +174,7 @@ pub(crate) struct CommandBucketer {
     pub(super) rows: RetainVec<RowState>,
     pub(crate) paint_fill_attrs: Vec<PaintFillAttrs>,
     pub(crate) layer_fill_attrs: Vec<LayerFillAttrs>,
-    pub(crate) filter_paints: Vec<EncodedPaint>,
+    pub(crate) filter_paints: Vec<FilterPaint>,
     /// Keeping track of currently active layers to enable lazy layer pushing.
     pub(super) active_layers: Vec<ActiveLayer>,
     /// A vector pool for keeping track of occupied rows in a layer.
@@ -184,22 +186,26 @@ pub(crate) struct CommandBucketer {
 }
 
 impl CommandBucketer {
-    pub(crate) fn from_wh(width: u16, height: u16) -> Self {
-        Self::new(RectU16::new(0, 0, width, height))
+    pub(crate) fn from_wh(width: u32, height: u32) -> Self {
+        Self::new(RectU32::new(0, 0, width, height))
     }
 
-    pub(crate) fn new(viewport: RectU16) -> Self {
+    pub(crate) fn new(viewport: RectU32) -> Self {
         // It's _very_ important that we snap to tile coordinates. Fine rasterization assumes
         // that the width is a multiple of the tile width, so if that's not the case bad things
         // could happen!
         let viewport = viewport.to_tile_bounds();
-        let clip_bbox = RectU16::new(0, 0, viewport.width(), viewport.height());
+        let clip_bbox = RectU32::new(0, 0, viewport.width(), viewport.height());
         // Note: `clip_bbox` is already snapped to tile coordinates because `viewport` is, so no
         // need to `div_ceil` here.
-        let num_rows = usize::from(clip_bbox.height());
+        let num_rows = clip_bbox.height() as usize;
 
         Self {
             viewport,
+            mask_offset: (
+                i64::from(viewport.x0) * i64::from(Tile::WIDTH_U32),
+                i64::from(viewport.y0) * i64::from(Tile::HEIGHT_U32),
+            ),
             clip_bboxes: vec![clip_bbox],
             rows: RetainVec::with_len(num_rows, RowState::new),
             paint_fill_attrs: Vec::new(),
@@ -213,7 +219,7 @@ impl CommandBucketer {
         }
     }
 
-    fn bbox_span(bbox: RectU16) -> TileAlignedSpan {
+    fn bbox_span(bbox: RectU32) -> TileAlignedSpan {
         // Bbox might be empty vertically but not horizontally. In this case,
         // it should still be considered a zero-sized span, though.
         // TODO: Discard empty layers in an earlier stage.
@@ -229,21 +235,25 @@ impl CommandBucketer {
     }
 
     pub(crate) fn width(&self) -> usize {
-        usize::from(self.clip_bboxes[0].width()) * usize::from(Tile::WIDTH)
+        (self.clip_bboxes[0].width() as usize) * (Tile::WIDTH_U32 as usize)
     }
 
-    fn viewport_origin(&self) -> (u16, u16) {
+    fn viewport_origin(&self) -> (u32, u32) {
         (
-            self.viewport.x0 * Tile::WIDTH,
-            self.viewport.y0 * Tile::HEIGHT,
+            self.viewport.x0 * Tile::WIDTH_U32,
+            self.viewport.y0 * Tile::HEIGHT_U32,
         )
     }
 
-    pub(crate) fn reset(&mut self, viewport: RectU16) {
+    pub(crate) fn mask_offset(&self) -> (i64, i64) {
+        self.mask_offset
+    }
+
+    pub(crate) fn reset(&mut self, viewport: RectU32, source_shift: (u32, u32)) {
         // Keep the same tile-coordinate contract as the constructor.
         let viewport = viewport.to_tile_bounds();
-        let clip_bbox = RectU16::new(0, 0, viewport.width(), viewport.height());
-        let num_rows = usize::from(viewport.height());
+        let clip_bbox = RectU32::new(0, 0, viewport.width(), viewport.height());
+        let num_rows = viewport.height() as usize;
 
         self.rows.clear();
         self.rows.resize_with(num_rows, RowState::new);
@@ -257,6 +267,11 @@ impl CommandBucketer {
         self.occupied_rows_bool_scratch.resize(num_rows, false);
         self.next_draw_id = 1;
         self.viewport = viewport;
+        let origin = self.viewport_origin();
+        self.mask_offset = (
+            i64::from(origin.0) - i64::from(source_shift.0),
+            i64::from(origin.1) - i64::from(source_shift.1),
+        );
         self.clip_bboxes.truncate(1);
         self.clip_bboxes[0] = clip_bbox;
     }
@@ -391,9 +406,6 @@ impl CommandBucketer {
         }
 
         self.active_layers.push(ActiveLayer {
-            // TODO: Masks are currently probably broken if they are used inside of a filter layer,
-            // since they aren't shifted and also only work if the mask has the same dimensions as
-            // our allocated filter layer.
             mask: props.mask.clone(),
             blend_mode: props.blend_mode,
             opacity: props.opacity,
@@ -406,8 +418,8 @@ impl CommandBucketer {
         // since even areas where we didn't draw anything need to be blended with the destructive
         // blend mode.
         if props.blend_mode.is_destructive() && !bbox.is_empty() {
-            let row_start = usize::from(bbox.y0);
-            let row_end = usize::from(bbox.y1).min(self.rows.len());
+            let row_start = bbox.y0 as usize;
+            let row_end = (bbox.y1 as usize).min(self.rows.len());
             for row_idx in row_start..row_end {
                 self.ensure_row_layers(row_idx);
             }
@@ -430,7 +442,8 @@ impl CommandBucketer {
         // also require anti-aliasing.
 
         if let Some(clip) = layer.clip {
-            let attrs_idx = self.layer_fill_attrs.len() as u32;
+            let attrs_idx = u32::try_from(self.layer_fill_attrs.len())
+                .expect("layer attribute index exceeds u32");
             let draw_id = self.next_draw_id();
 
             self.layer_fill_attrs.push(LayerFillAttrs {
@@ -491,7 +504,8 @@ impl CommandBucketer {
 
             self.occupied_rows_pool.submit(layer.occupied_rows);
         } else {
-            let attrs_idx = self.layer_fill_attrs.len() as u32;
+            let attrs_idx = u32::try_from(self.layer_fill_attrs.len())
+                .expect("layer attribute index exceeds u32");
             let draw_id = self.next_draw_id();
 
             self.layer_fill_attrs.push(LayerFillAttrs {
@@ -519,7 +533,7 @@ impl CommandBucketer {
 
     pub(crate) fn generate_filter_layer_fill(
         &mut self,
-        pixmap: Arc<Pixmap>,
+        pixmap: Arc<FilterPixmap>,
         placement: FilterLayerPlacement,
         static_paint_count: usize,
     ) {
@@ -535,8 +549,8 @@ impl CommandBucketer {
         // `FilterLayerPlacement::new` for a more detailed description of how/what this offset
         // represents).
         let src_offset = (
-            i32::from(src_sample_shift.0) - i32::from(dest_bbox.x0),
-            i32::from(src_sample_shift.1) - i32::from(dest_bbox.y0),
+            i64::from(src_sample_shift.0) - i64::from(dest_bbox.x0),
+            i64::from(src_sample_shift.1) - i64::from(dest_bbox.y0),
         );
 
         // Now that we have determined the image transform, we next need to determine which
@@ -560,21 +574,13 @@ impl CommandBucketer {
         let draw_id = self.next_draw_id();
         let span = Self::bbox_span(clipped_dest_bbox);
         let paint_idx = static_paint_count + self.filter_paints.len();
-        self.filter_paints.push(EncodedPaint::Image(EncodedImage {
-            source: ImageSource::Pixmap(pixmap),
-            sampler: ImageSampler {
-                x_extend: Extend::Pad,
-                y_extend: Extend::Pad,
-                quality: ImageQuality::Low,
-                alpha: 1.0,
-            },
-            may_have_transparency: true,
-            transform: Affine::translate((f64::from(src_offset.0), f64::from(src_offset.1))),
-            x_advance: Vec2::new(1.0, 0.0),
-            y_advance: Vec2::new(0.0, 1.0),
-            tint: None,
-        }));
-        let attrs_idx = self.paint_fill_attrs.len() as u32;
+        self.filter_paints.push(FilterPaint {
+            pixmap,
+            src_offset,
+            dest_bbox: placement.dest_bbox(),
+        });
+        let attrs_idx =
+            u32::try_from(self.paint_fill_attrs.len()).expect("paint attribute index exceeds u32");
         self.paint_fill_attrs.push(PaintFillAttrs {
             paint: Paint::Indexed(IndexedPaint::new(paint_idx)),
             blend_mode: BlendMode::default(),
@@ -583,8 +589,8 @@ impl CommandBucketer {
             thread_idx: 0,
             origin,
         });
-        let row_start = usize::from(clipped_dest_bbox.y0);
-        let row_end = usize::from(clipped_dest_bbox.y1);
+        let row_start = clipped_dest_bbox.y0 as usize;
+        let row_end = clipped_dest_bbox.y1 as usize;
         for row_idx in row_start..row_end {
             self.push_fill(GeneratedFill { row_idx, span }, attrs_idx, None);
         }
@@ -602,7 +608,8 @@ impl CommandBucketer {
 
         debug_assert_ne!(attrs.draw_id, 0, "fill draw IDs should start at 1");
 
-        let attrs_idx = self.paint_fill_attrs.len() as u32;
+        let attrs_idx =
+            u32::try_from(self.paint_fill_attrs.len()).expect("paint attribute index exceeds u32");
         self.paint_fill_attrs.push(attrs.clone());
 
         let draw_id =
@@ -664,7 +671,7 @@ impl CommandBucketer {
 
         let origin_tile_x = self.viewport.x0;
         let origin_tile_y = self.viewport.y0;
-        let tile_bounds = RectU16::new(
+        let tile_bounds = RectU32::new(
             origin_tile_x + clip_bbox.x0,
             origin_tile_y + clip_bbox.y0,
             origin_tile_x + clip_bbox.x1,
@@ -676,7 +683,7 @@ impl CommandBucketer {
             tile_bounds,
             self,
             |bucketer, segment| {
-                let row_idx = usize::from(segment.tile_y - origin_tile_y);
+                let row_idx = (segment.tile_y - origin_tile_y) as usize;
                 alpha_fill_cmd(
                     bucketer,
                     GeneratedAlphaFill {
@@ -690,7 +697,7 @@ impl CommandBucketer {
                 );
             },
             |bucketer, segment| {
-                let row_idx = usize::from(segment.tile_y - origin_tile_y);
+                let row_idx = (segment.tile_y - origin_tile_y) as usize;
                 fill_cmd(
                     bucketer,
                     GeneratedFill {
@@ -766,7 +773,7 @@ mod tests {
     use crate::coarse::depth::{BucketRange, DEPTH_BUCKET_WIDTH};
     use vello_common::color::palette::css::{BLUE, RED};
     use vello_common::color::{AlphaColor, Srgb};
-    use vello_common::geometry::RectU16;
+    use vello_common::geometry::RectU32;
     use vello_common::paint::{Paint, PremulColor};
     use vello_common::peniko::{BlendMode, Compose, Mix};
     use vello_common::record::LayerProps;
@@ -797,7 +804,7 @@ mod tests {
         }
     }
 
-    fn clipped_layer_props(bbox: RectU16) -> LayerProps {
+    fn clipped_layer_props(bbox: RectU32) -> LayerProps {
         LayerProps {
             blend_mode: BlendMode::default(),
             opacity: 1.0,
@@ -810,7 +817,7 @@ mod tests {
         }
     }
 
-    fn destructive_clipped_layer_props(bbox: RectU16) -> LayerProps {
+    fn destructive_clipped_layer_props(bbox: RectU32) -> LayerProps {
         LayerProps {
             blend_mode: BlendMode::new(Mix::Normal, Compose::Clear),
             ..clipped_layer_props(bbox)
@@ -818,7 +825,7 @@ mod tests {
     }
 
     fn clipped_layer_props_with_strips(
-        bbox: RectU16,
+        bbox: RectU32,
         strip_range: core::ops::Range<usize>,
     ) -> LayerProps {
         LayerProps {
@@ -855,7 +862,7 @@ mod tests {
         assert_eq!(row.render_cmds.len(), 2);
         assert!(matches!(row.render_cmds[0], RenderCmd::PushBuf(_)));
         assert!(
-            matches!(row.render_cmds[1], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 0 && cmd.span.pixel_width() == usize::from(DEPTH_BUCKET_WIDTH))
+            matches!(row.render_cmds[1], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 0 && cmd.span.pixel_width() == (DEPTH_BUCKET_WIDTH as usize))
         );
     }
 
@@ -864,7 +871,7 @@ mod tests {
         let mut bucketer = CommandBucketer::from_wh(8, 4);
         let strips = [Strip::new(0, 0, 0, false), Strip::new(12, 0, 48, false)];
 
-        bucketer.push_layer(&clipped_layer_props(RectU16::new(4, 0, 8, 4)));
+        bucketer.push_layer(&clipped_layer_props(RectU32::new(4, 0, 8, 4)));
         bucketer.generate_fill(&strips, &fill_attrs(Paint::Solid(color(RED))), &[]);
 
         let row = &bucketer.rows()[0];
@@ -875,7 +882,7 @@ mod tests {
             RenderCmd::PaintFill(cmd)
                 if cmd.span.pixel_x() == 4
                     && cmd.span.pixel_width() == 4
-                    && cmd.alpha_idx() == Some(u32::from(4 * Tile::HEIGHT))
+                    && cmd.alpha_idx() == Some(4 * Tile::HEIGHT_U32)
         ));
     }
 
@@ -884,8 +891,8 @@ mod tests {
         let mut bucketer = CommandBucketer::from_wh(16, 4);
         let strips = [Strip::new(0, 0, 0, false), Strip::new(16, 0, 0, true)];
 
-        bucketer.push_layer(&clipped_layer_props(RectU16::new(0, 0, 4, 4)));
-        bucketer.push_layer(&clipped_layer_props(RectU16::new(8, 0, 12, 4)));
+        bucketer.push_layer(&clipped_layer_props(RectU32::new(0, 0, 4, 4)));
+        bucketer.push_layer(&clipped_layer_props(RectU32::new(8, 0, 12, 4)));
         bucketer.generate_fill(&strips, &fill_attrs(Paint::Solid(color(RED))), &[]);
 
         assert!(bucketer.rows().iter().all(|row| row.render_cmds.is_empty()));
@@ -895,8 +902,8 @@ mod tests {
     fn empty_destructive_clip_does_not_push_rows() {
         let mut bucketer = CommandBucketer::from_wh(16, 4);
 
-        bucketer.push_layer(&clipped_layer_props(RectU16::new(0, 0, 4, 4)));
-        bucketer.push_layer(&destructive_clipped_layer_props(RectU16::new(8, 0, 12, 4)));
+        bucketer.push_layer(&clipped_layer_props(RectU32::new(0, 0, 4, 4)));
+        bucketer.push_layer(&destructive_clipped_layer_props(RectU32::new(8, 0, 12, 4)));
 
         assert!(bucketer.rows().iter().all(|row| row.render_cmds.is_empty()));
     }
@@ -914,10 +921,10 @@ mod tests {
         assert_eq!(row.depth_cmds[0].bucket_range(), BucketRange::new(1, 2));
         assert_eq!(row.render_cmds.len(), 2);
         assert!(
-            matches!(row.render_cmds[0], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 4 && cmd.span.pixel_width() == usize::from(DEPTH_BUCKET_WIDTH - 4))
+            matches!(row.render_cmds[0], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 4 && cmd.span.pixel_width() == ((DEPTH_BUCKET_WIDTH - 4) as usize))
         );
         assert!(
-            matches!(row.render_cmds[1], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == usize::from(DEPTH_BUCKET_WIDTH * 2) && cmd.span.pixel_width() == 4)
+            matches!(row.render_cmds[1], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == ((DEPTH_BUCKET_WIDTH * 2) as usize) && cmd.span.pixel_width() == 4)
         );
     }
 
@@ -939,21 +946,21 @@ mod tests {
         assert_eq!(row.depth_cmds.len(), 0);
         assert_eq!(row.render_cmds.len(), 1);
         assert!(
-            matches!(row.render_cmds[0], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 0 && cmd.span.pixel_width() == usize::from(DEPTH_BUCKET_WIDTH))
+            matches!(row.render_cmds[0], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 0 && cmd.span.pixel_width() == (DEPTH_BUCKET_WIDTH as usize))
         );
     }
 
     #[test]
     fn clips_fills_correctly_inside_nonzero_origin_viewport() {
         // Viewport spans scene (32, 32) to (96, 96). Local space is 64x64, the origin at (32, 32).
-        let mut bucketer = CommandBucketer::new(RectU16::new(32, 32, 96, 96));
+        let mut bucketer = CommandBucketer::new(RectU32::new(32, 32, 96, 96));
         // Clip bbox in scene coordinates: (40, 32)..(72, 96) => local (8, 0)..(40, 64).
-        bucketer.push_layer(&clipped_layer_props(RectU16::new(40, 32, 72, 96)));
+        bucketer.push_layer(&clipped_layer_props(RectU32::new(40, 32, 72, 96)));
 
         // A 32px-wide alpha strip at scene (40, 32) => local (8, 0), fully inside the clip.
         let strips = [
             Strip::new(40, 32, 0, false),
-            Strip::new(72, 32, 32 * u32::from(Tile::HEIGHT), false),
+            Strip::new(72, 32, 32 * Tile::HEIGHT_U32, false),
         ];
         bucketer.generate_fill(&strips, &fill_attrs(Paint::Solid(color(RED))), &[]);
 
@@ -973,9 +980,9 @@ mod tests {
     #[test]
     fn culls_clip_strips_above_viewport_origin() {
         // Viewport spans scene (0, 32) to (64, 96). Local space is 64x64, the origin at (0, 32).
-        let mut bucketer = CommandBucketer::new(RectU16::new(0, 32, 64, 96));
+        let mut bucketer = CommandBucketer::new(RectU32::new(0, 32, 64, 96));
 
-        let alpha = u32::from(Tile::HEIGHT);
+        let alpha = Tile::HEIGHT_U32;
         let strips = [
             // Content: 16px alpha strip at scene (0, 32) => local row 0.
             Strip::new(0, 32, 0, false),
@@ -990,7 +997,7 @@ mod tests {
 
         // Clip bbox in scene coordinates: (0, 0)..(16, 40) => local (0, 0)..(16, 8).
         bucketer.push_layer(&clipped_layer_props_with_strips(
-            RectU16::new(0, 0, 16, 40),
+            RectU32::new(0, 0, 16, 40),
             2..6,
         ));
         bucketer.generate_fill(&strips[0..2], &fill_attrs(Paint::Solid(color(RED))), &[]);

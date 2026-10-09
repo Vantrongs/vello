@@ -16,7 +16,7 @@ use svg::node::element::{Line as SvgLine, Path, Rectangle};
 use svg::{Document, Node};
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{FlattenCtx, Line};
-use vello_common::geometry::RectU16;
+use vello_common::geometry::RectU32;
 use vello_common::kurbo::{Affine, BezPath, Cap, Join, Stroke, StrokeCtx};
 use vello_common::peniko::Fill;
 use vello_common::strip::{
@@ -32,7 +32,7 @@ fn main() {
         Document::new().set("viewBox", (-10, -10, args.width + 20, args.height + 20));
 
     let mut line_buf = vec![];
-    let mut tiles = Tiles::new(Level::new(), args.width, args.height);
+    let mut tiles = Tiles::new(Level::new(), args.width.into(), args.height.into());
     let mut strip_buf = vec![];
     let mut alpha_buf = vec![];
 
@@ -48,7 +48,7 @@ fn main() {
                 Affine::IDENTITY,
                 &mut line_buf,
                 &mut FlattenCtx::default(),
-                RectU16::new(0, 0, args.width, args.height),
+                RectU32::new(0, 0, args.width.into(), args.height.into()),
             );
         } else {
             let stroke = Stroke {
@@ -66,13 +66,18 @@ fn main() {
                 &mut line_buf,
                 &mut FlattenCtx::default(),
                 &mut StrokeCtx::default(),
-                RectU16::new(0, 0, args.width, args.height),
+                RectU32::new(0, 0, args.width.into(), args.height.into()),
             );
         }
     }
 
     if stages.iter().any(|s| s.requires_tiling()) {
-        tiles.make_tiles_analytic_aa(Level::new(), &line_buf, args.width, args.height);
+        tiles.make_tiles_analytic_aa(
+            Level::new(),
+            &line_buf,
+            args.width.into(),
+            args.height.into(),
+        );
         tiles.sort_tiles();
     }
 
@@ -195,8 +200,8 @@ fn draw_tile_areas(document: &mut Document, tiles: &Tiles) {
 
     for i in 0..tiles.len() {
         let tile = tiles.get(i);
-        let x = tile.x * Tile::WIDTH;
-        let y = tile.y * Tile::HEIGHT;
+        let x = tile.x * Tile::WIDTH_U32;
+        let y = tile.y * Tile::HEIGHT_U32;
 
         if seen.contains(&(x, y)) {
             continue;
@@ -239,7 +244,7 @@ fn draw_strip_areas(document: &mut Document, strips: &[Strip], alphas: &[u8]) {
 
         let rect = Rectangle::new()
             .set("x", x)
-            .set("y", y * Tile::HEIGHT)
+            .set("y", y * Tile::HEIGHT_U32)
             .set("width", width)
             .set("height", Tile::HEIGHT)
             .set("stroke", color)
@@ -261,7 +266,7 @@ fn draw_strips(document: &mut Document, strips: &[Strip], alphas: &[u8]) {
             .map(|st| st.alpha_idx() / u32::from(Tile::HEIGHT))
             .unwrap_or(alphas.len() as u32);
 
-        let width = u16::try_from(end - strip.alpha_idx() / u32::from(Tile::HEIGHT)).unwrap();
+        let width = end - strip.alpha_idx() / u32::from(Tile::HEIGHT);
 
         // TODO: Account for even-odd?
         let color = if strip.fill_gap() { "red" } else { "limegreen" };
@@ -269,11 +274,11 @@ fn draw_strips(document: &mut Document, strips: &[Strip], alphas: &[u8]) {
         for x in 0..width {
             for y in 0..Tile::HEIGHT {
                 let alpha = alphas[strip.alpha_idx() as usize
-                    + usize::from(x) * usize::from(Tile::HEIGHT)
+                    + x as usize * usize::from(Tile::HEIGHT)
                     + usize::from(y)];
                 let rect = Rectangle::new()
                     .set("x", strip.x + x)
-                    .set("y", strip.y + y)
+                    .set("y", strip.y + u32::from(y))
                     .set("width", 1)
                     .set("height", 1)
                     .set("fill", color)
@@ -292,11 +297,11 @@ fn draw_fill_segments(
     width: u16,
     height: u16,
 ) {
-    let tile_bounds = RectU16::new(
+    let tile_bounds = RectU32::new(
         0,
         0,
-        width.div_ceil(Tile::WIDTH),
-        height.div_ceil(Tile::HEIGHT),
+        u32::from(width).div_ceil(Tile::WIDTH_U32),
+        u32::from(height).div_ceil(Tile::HEIGHT_U32),
     );
 
     visit_strip_fill_segments(
@@ -316,15 +321,15 @@ fn draw_alpha_fill_segment(
     height: u16,
 ) {
     let x0 = segment.x0();
-    let x1 = segment.x1().min(u32::from(width)) as u16;
+    let x1 = segment.x1().min(u32::from(width));
     let y0 = segment.y();
-    let y1 = y0.saturating_add(Tile::HEIGHT).min(height);
+    let y1 = y0.saturating_add(Tile::HEIGHT_U32).min(u32::from(height));
 
     for x in x0..x1 {
         for y in y0..y1 {
             let alpha_idx = segment.alpha_idx as usize
-                + usize::from(x - x0) * usize::from(Tile::HEIGHT)
-                + usize::from(y - y0);
+                + (x - x0) as usize * usize::from(Tile::HEIGHT)
+                + (y - y0) as usize;
             let rect = Rectangle::new()
                 .set("x", x)
                 .set("y", y)
@@ -340,9 +345,9 @@ fn draw_alpha_fill_segment(
 
 fn draw_fill_segment(document: &mut Document, segment: StripFillSegment, width: u16, height: u16) {
     let x0 = segment.x0();
-    let x1 = segment.x1().min(u32::from(width)) as u16;
+    let x1 = segment.x1().min(u32::from(width));
     let y0 = segment.y();
-    let y1 = y0.saturating_add(Tile::HEIGHT).min(height);
+    let y1 = y0.saturating_add(Tile::HEIGHT_U32).min(u32::from(height));
     let rect = Rectangle::new()
         .set("x", x0)
         .set("y", y0)

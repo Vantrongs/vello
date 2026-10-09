@@ -1071,7 +1071,7 @@ const SIZE_OF_CONFIG: NonZeroU64 = NonZeroU64::new(size_of::<Config>() as u64).u
 
 impl GpuStrip {
     /// Vertex attributes for the strip
-    pub fn vertex_attributes() -> [wgpu::VertexAttribute; 6] {
+    pub fn vertex_attributes() -> [wgpu::VertexAttribute; 7] {
         wgpu::vertex_attr_array![
             0 => Uint32,
             1 => Uint32,
@@ -1079,6 +1079,7 @@ impl GpuStrip {
             3 => Uint32,
             4 => Uint32,
             5 => Uint32,
+            6 => Uint32,
         ]
     }
 }

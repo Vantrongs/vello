@@ -4,7 +4,7 @@
 //! Rendering strips.
 
 use crate::flatten::Line;
-use crate::geometry::RectU16;
+use crate::geometry::RectU32;
 use crate::peniko::Fill;
 use crate::tile::{Tile, Tiles};
 use crate::util::f32_to_u8;
@@ -16,9 +16,9 @@ use fearless_simd::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Strip {
     /// The x coordinate of the strip, in user coordinates.
-    pub x: u16,
+    pub x: u32,
     /// The y coordinate of the strip, in user coordinates.
-    pub y: u16,
+    pub y: u32,
     /// Packed alpha index and fill gap flag.
     ///
     /// Bit layout (u32):
@@ -56,36 +56,36 @@ impl DerefMut for StripAlphaFillSegment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StripFillSegment {
     /// The inclusive start x coordinate in tile units.
-    pub tile_x0: u16,
+    pub tile_x0: u32,
     /// The exclusive end x coordinate in tile units.
-    pub tile_x1: u16,
+    pub tile_x1: u32,
     /// The y coordinate in tile units.
-    pub tile_y: u16,
+    pub tile_y: u32,
 }
 
 impl StripFillSegment {
     /// The inclusive start x coordinate in pixels.
     #[inline(always)]
-    pub const fn x0(self) -> u16 {
-        self.tile_x0 * Tile::WIDTH
+    pub const fn x0(self) -> u32 {
+        self.tile_x0 * Tile::WIDTH_U32
     }
 
     /// The exclusive end x coordinate in pixels.
     #[inline(always)]
     pub const fn x1(self) -> u32 {
-        self.tile_x1 as u32 * Tile::WIDTH as u32
+        self.tile_x1 * Tile::WIDTH_U32
     }
 
     /// The y coordinate in pixels.
     #[inline(always)]
-    pub const fn y(self) -> u16 {
-        self.tile_y * Tile::HEIGHT
+    pub const fn y(self) -> u32 {
+        self.tile_y * Tile::HEIGHT_U32
     }
 
     /// Return this segment's rectangle in tile coordinates.
     #[inline(always)]
-    pub const fn tile_rect(self) -> RectU16 {
-        RectU16::new(
+    pub const fn tile_rect(self) -> RectU32 {
+        RectU32::new(
             self.tile_x0,
             self.tile_y,
             self.tile_x1,
@@ -95,23 +95,14 @@ impl StripFillSegment {
 
     /// Return this segment's rectangle in pixel coordinates.
     #[inline(always)]
-    pub const fn pixel_rect(self) -> RectU16 {
-        RectU16::from_tile_bounds(self.tile_rect())
+    pub const fn pixel_rect(self) -> RectU32 {
+        RectU32::from_tile_bounds(self.tile_rect())
     }
 
     /// Return this segment's pixel-space rectangle shifted by `shift`.
     #[inline(always)]
-    pub fn shift(self, shift: (i32, i32)) -> RectU16 {
-        let shifted = |tile: u16, step: u16, delta: i32| {
-            (i64::from(tile) * i64::from(step) + i64::from(delta)).clamp(0, i64::from(u16::MAX))
-                as u16
-        };
-        RectU16::new(
-            shifted(self.tile_x0, Tile::WIDTH, shift.0),
-            shifted(self.tile_y, Tile::HEIGHT, shift.1),
-            shifted(self.tile_x1, Tile::WIDTH, shift.0),
-            shifted(self.tile_y + 1, Tile::HEIGHT, shift.1),
-        )
+    pub fn shift(self, shift: (i64, i64)) -> RectU32 {
+        self.pixel_rect().shift(shift)
     }
 }
 
@@ -119,7 +110,7 @@ impl StripFillSegment {
 /// within the tile-unit bounds indicated by `tile_bounds`.
 pub fn visit_strip_fill_segments<C>(
     strips: &[Strip],
-    tile_bounds: RectU16,
+    tile_bounds: RectU32,
     context: &mut C,
     mut alpha_fill: impl FnMut(&mut C, StripAlphaFillSegment),
     mut fill: impl FnMut(&mut C, StripFillSegment),
@@ -145,21 +136,21 @@ pub fn visit_strip_fill_segments<C>(
         let strip_width = strip.width_to(&next_strip);
 
         debug_assert_eq!(
-            strip.x % Tile::WIDTH,
+            strip.x % Tile::WIDTH_U32,
             0,
             "strip x must be tile-width aligned",
         );
         debug_assert_eq!(
-            strip_width % u32::from(Tile::WIDTH),
+            strip_width % Tile::WIDTH_U32,
             0,
             "strip width must be tile-width aligned",
         );
 
-        let strip_tile_x0 = strip.x / Tile::WIDTH;
-        let strip_tile_x1 = u32::from(strip_tile_x0) + strip_width / u32::from(Tile::WIDTH);
+        let strip_tile_x0 = strip.x / Tile::WIDTH_U32;
+        let strip_tile_x1 = strip_tile_x0 + strip_width / Tile::WIDTH_U32;
         // Clip strips that are outside the viewport horizontally.
         let tile_x0 = strip_tile_x0.max(tile_bounds.x0);
-        let tile_x1 = strip_tile_x1.min(u32::from(tile_bounds.x1)) as u16;
+        let tile_x1 = strip_tile_x1.min(tile_bounds.x1);
 
         if tile_x0 < tile_x1 {
             alpha_fill(
@@ -172,9 +163,7 @@ pub fn visit_strip_fill_segments<C>(
                     },
                     // Make sure to recalculate the index in case we had to clip.
                     alpha_idx: strip.alpha_idx()
-                        + u32::from(tile_x0 - strip_tile_x0)
-                            * u32::from(Tile::WIDTH)
-                            * u32::from(Tile::HEIGHT),
+                        + (tile_x0 - strip_tile_x0) * Tile::WIDTH_U32 * Tile::HEIGHT_U32,
                 },
             );
         }
@@ -182,15 +171,15 @@ pub fn visit_strip_fill_segments<C>(
         if next_strip.fill_gap() && next_strip.y == strip.y {
             // Similar procedure to above.
 
-            let tile_x0 = strip_tile_x1.max(u32::from(tile_bounds.x0));
-            let tile_x1 = u32::from((next_strip.x / Tile::WIDTH).min(tile_bounds.x1));
+            let tile_x0 = strip_tile_x1.max(tile_bounds.x0);
+            let tile_x1 = (next_strip.x / Tile::WIDTH_U32).min(tile_bounds.x1);
 
             if tile_x0 < tile_x1 {
                 fill(
                     context,
                     StripFillSegment {
-                        tile_x0: tile_x0 as u16,
-                        tile_x1: tile_x1 as u16,
+                        tile_x0,
+                        tile_x1,
                         tile_y,
                     },
                 );
@@ -203,8 +192,17 @@ impl Strip {
     /// The bit mask for `fill_gap` packed into `packed_alpha_idx_fill_gap`.
     const FILL_GAP_MASK: u32 = 1 << 31;
 
+    /// Convert an alpha-buffer position without truncating into the packed flag bit.
+    pub(crate) fn alpha_index(len: usize) -> u32 {
+        assert!(
+            len < Self::FILL_GAP_MASK as usize,
+            "alpha buffer exceeds packed strip index domain"
+        );
+        len as u32
+    }
+
     /// Creates a new strip.
-    pub fn new(x: u16, y: u16, alpha_idx: u32, fill_gap: bool) -> Self {
+    pub fn new(x: u32, y: u32, alpha_idx: u32, fill_gap: bool) -> Self {
         // Ensure `alpha_idx` does not collide with the fill flag bit.
         assert!(
             alpha_idx & Self::FILL_GAP_MASK == 0,
@@ -219,18 +217,18 @@ impl Strip {
     }
 
     /// Creates a sentinel strip.
-    pub fn sentinel(y: u16, alpha_idx: u32) -> Self {
-        Self::new(u16::MAX, y, alpha_idx, false)
+    pub fn sentinel(y: u32, alpha_idx: u32) -> Self {
+        Self::new(u32::MAX, y, alpha_idx, false)
     }
 
     /// Return whether the strip is a sentinel strip.
     pub fn is_sentinel(&self) -> bool {
-        self.x == u16::MAX
+        self.x == u32::MAX
     }
 
     /// Return the y coordinate of the strip, in strip units.
-    pub fn strip_y(&self) -> u16 {
-        self.y / Tile::HEIGHT
+    pub fn strip_y(&self) -> u32 {
+        self.y / Tile::HEIGHT_U32
     }
 
     /// Returns the horizontal pixel width of this strip.
@@ -238,8 +236,8 @@ impl Strip {
     /// **IMPORTANT**: This assumes that the `next` is actually the next adjacent strip
     /// to `self`, otherwise this method will return a garbage value!
     pub fn width_to(&self, next: &Self) -> u32 {
-        let col = self.alpha_idx() / u32::from(Tile::HEIGHT);
-        let next_col = next.alpha_idx() / u32::from(Tile::HEIGHT);
+        let col = self.alpha_idx() / Tile::HEIGHT_U32;
+        let next_col = next.alpha_idx() / Tile::HEIGHT_U32;
         next_col - col
     }
 
@@ -289,9 +287,9 @@ impl Strip {
     ///      3. All rows vertically below the last visible tile.
     #[inline(always)]
     fn emit_culled_background<F>(
-        start: u16,
-        end: u16,
-        viewport_width: u16,
+        start: u32,
+        end: u32,
+        viewport_width: u32,
         strips: &mut Vec<Self>,
         alphas: &mut Vec<u8>,
         windings: &crate::tile::CulledWindings,
@@ -301,38 +299,27 @@ impl Strip {
     {
         windings.for_active_rows_in_range(start as usize, end as usize, |row| {
             if should_fill(windings.coarse[row]) {
-                let y_pos = row as u16 * Tile::HEIGHT;
-                strips.push(Self::new(0, y_pos, alphas.len() as u32, false));
+                let y_pos = row as u32 * Tile::HEIGHT_U32;
+                strips.push(Self::new(0, y_pos, Self::alpha_index(alphas.len()), false));
                 // TODO: Would be nice to get rid of this, but the current clipping code only
                 // allows zero-width strips as a row terminator, not in-between.
-                alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
+                alphas.extend([255_u8; Tile::HEIGHT_U32 as usize * Tile::WIDTH_U32 as usize]);
                 Self::emit_row_end(viewport_width, y_pos, true, strips, alphas);
             }
         });
     }
 
     fn emit_row_end(
-        viewport_width: u16,
-        y: u16,
+        viewport_width: u32,
+        y: u32,
         fill_gap: bool,
         strips: &mut Vec<Self>,
-        alphas: &mut Vec<u8>,
+        alphas: &[u8],
     ) {
-        let end = u32::from(viewport_width).next_multiple_of(u32::from(Tile::WIDTH));
-        if end <= u32::from(u16::MAX) {
-            strips.push(Self::new(end as u16, y, alphas.len() as u32, fill_gap));
-        } else if fill_gap {
-            // An aligned endpoint of 65536 cannot be a strip start. Keep the
-            // last tile explicit instead of aliasing the sentinel.
-            let last = strips.last().unwrap();
-            let alpha_end = u32::from(last.x)
-                + (alphas.len() as u32 - last.alpha_idx()) / u32::from(Tile::HEIGHT);
-            if alpha_end < end {
-                let last_x = u16::MAX / Tile::WIDTH * Tile::WIDTH;
-                strips.push(Self::new(last_x, y, alphas.len() as u32, true));
-                alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
-            }
-        }
+        let end = viewport_width
+            .checked_next_multiple_of(Tile::WIDTH_U32)
+            .expect("source viewport exceeds tile coordinate domain");
+        strips.push(Self::new(end, y, Self::alpha_index(alphas.len()), fill_gap));
     }
 }
 
@@ -372,7 +359,7 @@ fn render_impl<S: Simd>(
     let maybe_emit_sentinel_strip = |strip_buf: &mut Vec<Strip>, alpha_buf: &Vec<u8>| {
         // Emit the final sentinel strip, if we produced at least one strip.
         if let Some(last_y) = strip_buf[strip_start..].last().map(|s| s.y) {
-            strip_buf.push(Strip::sentinel(last_y, alpha_buf.len() as u32));
+            strip_buf.push(Strip::sentinel(last_y, Strip::alpha_index(alpha_buf.len())));
         }
     };
 
@@ -392,12 +379,17 @@ fn render_impl<S: Simd>(
     // is not at the left edge of the viewport (x != 0), we must emit a solid strip
     // from x=0 to that tile if the coarse winding dictates a fill.
     let emit_captive_strip =
-        |y: u16, is_left_viewport: bool, strips: &mut Vec<Strip>, alphas: &mut Vec<u8>| {
+        |y: u32, is_left_viewport: bool, strips: &mut Vec<Strip>, alphas: &mut Vec<u8>| {
             let coarse_wd = tiles.windings.coarse[y as usize];
 
             if should_fill(coarse_wd) && !is_left_viewport {
-                strips.push(Strip::new(0, y * Tile::HEIGHT, alphas.len() as u32, false));
-                alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
+                strips.push(Strip::new(
+                    0,
+                    y * Tile::HEIGHT_U32,
+                    Strip::alpha_index(alphas.len()),
+                    false,
+                ));
+                alphas.extend([255_u8; Tile::HEIGHT_U32 as usize * Tile::WIDTH_U32 as usize]);
             }
 
             let mut acc = f32x4::splat(s, coarse_wd as f32);
@@ -425,14 +417,14 @@ fn render_impl<S: Simd>(
     // Note multiple tiles can be at the same location.
     // Note that we are also implicitly assuming here that the tile height exactly fits into a
     // SIMD vector (i.e. 128 bits).
-    let mut location_winding = [f32x4::splat(s, 0.0); Tile::WIDTH as usize];
+    let mut location_winding = [f32x4::splat(s, 0.0); Tile::WIDTH_U32 as usize];
     // The accumulated (fractional) windings at this location's right edge. When we move to the
     // next location, this is splatted to that location's starting winding.
     let mut accumulated_winding = f32x4::splat(s, 0.0);
 
     let left_viewport = prev_tile.x == 0;
     if has_culled_tiles {
-        let row_max = prev_tile.y.min(row_windings.len() as u16);
+        let row_max = prev_tile.y.min(row_windings.len() as u32);
         Strip::emit_culled_background(
             0,
             row_max,
@@ -450,21 +442,21 @@ fn render_impl<S: Simd>(
         let (wd, acc) = emit_captive_strip(prev_tile.y, left_viewport, strip_buf, alpha_buf);
         winding_delta = wd;
         accumulated_winding = acc;
-        location_winding = [accumulated_winding; Tile::WIDTH as usize];
+        location_winding = [accumulated_winding; Tile::WIDTH_U32 as usize];
     }
 
     // The strip we're building.
     let mut strip = Strip::new(
-        prev_tile.x * Tile::WIDTH,
-        prev_tile.y * Tile::HEIGHT,
-        alpha_buf.len() as u32,
+        prev_tile.x * Tile::WIDTH_U32,
+        prev_tile.y * Tile::HEIGHT_U32,
+        Strip::alpha_index(alpha_buf.len()),
         should_fill(winding_delta) && !left_viewport,
     );
 
     for (tile_idx, tile) in tiles.iter().copied().chain([Tile::SENTINEL]).enumerate() {
         let line = lines[tile.line_idx() as usize];
-        let tile_left_x = f32::from(tile.x) * f32::from(Tile::WIDTH);
-        let tile_top_y = f32::from(tile.y) * f32::from(Tile::HEIGHT);
+        let tile_left_x = (tile.x as f32) * (Tile::WIDTH_U32 as f32);
+        let tile_top_y = (tile.y as f32) * (Tile::HEIGHT_U32 as f32);
         let p0_x = line.p0.x - tile_left_x;
         let p0_y = line.p0.y - tile_top_y;
         let p1_x = line.p1.x - tile_left_x;
@@ -479,7 +471,7 @@ fn render_impl<S: Simd>(
                     let p2 = f32x4::splat(s, 255.0);
 
                     #[expect(clippy::needless_range_loop, reason = "dimension clarity")]
-                    for x in 0..Tile::WIDTH as usize {
+                    for x in 0..Tile::WIDTH_U32 as usize {
                         let area = location_winding[x];
                         let coverage = area.abs();
                         let mulled = coverage.mul_add(p2, p1);
@@ -496,7 +488,7 @@ fn render_impl<S: Simd>(
                     let p3 = f32x4::splat(s, 255.0);
 
                     #[expect(clippy::needless_range_loop, reason = "dimension clarity")]
-                    for x in 0..Tile::WIDTH as usize {
+                    for x in 0..Tile::WIDTH_U32 as usize {
                         let area = location_winding[x];
                         let im1 = area.mul_add(p1, p1).floor();
                         let coverage = p2.mul_add(im1, area).abs();
@@ -524,7 +516,7 @@ fn render_impl<S: Simd>(
             alpha_buf.extend_from_slice(u8_vals.as_slice());
 
             #[expect(clippy::needless_range_loop, reason = "dimension clarity")]
-            for x in 0..Tile::WIDTH as usize {
+            for x in 0..Tile::WIDTH_U32 as usize {
                 location_winding[x] = accumulated_winding;
             }
         }
@@ -532,8 +524,9 @@ fn render_impl<S: Simd>(
         // Push out the strip if we're moving to a next strip.
         if !prev_tile.same_loc(&tile) && !prev_tile.prev_loc(&tile) {
             debug_assert_eq!(
-                (prev_tile.x as u32 + 1) * Tile::WIDTH as u32 - strip.x as u32,
-                ((alpha_buf.len() - strip.alpha_idx() as usize) / usize::from(Tile::HEIGHT)) as u32,
+                (prev_tile.x + 1) * Tile::WIDTH_U32 - strip.x,
+                ((alpha_buf.len() - strip.alpha_idx() as usize) / (Tile::HEIGHT_U32 as usize))
+                    as u32,
                 "The number of columns written to the alpha buffer should equal the number of columns spanned by this strip."
             );
             strip_buf.push(strip);
@@ -545,7 +538,7 @@ fn render_impl<S: Simd>(
                 if winding_delta != 0 {
                     Strip::emit_row_end(
                         viewport_width,
-                        prev_tile.y * Tile::HEIGHT,
+                        prev_tile.y * Tile::HEIGHT_U32,
                         should_fill(winding_delta),
                         strip_buf,
                         alpha_buf,
@@ -574,7 +567,7 @@ fn render_impl<S: Simd>(
                 };
 
                 #[expect(clippy::needless_range_loop, reason = "dimension clarity")]
-                for x in 0..Tile::WIDTH as usize {
+                for x in 0..Tile::WIDTH_U32 as usize {
                     location_winding[x] = accumulated_winding;
                 }
             } else {
@@ -588,9 +581,9 @@ fn render_impl<S: Simd>(
             }
 
             strip = Strip::new(
-                tile.x * Tile::WIDTH,
-                tile.y * Tile::HEIGHT,
-                alpha_buf.len() as u32,
+                tile.x * Tile::WIDTH_U32,
+                tile.y * Tile::HEIGHT_U32,
+                Strip::alpha_index(alpha_buf.len()),
                 should_fill(winding_delta) && !left_viewport,
             );
         }
@@ -662,7 +655,7 @@ fn render_impl<S: Simd>(
 
         let mut acc = f32x4::splat(s, 0.0);
 
-        for x_idx in 0..Tile::WIDTH {
+        for x_idx in 0..Tile::WIDTH_U32 {
             let x_idx_s = f32x4::splat(s, x_idx as f32);
             let px_left_x = x_idx_s;
             let px_right_x = 1.0 + x_idx_s;
@@ -749,8 +742,8 @@ fn render_impl<S: Simd>(
 
     if has_culled_tiles {
         Strip::emit_culled_background(
-            (prev_tile.y + 1).min(row_windings.len() as u16),
-            row_windings.len() as u16,
+            (prev_tile.y + 1).min(row_windings.len() as u32),
+            row_windings.len() as u32,
             viewport_width,
             strip_buf,
             alpha_buf,
@@ -765,18 +758,27 @@ fn render_impl<S: Simd>(
 #[cfg(test)]
 mod tests {
     use super::{Strip, StripFillSegment, visit_strip_fill_segments};
-    use crate::geometry::RectU16;
+    use crate::geometry::RectU32;
     use alloc::vec;
+
+    #[test]
+    fn alpha_buffer_index_rejects_overflow_before_narrowing() {
+        assert_eq!(Strip::alpha_index(0), 0);
+        assert_eq!(Strip::alpha_index((1_usize << 31) - 1), (1_u32 << 31) - 1);
+        assert!(std::panic::catch_unwind(|| Strip::alpha_index(1_usize << 31)).is_err());
+        #[cfg(target_pointer_width = "64")]
+        assert!(std::panic::catch_unwind(|| Strip::alpha_index(1_usize << 32)).is_err());
+    }
 
     #[test]
     fn full_domain_alpha_strip_is_clipped_before_narrowing() {
         let strips = [Strip::new(0, 0, 0, false), Strip::sentinel(0, 65536 * 4)];
         assert_eq!(strips[0].width_to(&strips[1]), 65536);
-        for width in 65532..=u16::MAX {
+        for width in 65532..=65535 {
             let mut segments = vec![];
             visit_strip_fill_segments(
                 &strips,
-                RectU16::new(0, 0, width, 1).to_tile_bounds(),
+                RectU32::new(0, 0, width, 1).to_tile_bounds(),
                 &mut segments,
                 |segments, segment| segments.push(segment),
                 |_, _| panic!("dense strip must not produce sparse fills"),
@@ -798,25 +800,21 @@ mod tests {
         assert_eq!(segment.x1(), 65536);
         assert_eq!(
             segment.shift((-4, -4)),
-            RectU16::new(65528, 65528, 65532, 65532)
+            RectU32::new(65528, 65528, 65532, 65532)
         );
     }
 
     #[test]
-    fn full_domain_row_end_keeps_last_tile_without_sentinel_alias() {
-        let mut strips = vec![Strip::new(0, 0, 0, false)];
-        let mut alphas = vec![255; 16];
-        Strip::emit_row_end(u16::MAX, 0, true, &mut strips, &mut alphas);
-        assert_eq!(strips.len(), 2);
-        assert_eq!(strips[1].x, 65532);
-        assert!(!strips[1].is_sentinel());
-        assert!(strips[1].fill_gap());
-        assert_eq!(alphas.len(), 32);
-        Strip::emit_row_end(u16::MAX, 0, true, &mut strips, &mut alphas);
-        assert_eq!(
-            strips.len(),
-            2,
-            "an already present last tile is not duplicated"
-        );
+    fn wide_row_end_does_not_alias_sentinel() {
+        for width in [65535, 65536, 70001] {
+            let mut strips = vec![Strip::new(0, 0, 0, false)];
+            let mut alphas = vec![255; 16];
+            Strip::emit_row_end(width, 0, true, &mut strips, &mut alphas);
+            assert_eq!(strips.len(), 2);
+            assert_eq!(strips[1].x, width.next_multiple_of(4));
+            assert!(!strips[1].is_sentinel());
+            assert!(strips[1].fill_gap());
+            assert_eq!(alphas.len(), 16);
+        }
     }
 }

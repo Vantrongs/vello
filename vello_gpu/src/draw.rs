@@ -13,7 +13,7 @@ use crate::scene::{RecordedDraw, RecordedPath};
 use crate::target::{DrawTarget, LayerTextureRegion};
 use crate::util::{Ranges, VecExt, pack_opacity, pack_u16_pair};
 use alloc::vec::Vec;
-use vello_common::geometry::RectU16;
+use vello_common::geometry::{RectU16, RectU32};
 use vello_common::kurbo::Rect;
 use vello_common::paint::Paint;
 use vello_common::record::LayerClip;
@@ -188,6 +188,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
             self,
             |builder, segment| {
                 let shifted = segment.shift(geometry_shift);
+                let (payload, paint_code) = paint.payload_at(segment.x0(), segment.y());
                 let strip = GpuStrip::from_fill_segment(
                     shifted,
                     Some(segment.col_idx()),
@@ -195,8 +196,8 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                     // the shifted one. The shifted accounts for where the segment needs to be
                     // placed based on the layer bbox and texture region, but the location of
                     // where the paint is sampled should not be affected by that!
-                    paint.payload_at(segment.x0(), segment.y()),
-                    paint.paint,
+                    payload,
+                    paint_code,
                     depth_index,
                 );
 
@@ -206,13 +207,13 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
             },
             |builder, segment| {
                 let shifted = segment.shift(geometry_shift);
-
+                let (payload, paint_code) = paint.payload_at(segment.x0(), segment.y());
                 let strip = GpuStrip::from_fill_segment(
                     shifted,
                     None,
                     // See the comment above.
-                    paint.payload_at(segment.x0(), segment.y()),
-                    paint.paint,
+                    payload,
+                    paint_code,
                     depth_index,
                 );
 
@@ -252,12 +253,12 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         .flatten()
         {
             let shifted = part.shift(self.state.target.geometry_shift());
-
+            let (payload, paint_code) = paint.payload_at(part.rect.x0, part.rect.y0);
             let strip = GpuStrip::from_rect(
                 shifted,
                 // See the comment in `push_path`.
-                paint.payload_at(part.rect.x0, part.rect.y0),
-                paint.paint,
+                payload,
+                paint_code,
                 depth_index,
             );
 
@@ -339,12 +340,19 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         paint: u32,
         depth_index: u32,
     ) {
+        let bounds = sample.layer_bbox.intersect(self.state.target_bbox);
+        let clipped = segment.shift((0, 0)).intersect(bounds);
+        if clipped.is_empty() {
+            return;
+        }
         self.draw.has_child_layer = true;
-        // See the comment in `push_path`.
-        let payload = sample.payload_at(segment.x0(), segment.y());
-        let shifted = segment.shift(self.state.target.geometry_shift());
+        let mut payload = sample.payload_at(clipped.x0, clipped.y0);
+        // Layer destinations need not be tile-aligned after an integer offset.
+        // Preserve the clip alpha row while limiting geometry to the actual sample region.
+        payload[1] = (clipped.height() << 8) | (clipped.y0 - segment.y());
+        let col_idx = col_idx.map(|index| index + clipped.x0 - segment.x0());
+        let shifted = clipped.shift(self.state.target.geometry_shift());
         let strip = GpuStrip::from_fill_segment(shifted, col_idx, payload, paint, depth_index);
-
         self.draw.push(self.strips, strip, None);
     }
 }
@@ -375,11 +383,11 @@ pub(crate) struct DrawState<T: DrawTarget> {
     /// Assigns depth values to opaque strips.
     depth_counter: DepthCounter,
     /// Scene-space bounds visible in the target.
-    pub(crate) target_bbox: RectU16,
+    pub(crate) target_bbox: RectU32,
 }
 
 impl<T: DrawTarget> DrawState<T> {
-    pub(crate) fn new(target: T, target_bbox: RectU16, use_depth_buffer: bool) -> Self {
+    pub(crate) fn new(target: T, target_bbox: RectU32, use_depth_buffer: bool) -> Self {
         Self {
             target,
             use_depth_buffer,
@@ -395,13 +403,14 @@ const RECT_STRIP_FLAG: u32 = 1 << 31;
 
 impl GpuStrip {
     fn from_fill_segment(
-        rect: RectU16,
+        rect: RectU32,
         col_idx: Option<u32>,
-        payload: u32,
+        payload: [u32; 2],
         paint: u32,
         depth_index: u32,
     ) -> Self {
-        let width = rect.width();
+        // Only origins and sizes are packed; a clipped final tile can end at 65536.
+        let width = u16::try_from(rect.width()).unwrap();
         let (dense_width_or_rect_height, col_idx_or_rect_frac) = if let Some(col_idx) = col_idx {
             (width, col_idx)
         } else {
@@ -409,25 +418,28 @@ impl GpuStrip {
         };
 
         Self {
-            x: rect.x0,
-            y: rect.y0,
+            x: u16::try_from(rect.x0).unwrap(),
+            y: u16::try_from(rect.y0).unwrap(),
             width,
             dense_width_or_rect_height,
             col_idx_or_rect_frac,
-            payload,
+            payload: payload[0],
+            payload_y: payload[1],
             paint_and_rect_flag: paint,
             depth_index,
         }
     }
 
-    fn from_rect(part: RectPart, payload: u32, paint: u32, depth_index: u32) -> Self {
+    fn from_rect(part: RectPart, payload: [u32; 2], paint: u32, depth_index: u32) -> Self {
+        let rect = RectU16::try_from(part.rect).unwrap();
         Self {
-            x: part.rect.x0,
-            y: part.rect.y0,
-            width: part.rect.width(),
-            dense_width_or_rect_height: part.rect.height(),
+            x: rect.x0,
+            y: rect.y0,
+            width: rect.width(),
+            dense_width_or_rect_height: rect.height(),
             col_idx_or_rect_frac: part.frac,
-            payload,
+            payload: payload[0],
+            payload_y: payload[1],
             paint_and_rect_flag: paint | RECT_STRIP_FLAG,
             depth_index,
         }
@@ -435,19 +447,23 @@ impl GpuStrip {
 }
 
 impl LayerTextureRegion {
-    fn payload_at(self, x: u16, y: u16) -> u32 {
+    fn payload_at(self, x: u32, y: u32) -> [u32; 2] {
         let shift = self.geometry_shift();
         // This should never fail. The shift itself can be negative if the layer bbox doesn't
         // start at 0, but we only sample values that are within the layer bbox in the first place.
-        let source_x = u16::try_from(x as i32 + shift.0).unwrap();
-        let source_y = u16::try_from(y as i32 + shift.1).unwrap();
+        let source_x = u16::try_from(i64::from(x) + shift.0).unwrap();
+        let source_y = u16::try_from(i64::from(y) + shift.1).unwrap();
 
-        pack_u16_pair(source_x, source_y)
+        [pack_u16_pair(source_x, source_y), 0]
     }
 }
 
 /// Number of external textures that can be sampled by one strip draw.
 pub(crate) const EXTERNAL_TEXTURE_SLOT_COUNT: usize = 1;
+const _: () = assert!(
+    EXTERNAL_TEXTURE_SLOT_COUNT <= 2,
+    "bit 25 is reserved for local paint coordinates"
+);
 
 /// External texture bindings for one strip draw.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -563,7 +579,7 @@ mod tests {
     use alloc::vec::Vec;
     use vello_common::TextureId;
     use vello_common::encode::{EncodedImage, EncodedPaint};
-    use vello_common::geometry::RectU16;
+    use vello_common::geometry::{RectU16, RectU32};
     use vello_common::image_cache::ImageCache;
     use vello_common::kurbo::{Affine, Rect, Vec2};
     use vello_common::multi_atlas::{AtlasConfig, AtlasId};
@@ -580,7 +596,7 @@ mod tests {
     }
 
     impl<T: DrawTarget> DrawCase<T> {
-        fn new(target: T, bbox: RectU16) -> Self {
+        fn new(target: T, bbox: RectU32) -> Self {
             Self {
                 buffers: DrawBuffers::default(),
                 state: DrawState::new(target, bbox, true),
@@ -637,6 +653,7 @@ mod tests {
             dense_width_or_rect_height: 0,
             col_idx_or_rect_frac: 0,
             payload: 0,
+            payload_y: 0,
             paint_and_rect_flag: 0,
             depth_index: 0,
         }
@@ -649,7 +666,7 @@ mod tests {
     fn external_texture_slots(draw: &OpaqueDraw) -> Vec<u32> {
         draw.strips()
             .iter()
-            .map(|strip| (strip.paint_and_rect_flag >> EXTERNAL_TEXTURE_SLOT_SHIFT) & 0x3)
+            .map(|strip| (strip.paint_and_rect_flag >> EXTERNAL_TEXTURE_SLOT_SHIFT) & 0x1)
             .collect()
     }
 
@@ -706,14 +723,64 @@ mod tests {
         })
     }
 
-    fn layer(layer_bbox: RectU16) -> LayerTextureRegion {
+    fn layer(layer_bbox: RectU32) -> LayerTextureRegion {
         LayerTextureRegion {
             texture: TextureRegion {
                 target: LayerTextureId::new(TextureParity::Even, 0),
-                rect: RectU16::new(0, 0, layer_bbox.width(), layer_bbox.height()),
+                rect: RectU16::try_from(RectU32::new(
+                    0,
+                    0,
+                    layer_bbox.width(),
+                    layer_bbox.height(),
+                ))
+                .unwrap(),
             },
             layer_bbox,
         }
+    }
+
+    #[test]
+    fn final_root_tile_can_end_past_packed_origin_domain() {
+        let strip = GpuStrip::from_fill_segment(
+            RectU32::new(65532, 65532, 65536, 65536),
+            Some(0),
+            [0, 0],
+            0,
+            0,
+        );
+        assert_eq!((strip.x, strip.y, strip.width), (65532, 65532, 4));
+    }
+
+    #[test]
+    fn wide_source_positions_are_rebased_for_geometry_but_preserved_for_paint() {
+        let bounds = RectU32::new(131068, 196604, 131084, 196620);
+        let target = layer(bounds);
+        let mut case = DrawCase::new(target, bounds);
+        let mut draw = Draw::default();
+        let encoded = [external(TextureId(7))];
+        let offsets = [0];
+        case.rect(
+            &mut draw,
+            Rect::new(131070.0, 196607.0, 131080.0, 196615.0),
+            indexed(0),
+            PaintResolver::new(&encoded, &offsets),
+        );
+        let strip = case.buffers.strips[0];
+        assert_eq!(
+            (
+                strip.x,
+                strip.y,
+                strip.width,
+                strip.dense_width_or_rect_height
+            ),
+            (2, 3, 10, 8)
+        );
+        assert_eq!(
+            (strip.payload, strip.payload_y),
+            (131070.0_f32.to_bits(), 196607.0_f32.to_bits())
+        );
+        assert_ne!(strip.paint_and_rect_flag & (1 << 25), 0);
+        assert_eq!(size_of::<GpuStrip>(), 28);
     }
 
     #[test]
@@ -722,7 +789,7 @@ mod tests {
         let encoded = [external(texture_a), external(texture_b)];
         let offsets = [0, 0];
         let resolver = PaintResolver::new(&encoded, &offsets);
-        let mut case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 32, 8));
+        let mut case = DrawCase::new(RootTarget::UserSurface, RectU32::new(0, 0, 32, 8));
         let mut draw = Draw::default();
         let mut other = Draw::default();
 
@@ -750,7 +817,7 @@ mod tests {
         let encoded = textures.map(external);
         let offsets = [0; 5];
         let resolver = PaintResolver::new(&encoded, &offsets);
-        let mut case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 32, 8));
+        let mut case = DrawCase::new(RootTarget::UserSurface, RectU32::new(0, 0, 32, 8));
         let mut draw = Draw::default();
 
         for (draw_index, paint_index) in [0, 1, 2, 3, 4, 0].into_iter().enumerate() {
@@ -777,7 +844,7 @@ mod tests {
             case.buffers
                 .strips
                 .iter()
-                .map(|strip| (strip.paint_and_rect_flag >> EXTERNAL_TEXTURE_SLOT_SHIFT) & 0x3)
+                .map(|strip| (strip.paint_and_rect_flag >> EXTERNAL_TEXTURE_SLOT_SHIFT) & 0x1)
                 .collect::<Vec<_>>(),
             [0, 0, 0, 0, 0, 0]
         );
@@ -788,7 +855,7 @@ mod tests {
         let [texture] = texture_ids();
         let encoded = [external(texture), external(texture)];
         let resolver = PaintResolver::new(&encoded, &[0, 3]);
-        let mut case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 8, 8));
+        let mut case = DrawCase::new(RootTarget::UserSurface, RectU32::new(0, 0, 8, 8));
         let mut draw = Draw::default();
 
         case.rect(&mut draw, rect(0.0), indexed(0), resolver);
@@ -807,7 +874,7 @@ mod tests {
         let image_id = image_cache.allocate(1, 1, 0).unwrap();
         let encoded = [external(texture), atlas_image(image_id)];
         let resolver = PaintResolver::new(&encoded, &[0, 0]).with_image_cache(&image_cache);
-        let mut case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 16, 8));
+        let mut case = DrawCase::new(RootTarget::UserSurface, RectU32::new(0, 0, 16, 8));
         let mut draw = Draw::default();
 
         for (x, paint_index) in [(0.0, 0), (4.0, 1), (8.0, 0)] {
@@ -932,11 +999,11 @@ mod tests {
         let encoded = [external(texture_id)];
         let offsets = [0];
         let resolver = PaintResolver::new(&encoded, &offsets);
-        let mut case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 8, 8));
+        let mut case = DrawCase::new(RootTarget::UserSurface, RectU32::new(0, 0, 8, 8));
         let mut draw = Draw::default();
 
         case.rect(&mut draw, rect(0.0), indexed(0), resolver);
-        case.layer(&mut draw, layer(RectU16::new(0, 0, 8, 8)));
+        case.layer(&mut draw, layer(RectU32::new(0, 0, 8, 8)));
         assert_eq!(draw.strip_ranges.len(), 2);
         assert_eq!(draw.external_texture_runs.len(), 1);
         assert!(draw.has_child_layer);
@@ -954,7 +1021,7 @@ mod tests {
 
     #[test]
     fn opaque_routing() {
-        let mut user_case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 16, 8));
+        let mut user_case = DrawCase::new(RootTarget::UserSurface, RectU32::new(0, 0, 16, 8));
         let mut user_draw = Draw::default();
         user_case.rect(&mut user_draw, rect(0.0), solid(1.0), no_paints());
         user_case.rect(
@@ -967,7 +1034,7 @@ mod tests {
         assert_eq!(user_case.buffers.opaque.strips().len(), 1);
         assert_eq!(user_draw.strip_ranges.len(), 1);
 
-        let mut atlas_case = DrawCase::new(RootTarget::AtlasLayer, RectU16::new(0, 0, 8, 8));
+        let mut atlas_case = DrawCase::new(RootTarget::AtlasLayer, RectU32::new(0, 0, 8, 8));
         let mut atlas_draw = Draw::default();
         atlas_case.rect(&mut atlas_draw, rect(0.0), solid(1.0), no_paints());
 
@@ -977,17 +1044,17 @@ mod tests {
 
     #[test]
     fn child_binding() {
-        let mut case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 8, 8));
+        let mut case = DrawCase::new(RootTarget::UserSurface, RectU32::new(0, 0, 8, 8));
         let mut draw = Draw::default();
 
-        case.layer(&mut draw, layer(RectU16::new(0, 0, 8, 8)));
+        case.layer(&mut draw, layer(RectU32::new(0, 0, 8, 8)));
         assert!(draw.has_child_layer);
         assert_eq!(draw.strip_ranges.len(), 1);
     }
 
     #[test]
     fn depth_progression() {
-        let mut case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 64, 8));
+        let mut case = DrawCase::new(RootTarget::UserSurface, RectU32::new(0, 0, 64, 8));
         let mut draw = Draw::default();
         let opacity = [0.5, 0.5, 1.0, 0.5, 0.5, 1.0, 0.5];
         let positions = [0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0];

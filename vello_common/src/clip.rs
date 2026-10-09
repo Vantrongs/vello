@@ -3,7 +3,7 @@
 
 //! Managing clipping state.
 
-use crate::geometry::RectU16;
+use crate::geometry::RectU32;
 use crate::kurbo::{Affine, BezPath, PathEl, Rect};
 use crate::strip::Strip;
 use crate::strip_generator::{GenerationMode, StripGenerator, StripStorage};
@@ -24,8 +24,8 @@ struct ClipData {
     /// A coarse bounding box of the clip path in pixel coordinates.
     ///
     /// These bounds have already been intersected with the viewport.
-    bbox: RectU16,
-    opaque_bbox: Option<RectU16>,
+    bbox: RectU32,
+    opaque_bbox: Option<RectU32>,
 }
 
 impl ClipData {
@@ -127,14 +127,15 @@ impl ClipContext {
     ) {
         self.temp_storage.clear();
 
-        let alpha_start = self.storage.alphas.len() as u32;
-        let strip_start = self.storage.strips.len() as u32;
+        let alpha_start = Strip::alpha_index(self.storage.alphas.len());
+        let strip_start = u32::try_from(self.storage.strips.len())
+            .expect("clip strip buffer exceeds u32 index domain");
 
         let existing_clip = self.clip_stack.last().map(|c| c.to_clip_ref(&self.storage));
 
         let shape = generate(strip_generator, &mut self.temp_storage, existing_clip);
 
-        let bbox = strip_bbox(&self.temp_storage.strips).unwrap_or(RectU16::ZERO);
+        let bbox = strip_bbox(&self.temp_storage.strips).unwrap_or(RectU32::ZERO);
         let opaque_bbox = opaque_fill_bbox(&self.temp_storage.strips);
         self.storage.extend(&self.temp_storage);
         self.clip_stack.push(ClipData {
@@ -237,7 +238,7 @@ impl ClipState {
     /// Push a new root viewport.
     pub fn push_root_viewport(
         &mut self,
-        source_shift: (u16, u16),
+        source_shift: (u32, u32),
         strip_generator: &mut StripGenerator,
     ) {
         let parent_context = core::mem::replace(&mut self.context, self.context_pool.take());
@@ -367,39 +368,38 @@ pub struct PathDataRef<'a> {
     pub strips: &'a [Strip],
     /// The alpha buffer.
     pub alphas: &'a [u8],
-    /// A coarse physical bounding box of the clip path in pixel coordinates.
-    /// Its exclusive edge may cut the final tile at the coordinate-domain boundary.
+    /// A coarse bounding box of the clip path in source pixel coordinates.
     ///
     /// These bounds have already been intersected with the viewport.
-    pub bbox: RectU16,
+    pub bbox: RectU32,
     /// A rectangle guaranteed to have coverage 255 throughout the accumulated mask.
     /// `None` provides no opacity guarantee; the geometric bounding box is insufficient.
-    pub opaque_bbox: Option<RectU16>,
+    pub opaque_bbox: Option<RectU32>,
 }
 
 /// Find a conservative opaque rectangle using only implicit fully filled gaps.
 /// Alpha strips, including apparently rectangular antialiased edges, give no proof.
-fn opaque_fill_bbox(strips: &[Strip]) -> Option<RectU16> {
-    let mut current = RectU16::ZERO;
-    let mut best = RectU16::ZERO;
-    let area = |r: RectU16| u32::from(r.x1 - r.x0) * u32::from(r.y1 - r.y0);
+fn opaque_fill_bbox(strips: &[Strip]) -> Option<RectU32> {
+    let mut current = RectU32::ZERO;
+    let mut best = RectU32::ZERO;
+    let area = |r: RectU32| u64::from(r.x1 - r.x0) * u64::from(r.y1 - r.y0);
     for pair in strips.windows(2) {
         let (strip, next) = (&pair[0], &pair[1]);
         if !next.fill_gap() || next.y != strip.y {
             continue;
         }
-        let x0 = u32::from(strip.x) + strip.width_to(next);
-        if x0 >= u32::from(next.x) {
+        let x0 = strip.x + strip.width_to(next);
+        if x0 >= next.x {
             continue;
         }
-        let row = RectU16::new(
-            x0 as u16,
+        let row = RectU32::new(
+            x0,
             strip.y,
             next.x,
-            strip.y.saturating_add(Tile::HEIGHT),
+            strip.y.saturating_add(Tile::HEIGHT_U32),
         );
         if current.y1 == row.y0 && current.x0.max(row.x0) < current.x1.min(row.x1) {
-            current = RectU16::new(
+            current = RectU32::new(
                 current.x0.max(row.x0),
                 current.y0,
                 current.x1.min(row.x1),
@@ -553,7 +553,7 @@ fn intersect_impl<S: Simd>(
                                 start_strip(&mut strip_state, &target.alphas, overlap.start, false);
                             }
 
-                            let num_blocks = overlap.width() / u32::from(Tile::HEIGHT);
+                            let num_blocks = overlap.width() / Tile::HEIGHT_U32;
 
                             // Get the right alpha values for the specific position.
                             let s1_alphas = s_region_1.alphas
@@ -593,14 +593,14 @@ fn intersect_impl<S: Simd>(
     // Push the sentinel strip if the intersection is not empty.
     if !target.strips.is_empty() {
         target.strips.push(Strip::sentinel(
-            end_y * Tile::HEIGHT,
-            target.alphas.len() as u32,
+            end_y * Tile::HEIGHT_U32,
+            Strip::alpha_index(target.alphas.len()),
         ));
     }
 }
 
 #[inline(always)]
-fn first_strip_at_or_after(strips: &[Strip], strip_y: u16) -> usize {
+fn first_strip_at_or_after(strips: &[Strip], strip_y: u32) -> usize {
     // Strips are guaranteed to be sorted in ascending y (and ascending x),
     // hence why we can do this.
     strips.partition_point(|strip| strip.strip_y() < strip_y)
@@ -705,7 +705,7 @@ struct RowIterator<'a> {
     /// The path in question.
     input: PathDataRef<'a>,
     /// The strip row we want to iterate over.
-    strip_y: u16,
+    strip_y: u32,
     /// The index of the current strip.
     cur_idx: &'a mut usize,
     /// Whether the iterator should yield a strip next or not.
@@ -716,7 +716,7 @@ struct RowIterator<'a> {
 }
 
 impl<'a> RowIterator<'a> {
-    fn new(input: PathDataRef<'a>, cur_idx: &'a mut usize, strip_y: u16) -> Self {
+    fn new(input: PathDataRef<'a>, cur_idx: &'a mut usize, strip_y: u32) -> Self {
         // Forward the index until we have found the right strip.
         while input.strips[*cur_idx].strip_y() < strip_y {
             *cur_idx += 1;
@@ -761,8 +761,8 @@ impl<'a> RowIterator<'a> {
         // zero winding so we don't need to special case this.
         if next.fill_gap() {
             let cur = self.cur_strip();
-            let x = u32::from(cur.x) + self.cur_strip_width();
-            let width = u32::from(next.x) - x;
+            let x = cur.x + self.cur_strip_width();
+            let width = next.x - x;
 
             (width > 0).then_some(FillRegion { start: x, width })
         } else {
@@ -804,7 +804,7 @@ impl<'a> Iterator for RowIterator<'a> {
             }
 
             // Calculate the dimensions of the strip and yield it.
-            let x = u32::from(self.cur_strip().x);
+            let x = self.cur_strip().x;
             let width = self.cur_strip_width();
 
             // Zero-width strips only act as markers for cheaply delimiting the width
@@ -833,16 +833,16 @@ impl<'a> Iterator for RowIterator<'a> {
 
 /// The data of the current strip we are building.
 struct StripState {
-    x: u16,
+    x: u32,
     alpha_idx: u32,
     fill_gap: bool,
 }
 
-fn flush_strip(strip_state: &mut Option<StripState>, strips: &mut Vec<Strip>, cur_y: u16) {
+fn flush_strip(strip_state: &mut Option<StripState>, strips: &mut Vec<Strip>, cur_y: u32) {
     if let Some(state) = core::mem::take(strip_state) {
         strips.push(Strip::new(
             state.x,
-            cur_y * Tile::HEIGHT,
+            cur_y * Tile::HEIGHT_U32,
             state.alpha_idx,
             state.fill_gap,
         ));
@@ -852,8 +852,8 @@ fn flush_strip(strip_state: &mut Option<StripState>, strips: &mut Vec<Strip>, cu
 #[inline(always)]
 fn start_strip(strip_data: &mut Option<StripState>, alphas: &[u8], x: u32, fill_gap: bool) {
     *strip_data = Some(StripState {
-        x: u16::try_from(x).expect("strip starts must remain in the physical coordinate domain"),
-        alpha_idx: alphas.len() as u32,
+        x,
+        alpha_idx: Strip::alpha_index(alphas.len()),
         fill_gap,
     });
 }
@@ -865,8 +865,8 @@ fn should_create_new_strip(
 ) -> bool {
     // Returns false in case we can append to the currently built strip.
     strip_state.as_ref().is_none_or(|state| {
-        let width = (alphas.len() as u32 - state.alpha_idx) / u32::from(Tile::HEIGHT);
-        let strip_end = u32::from(state.x) + width;
+        let width = (Strip::alpha_index(alphas.len()) - state.alpha_idx) / Tile::HEIGHT_U32;
+        let strip_end = state.x + width;
 
         strip_end + 1 < overlap_start
     })
@@ -878,7 +878,7 @@ mod tests {
         ClipContext, ClipShape, ClipState, PathDataRef, Region, RowIterator,
         first_strip_at_or_after, intersect,
     };
-    use crate::geometry::RectU16;
+    use crate::geometry::RectU32;
     use crate::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
     use crate::peniko::Fill;
     use crate::strip::Strip;
@@ -894,7 +894,7 @@ mod tests {
         input.alphas = vec![255; 65536 * 4];
         let mut target = StripStorage::default();
         intersect(
-            Level::new(),
+            Level::try_detect().unwrap_or(Level::baseline()),
             path_ref(&input),
             path_ref(&input),
             &mut target,
@@ -910,20 +910,20 @@ mod tests {
             if strip.is_sentinel() {
                 continue;
             }
-            let end = u32::from(strip.x) + strip.width_to(&next);
-            for x in u32::from(strip.x)..end.min(100) {
-                for dy in 0..Tile::HEIGHT {
+            let end = strip.x + strip.width_to(&next);
+            for x in strip.x..end.min(100) {
+                for dy in 0..Tile::HEIGHT_U32 {
                     let y = strip.y + dy;
                     if y < 100 {
                         pixels[y as usize * 100 + x as usize] = alphas[strip.alpha_idx() as usize
-                            + (x - u32::from(strip.x)) as usize * Tile::HEIGHT as usize
+                            + (x - strip.x) as usize * Tile::HEIGHT_U32 as usize
                             + dy as usize];
                     }
                 }
             }
             if next.fill_gap() && strip.y == next.y {
-                for x in end..u32::from(next.x.min(100)) {
-                    for y in strip.y..(strip.y + Tile::HEIGHT).min(100) {
+                for x in end..(next.x.min(100)) {
+                    for y in strip.y..(strip.y + Tile::HEIGHT_U32).min(100) {
                         pixels[y as usize * 100 + x as usize] = 255;
                     }
                 }
@@ -1259,7 +1259,7 @@ mod tests {
         let path_ref = PathDataRef {
             strips: &path_1.strips,
             alphas: &path_1.alphas,
-            bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
+            bbox: RectU32::new(0, 0, u32::MAX, u32::MAX),
             opaque_bbox: None,
         };
 
@@ -1273,22 +1273,22 @@ mod tests {
     #[test]
     fn row_iterator_row_end_fill_gap() {
         let path = StripBuilder::new()
-            .add_strip(0, 0, Tile::WIDTH, false)
+            .add_strip(0, 0, Tile::WIDTH_U32, false)
             .finish_with_fill_gap_row_end(16);
         let path_ref = path_ref(&path);
 
         let mut idx = 0;
         let mut iter = RowIterator::new(path_ref, &mut idx, 0);
 
-        assert_strip_region(iter.next(), 0, Tile::WIDTH);
-        assert_fill_region(iter.next(), Tile::WIDTH, 16 - Tile::WIDTH);
+        assert_strip_region(iter.next(), 0, Tile::WIDTH_U32);
+        assert_fill_region(iter.next(), Tile::WIDTH_U32, 16 - Tile::WIDTH_U32);
         assert!(iter.next().is_none());
     }
 
     #[test]
     fn intersect_strip_with_row_end_fill_gap() {
         let path_1 = StripBuilder::new()
-            .add_strip(0, 0, Tile::WIDTH, false)
+            .add_strip(0, 0, Tile::WIDTH_U32, false)
             .finish_with_fill_gap_row_end(16);
         let path_2 = StripBuilder::new().add_strip(8, 0, 12, false).finish();
         let expected = StripBuilder::new().add_strip(8, 0, 12, false).finish();
@@ -1329,7 +1329,7 @@ mod tests {
 
         let mut iter = RowIterator::new(path_ref, &mut idx, 1);
 
-        assert_strip_region(iter.next(), 0, Tile::WIDTH);
+        assert_strip_region(iter.next(), 0, Tile::WIDTH_U32);
         assert!(iter.next().is_none());
     }
 
@@ -1383,7 +1383,12 @@ mod tests {
         let path_1 = path_ref(&path_1);
         let path_2 = path_ref(&path_2);
 
-        intersect(Level::new(), path_1, path_2, &mut write_target);
+        intersect(
+            Level::try_detect().unwrap_or(Level::baseline()),
+            path_1,
+            path_2,
+            &mut write_target,
+        );
 
         assert_eq!(write_target, expected);
     }
@@ -1392,27 +1397,27 @@ mod tests {
         PathDataRef {
             strips: &path.strips,
             alphas: &path.alphas,
-            bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
+            bbox: RectU32::new(0, 0, u32::MAX, u32::MAX),
             opaque_bbox: None,
         }
     }
 
-    fn assert_strip_region(region: Option<Region<'_>>, start: u16, width: u16) {
+    fn assert_strip_region(region: Option<Region<'_>>, start: u32, width: u32) {
         match region {
             Some(Region::Strip(strip)) => {
-                assert_eq!(strip.start, u32::from(start));
-                assert_eq!(strip.width, u32::from(width));
-                assert_eq!(strip.alphas.len(), (width * Tile::HEIGHT) as usize);
+                assert_eq!(strip.start, start);
+                assert_eq!(strip.width, width);
+                assert_eq!(strip.alphas.len(), (width * Tile::HEIGHT_U32) as usize);
             }
             other => panic!("expected strip region, got {other:?}"),
         }
     }
 
-    fn assert_fill_region(region: Option<Region<'_>>, start: u16, width: u16) {
+    fn assert_fill_region(region: Option<Region<'_>>, start: u32, width: u32) {
         match region {
             Some(Region::Fill(fill)) => {
-                assert_eq!(fill.start, u32::from(start));
-                assert_eq!(fill.width, u32::from(width));
+                assert_eq!(fill.start, start);
+                assert_eq!(fill.width, width);
             }
             other => panic!("expected fill region, got {other:?}"),
         }
@@ -1429,31 +1434,34 @@ mod tests {
             }
         }
 
-        fn add_strip(self, x: u16, strip_y: u16, end: u16, fill_gap: bool) -> Self {
+        fn add_strip(self, x: u32, strip_y: u32, end: u32, fill_gap: bool) -> Self {
             let width = end - x;
             self.add_strip_with(
                 x,
                 strip_y,
                 end,
                 fill_gap,
-                &vec![0; (width * Tile::HEIGHT) as usize],
+                &vec![0; (width * Tile::HEIGHT_U32) as usize],
             )
         }
 
         fn add_strip_with(
             mut self,
-            x: u16,
-            strip_y: u16,
-            end: u16,
+            x: u32,
+            strip_y: u32,
+            end: u32,
             fill_gap: bool,
             alphas: &[u8],
         ) -> Self {
             let width = end - x;
-            assert_eq!(alphas.len(), (width * Tile::HEIGHT) as usize);
+            assert_eq!(alphas.len(), (width * Tile::HEIGHT_U32) as usize);
             let idx = self.storage.alphas.len();
-            self.storage
-                .strips
-                .push(Strip::new(x, strip_y * Tile::HEIGHT, idx as u32, fill_gap));
+            self.storage.strips.push(Strip::new(
+                x,
+                strip_y * Tile::HEIGHT_U32,
+                idx as u32,
+                fill_gap,
+            ));
             self.storage.alphas.extend_from_slice(alphas);
 
             self
@@ -1470,16 +1478,19 @@ mod tests {
             self.storage
         }
 
-        fn add_row_end(mut self, strip_y: u16, x: u16, fill_gap: bool) -> Self {
+        fn add_row_end(mut self, strip_y: u32, x: u32, fill_gap: bool) -> Self {
             let idx = self.storage.alphas.len();
-            self.storage
-                .strips
-                .push(Strip::new(x, strip_y * Tile::HEIGHT, idx as u32, fill_gap));
+            self.storage.strips.push(Strip::new(
+                x,
+                strip_y * Tile::HEIGHT_U32,
+                idx as u32,
+                fill_gap,
+            ));
 
             self
         }
 
-        fn finish_with_fill_gap_row_end(self, x: u16) -> StripStorage {
+        fn finish_with_fill_gap_row_end(self, x: u32) -> StripStorage {
             let strip_y = self.storage.strips.last().unwrap().strip_y();
 
             self.add_row_end(strip_y, x, true).finish()

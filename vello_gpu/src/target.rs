@@ -3,7 +3,7 @@
 
 //! Render targets, texture bindings, and coordinate-space mappings.
 
-use vello_common::geometry::RectU16;
+use vello_common::geometry::{RectU16, RectU32};
 
 /// The root target provided by the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,12 +249,12 @@ pub(crate) struct LayerTextureRegion {
     /// The texture region of the layer.
     pub(crate) texture: TextureRegion,
     /// Bounds of this layer in **viewport** coordinates.
-    pub(crate) layer_bbox: RectU16,
+    pub(crate) layer_bbox: RectU32,
 }
 
 impl LayerTextureRegion {
     /// Restrict this region to the given scene-space bounds while preserving its texture mapping.
-    pub(crate) fn crop_to(self, bounds: RectU16) -> Self {
+    pub(crate) fn crop_to(self, bounds: RectU32) -> Self {
         let layer_bbox = self.layer_bbox.intersect(bounds);
 
         Self {
@@ -269,11 +269,11 @@ impl LayerTextureRegion {
     /// Translate a scene-space rectangle within this layer to texture coordinates.
     ///
     /// The given bbox must be fully contained within the layer bbox.
-    pub(crate) fn texture_rect(self, bbox: RectU16) -> RectU16 {
-        let x0 = self.texture.rect.x0 + (bbox.x0.checked_sub(self.layer_bbox.x0).unwrap());
-        let y0 = self.texture.rect.y0 + (bbox.y0.checked_sub(self.layer_bbox.y0).unwrap());
+    pub(crate) fn texture_rect(self, bbox: RectU32) -> RectU16 {
+        let x0 = u32::from(self.texture.rect.x0) + bbox.x0.checked_sub(self.layer_bbox.x0).unwrap();
+        let y0 = u32::from(self.texture.rect.y0) + bbox.y0.checked_sub(self.layer_bbox.y0).unwrap();
 
-        RectU16::new(x0, y0, x0 + bbox.width(), y0 + bbox.height())
+        RectU16::try_from(RectU32::new(x0, y0, x0 + bbox.width(), y0 + bbox.height())).unwrap()
     }
 }
 
@@ -282,7 +282,7 @@ pub(crate) trait DrawTarget {
     fn enable_depth(&self) -> bool;
 
     /// A positional shift that needs to be applied to all geometry when rendering to this target.
-    fn geometry_shift(&self) -> (i32, i32);
+    fn geometry_shift(&self) -> (i64, i64);
 }
 
 impl DrawTarget for RootTarget {
@@ -290,7 +290,7 @@ impl DrawTarget for RootTarget {
         matches!(self, Self::UserSurface)
     }
 
-    fn geometry_shift(&self) -> (i32, i32) {
+    fn geometry_shift(&self) -> (i64, i64) {
         (0, 0)
     }
 }
@@ -300,12 +300,12 @@ impl DrawTarget for LayerTextureRegion {
         false
     }
 
-    fn geometry_shift(&self) -> (i32, i32) {
+    fn geometry_shift(&self) -> (i64, i64) {
         // We always render layers such that their bbox starts at (0, 0) in the allocated
         // texture region, to minimize the consumed space.
         (
-            self.texture.rect.x0 as i32 - i32::from(self.layer_bbox.x0),
-            self.texture.rect.y0 as i32 - i32::from(self.layer_bbox.y0),
+            i64::from(self.texture.rect.x0) - i64::from(self.layer_bbox.x0),
+            i64::from(self.texture.rect.y0) - i64::from(self.layer_bbox.y0),
         )
     }
 }
@@ -313,7 +313,7 @@ impl DrawTarget for LayerTextureRegion {
 #[cfg(test)]
 mod tests {
     use super::{LayerTextureId, LayerTextureRegion, RoundBindings, TextureParity, TextureRegion};
-    use vello_common::geometry::RectU16;
+    use vello_common::geometry::{RectU16, RectU32};
 
     #[test]
     fn texture_pair_constraints() {
@@ -337,11 +337,11 @@ mod tests {
                 target: LayerTextureId::new(TextureParity::Even, 0),
                 rect: RectU16::new(100, 200, 150, 250),
             },
-            layer_bbox: RectU16::new(10, 20, 60, 70),
+            layer_bbox: RectU32::new(131082, 196628, 131132, 196678),
         };
 
         assert_eq!(
-            layer.texture_rect(RectU16::new(15, 30, 25, 42)),
+            layer.texture_rect(RectU32::new(131087, 196638, 131097, 196650)),
             RectU16::new(105, 210, 115, 222)
         );
     }
@@ -353,17 +353,17 @@ mod tests {
                 target: LayerTextureId::new(TextureParity::Even, 0),
                 rect: RectU16::new(100, 200, 150, 250),
             },
-            layer_bbox: RectU16::new(10, 20, 60, 70),
+            layer_bbox: RectU32::new(131082, 196628, 131132, 196678),
         };
 
         assert_eq!(
-            layer.crop_to(RectU16::new(15, 30, 25, 42)),
+            layer.crop_to(RectU32::new(131087, 196638, 131097, 196650)),
             LayerTextureRegion {
                 texture: TextureRegion {
                     target: layer.texture.target,
                     rect: RectU16::new(105, 210, 115, 222),
                 },
-                layer_bbox: RectU16::new(15, 30, 25, 42),
+                layer_bbox: RectU32::new(131087, 196638, 131097, 196650),
             }
         );
     }

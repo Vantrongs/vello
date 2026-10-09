@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use bytemuck::{Pod, Zeroable};
 use core::mem::size_of;
 use vello_common::color::{AlphaColor, Srgb};
-use vello_common::geometry::{RectU16, SizeU16};
+use vello_common::geometry::{RectU16, SizeU16, SizeU32};
 use vello_common::record::CommandRecorder;
 use vello_common::tile::Tile;
 
@@ -171,10 +171,10 @@ impl LayersConfig {
         let min_size = self.min_texture_size;
         let max_size = self.max_texture_size;
 
-        let checked_size = |width: u32, height: u32| {
-            let width = width.next_multiple_of(u32::from(Tile::WIDTH));
-            let height = height.next_multiple_of(u32::from(Tile::HEIGHT));
-            if width > u32::from(max_size.width()) || height > u32::from(max_size.height()) {
+        let checked_size = |width: u64, height: u64| {
+            let width = width.next_multiple_of(u64::from(Tile::WIDTH));
+            let height = height.next_multiple_of(u64::from(Tile::HEIGHT));
+            if width > u64::from(max_size.width()) || height > u64::from(max_size.height()) {
                 return Err(IntermediateTextureError::TooLarge {
                     width,
                     height,
@@ -189,11 +189,11 @@ impl LayersConfig {
             ))
         };
 
-        let filter_padding = u32::from(FILTER_ATLAS_PADDING) * 2;
+        let filter_padding = u64::from(FILTER_ATLAS_PADDING) * 2;
         let filter_size = if let Some(size) = recorder.largest_filter_layer_size {
             checked_size(
-                u32::from(size.width()) + filter_padding,
-                u32::from(size.height()) + filter_padding,
+                u64::from(size.width()) + filter_padding,
+                u64::from(size.height()) + filter_padding,
             )?
         } else {
             SizeU16::ZERO
@@ -201,8 +201,8 @@ impl LayersConfig {
 
         let mut layer_size = recorder
             .largest_layer_size
-            .unwrap_or(SizeU16::ZERO)
-            .max(filter_size);
+            .unwrap_or(SizeU32::ZERO)
+            .max(filter_size.into());
 
         // If we are blending into the root we will render the whole root into an
         // layer texture. Since we don't track the bbox of root draw commands, we need
@@ -212,8 +212,8 @@ impl LayersConfig {
         }
 
         Ok(checked_size(
-            u32::from(layer_size.width()),
-            u32::from(layer_size.height()),
+            u64::from(layer_size.width()),
+            u64::from(layer_size.height()),
         )?
         .max(min_size))
     }
@@ -221,7 +221,7 @@ impl LayersConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::DeviceLimits;
+    use super::{DeviceLimits, SizeU32};
     use crate::scene::RecordedDraw;
     use crate::{IntermediateTextureError, LayersConfig, MemorySettings, SizeU16};
     use vello_common::multi_atlas::AtlasConfig;
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn required_intermediate_texture_size_rejects_oversized_layers() {
         let mut recorder = CommandRecorder::<RecordedDraw>::new(10, 10);
-        recorder.largest_layer_size = Some(SizeU16::from_wh(513, 10));
+        recorder.largest_layer_size = Some(SizeU32::from_wh(513, 10));
 
         let config = LayersConfig {
             min_texture_size: SizeU16::new(1),
@@ -371,9 +371,32 @@ mod tests {
     }
 
     #[test]
+    fn required_intermediate_texture_size_reports_full_source_and_padding() {
+        let config = LayersConfig {
+            min_texture_size: SizeU16::new(1),
+            max_texture_size: SizeU16::new(u16::MAX),
+            ..Default::default()
+        };
+        let mut recorder = CommandRecorder::<RecordedDraw>::new(4, 4);
+        for size in [70_000, u32::MAX - 3] {
+            recorder.largest_filter_layer_size = Some(SizeU32::from_wh(size, 4));
+            let Err(IntermediateTextureError::TooLarge { width, .. }) =
+                config.required_intermediate_texture_size(&recorder)
+            else {
+                panic!("expected a texture resource limit error");
+            };
+            assert_eq!(
+                width,
+                (u64::from(size) + u64::from(crate::filter::FILTER_ATLAS_PADDING) * 2)
+                    .next_multiple_of(4)
+            );
+        }
+    }
+
+    #[test]
     fn required_intermediate_texture_size_rejects_filter_padding_overflow() {
         let mut recorder = CommandRecorder::<RecordedDraw>::new(10, 10);
-        recorder.largest_filter_layer_size = Some(SizeU16::from_wh(u16::MAX, 10));
+        recorder.largest_filter_layer_size = Some(SizeU32::from_wh(u32::from(u16::MAX), 10));
 
         let config = LayersConfig {
             min_texture_size: SizeU16::new(1),
@@ -381,7 +404,7 @@ mod tests {
             ..Default::default()
         };
 
-        let padding = u32::from(crate::filter::FILTER_ATLAS_PADDING) * 2;
+        let padding = u64::from(crate::filter::FILTER_ATLAS_PADDING) * 2;
         let error = config
             .required_intermediate_texture_size(&recorder)
             .unwrap_err();
@@ -393,7 +416,7 @@ mod tests {
                 max_width,
                 max_height,
             } => {
-                assert_eq!(width, (u32::from(u16::MAX) + padding).next_multiple_of(4));
+                assert_eq!(width, (u64::from(u16::MAX) + padding).next_multiple_of(4));
                 assert_eq!(height, (10 + padding).next_multiple_of(4));
                 assert_eq!(max_width, u16::MAX);
                 assert_eq!(max_height, u16::MAX);
@@ -472,6 +495,8 @@ pub struct GpuStrip {
     pub col_idx_or_rect_frac: u32,
     /// See `StripInstance::payload` documentation in `render.wesl`.
     pub payload: u32,
+    /// Second paint coordinate (u32 source or f32 local); height and alpha row for clipped layer strips.
+    pub payload_y: u32,
     /// See `StripInstance::paint_and_rect_flag` documentation in `render.wesl`.
     pub paint_and_rect_flag: u32,
     /// Painter's-order index used to compute z-depth for early-z rejection in shader.

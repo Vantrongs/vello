@@ -312,9 +312,8 @@ mod tests {
             case.layer_with(
                 None,
                 Some(BlendMode::new(Mix::Multiply, Compose::SrcOver)),
-                Some(Filter::from_primitive(FilterPrimitive::Offset {
-                    dx: 0.0,
-                    dy: 0.0,
+                Some(Filter::from_primitive(FilterPrimitive::Flood {
+                    color: vello_common::peniko::Color::WHITE,
                 })),
                 |case| case.draw_at(8.0, 0.5),
             );
@@ -326,9 +325,8 @@ mod tests {
                 case.layer_with(
                     None,
                     Some(BlendMode::new(Mix::Multiply, Compose::SrcOver)),
-                    Some(Filter::from_primitive(FilterPrimitive::Offset {
-                        dx: 0.0,
-                        dy: 0.0,
+                    Some(Filter::from_primitive(FilterPrimitive::Flood {
+                        color: vello_common::peniko::Color::WHITE,
                     })),
                     |case| case.draw_at(20.0, 0.5),
                 );
