@@ -5,9 +5,12 @@
 //! well as some code that was copied from kurbo, which is needed to reimplement the
 //! full `flatten` method.
 
+use crate::cull::{Cull, SPLIT_EXTENT, SplitHuge, seg_to_el};
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
-use crate::kurbo::{CubicBez, Line, ParamCurve, ParamCurveNearest, PathEl, Point, QuadBez};
+use crate::kurbo::{
+    CubicBez, Line, ParamCurve, ParamCurveNearest, PathEl, PathSeg, Point, QuadBez,
+};
 use crate::{
     flatten::{SQRT_TOL, TOL, TOL_2},
     geometry::RectU16,
@@ -80,7 +83,7 @@ pub(crate) fn flatten<S: Simd>(
     // rendered at all, there will be other geometry above that edge of the cull bbox. If that
     // geometry extends above the row, there will be coarse winding for a sparse fill. If not, it
     // there will be geometry to generate the intermediate tiles.
-    let [left, top, right, bottom] = fill_cull_rect(cull_bbox);
+    let rect = fill_cull_rect(cull_bbox);
 
     let mut path = path.into_iter();
     let Some(first_el) = path.next() else {
@@ -115,106 +118,31 @@ pub(crate) fn flatten<S: Simd>(
             }
             PathEl::QuadTo(p1, p2) => {
                 let p0 = last_pt;
-                let line = Line::new(p0, p2);
-                // If the quadratic Bézier is fully to the right, top, or bottom of the culling
-                // bbox, it does not impact pixel coverage or winding. We can ignore it. The
-                // following checks that conservatively by checking whether the bounding box of the
-                // Bézier's control points is fully outside the culling bbox.
-                if [p0, p1, p2].into_iter().all(|p| p.x > right)
-                    || [p0, p1, p2].into_iter().all(|p| p.y < top)
-                    || [p0, p1, p2].into_iter().all(|p| p.y > bottom)
-                {
-                    callback.callback(LinePathEl::MoveTo(p2));
-                }
-                // The following checks two things. First, if the quadratic Bézier is fully to the
-                // left of the culling bbox, it may affect pixel coverage and winding, but its
-                // exact shape does not matter. It can be emitted as a line segment [p0, p2].
-                //
-                // Second, an upper bound on the shortest distance of any point on the quadratic
-                // Bézier curve to the line segment [p0, p2] is 1/2 of the control-point-to-line-segment
-                // distance.
-                //
-                // The derivation is similar to that for the cubic Bézier (see below). In
-                // short:
-                //
-                // q(t) = B0(t) p0 + B1(t) p1 + B2(t) p2
-                // dist(q(t), [p0, p1]) <= B1(t) dist(p1, [p0, p1])
-                //                       = 2 (1-t)t dist(p1, [p0, p1]).
-                //
-                // The maximum occurs at t=1/2, hence
-                // max(dist(q(t), [p0, p1] <= 1/2 dist(p1, [p0, p1])).
-                //
-                // The following takes the square to elide the square root of the Euclidean
-                // distance.
-                else if [p0, p1, p2].into_iter().all(|p| p.x < left)
-                    || line.nearest(p1, 0.).distance_sq <= 4. * TOL_2
-                {
-                    callback.callback(LinePathEl::LineTo(p2));
+                if exceeds_split_extent(&[p0, p1, p2]) {
+                    flatten_split(
+                        simd,
+                        PathSeg::Quad(QuadBez::new(p0, p1, p2)),
+                        rect,
+                        callback,
+                        flatten_ctx,
+                    );
                 } else {
-                    let q = QuadBez::new(p0, p1, p2);
-                    let params = q.estimate_subdiv(SQRT_TOL);
-                    let n = ((0.5 / SQRT_TOL * params.val).ceil() as usize).max(1);
-                    let step = 1.0 / (n as f64);
-                    for i in 1..n {
-                        let u = (i as f64) * step;
-                        let t = q.determine_subdiv_t(&params, u);
-                        let p = q.eval(t);
-                        callback.callback(LinePathEl::LineTo(p));
-                    }
-                    callback.callback(LinePathEl::LineTo(p2));
+                    flatten_quad(p0, p1, p2, rect, callback);
                 }
                 last_pt = p2;
             }
             PathEl::CurveTo(p1, p2, p3) => {
                 let p0 = last_pt;
-                let line = Line::new(p0, p3);
-                // If the cubic Bézier is fully to the right, top, or bottom of the culling bbox,
-                // it does not impact pixel coverage or winding. We can ignore it. The following
-                // checks that conservatively by checking whether the bounding box of the Bézier's
-                // control points is fully outside the culling bbox.
-                if [p0, p1, p2, p3].into_iter().all(|p| p.x > right)
-                    || [p0, p1, p2, p3].into_iter().all(|p| p.y < top)
-                    || [p0, p1, p2, p3].into_iter().all(|p| p.y > bottom)
-                {
-                    callback.callback(LinePathEl::MoveTo(p3));
-                }
-                // The following checks two things. First, if the cubic Bézier is fully to the left
-                // of the culling bbox, it may affect pixel coverage and winding, but its exact
-                // shape does not matter. It can be emitted as a line segment [p0, p3].
-                //
-                // Second, an upper bound on the shortest distance of any point on the cubic Bézier
-                // curve to the line segment [p0, p3] is 3/4 of the maximum of the
-                // control-point-to-line-segment distances.
-                //
-                // With Bernstein weights Bi(t), we have
-                // c(t) = B0(t) p0 + B1(t) p1 + B2(t) p2 + B3(t) p3
-                // with t from 0 to 1 (inclusive).
-                //
-                // Through convexivity of the Euclidean distance function and the line segment,
-                // we have
-                // dist(c(t), [p0, p3]) <= B1(t) dist(p1, [p0, p3]) + B2(t) dist(p2, [p0, p3])
-                //                      <= (B1(t) + B2(t)) max(dist(p1, [p0, p3]), dist(p2, [p0, p3]))
-                //                       = 3 ((1-t)t^2 + (1-t)^2t) max(dist(p1, [p0, p3]), dist(p2, [p0, p3])).
-                //
-                // The inner polynomial has its maximum of 1/4 at t=1/2, hence
-                // max(dist(c(t), [p0, p3])) <= 3/4 max(dist(p1, [p0, p3]), dist(p2, [p0, p3])).
-                //
-                // The following takes the square to elide the square root of the Euclidean
-                // distance.
-                else if [p0, p1, p2, p3].into_iter().all(|p| p.x < left)
-                    || f64::max(
-                        line.nearest(p1, 0.).distance_sq,
-                        line.nearest(p2, 0.).distance_sq,
-                    ) <= 16. / 9. * TOL_2
-                {
-                    callback.callback(LinePathEl::LineTo(p3));
+                if exceeds_split_extent(&[p0, p1, p2, p3]) {
+                    flatten_split(
+                        simd,
+                        PathSeg::Cubic(CubicBez::new(p0, p1, p2, p3)),
+                        rect,
+                        callback,
+                        flatten_ctx,
+                    );
                 } else {
-                    let c = CubicBez::new(p0, p1, p2, p3);
-                    let max = flatten_cubic_simd(simd, c, flatten_ctx);
-
-                    for p in &flatten_ctx.flattened_cubics[1..max] {
-                        callback.callback(LinePathEl::LineTo(Point::new(p.x as f64, p.y as f64)));
-                    }
+                    flatten_cubic(simd, p0, p1, p2, p3, rect, callback, flatten_ctx);
                 }
                 last_pt = p3;
             }
@@ -238,9 +166,175 @@ pub(crate) fn flatten<S: Simd>(
     }
 }
 
+/// Whether a curve with these device control points is split before flattening
+/// (`cull::SPLIT_EXTENT`): the lines below grow with its size.
+#[inline(always)]
+fn exceeds_split_extent(pts: &[Point]) -> bool {
+    let (mut x0, mut y0, mut x1, mut y1) = (pts[0].x, pts[0].y, pts[0].x, pts[0].y);
+    for p in &pts[1..] {
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+    (x1 - x0).max(y1 - y0) > SPLIT_EXTENT
+}
+
+/// Flattens the pieces `SplitHuge` cuts a huge device-space curve into: chords where
+/// they miss `rect`, curves no larger than it where they meet it.
+#[cold]
+#[inline(never)]
+fn flatten_split<S: Simd>(
+    simd: S,
+    seg: PathSeg,
+    rect: [f64; 4],
+    callback: &mut impl Callback,
+    flatten_ctx: &mut FlattenCtx,
+) {
+    let mut last = seg.start();
+    let cull = Cull::new(Affine::IDENTITY, rect);
+    let pieces = SplitHuge::new([PathEl::MoveTo(last), seg_to_el(&seg)], cull, false);
+    for (el, _) in pieces.skip(1) {
+        match el {
+            PathEl::LineTo(p) => {
+                callback.callback(LinePathEl::LineTo(p));
+                last = p;
+            }
+            PathEl::QuadTo(p1, p2) => {
+                flatten_quad(last, p1, p2, rect, callback);
+                last = p2;
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                flatten_cubic(simd, last, p1, p2, p3, rect, callback, flatten_ctx);
+                last = p3;
+            }
+            PathEl::MoveTo(_) | PathEl::ClosePath => unreachable!("pieces of one segment"),
+        }
+    }
+}
+
+/// Flattens the quadratic `p0 p1 p2` (device space), culled against `rect`.
+#[inline(always)]
+fn flatten_quad(p0: Point, p1: Point, p2: Point, rect: [f64; 4], callback: &mut impl Callback) {
+    let [left, top, right, bottom] = rect;
+    let line = Line::new(p0, p2);
+    // If the quadratic Bézier is fully to the right, top, or bottom of the culling
+    // bbox, it does not impact pixel coverage or winding. We can ignore it. The
+    // following checks that conservatively by checking whether the bounding box of the
+    // Bézier's control points is fully outside the culling bbox.
+    if [p0, p1, p2].into_iter().all(|p| p.x > right)
+        || [p0, p1, p2].into_iter().all(|p| p.y < top)
+        || [p0, p1, p2].into_iter().all(|p| p.y > bottom)
+    {
+        callback.callback(LinePathEl::MoveTo(p2));
+    }
+    // The following checks two things. First, if the quadratic Bézier is fully to the
+    // left of the culling bbox, it may affect pixel coverage and winding, but its
+    // exact shape does not matter. It can be emitted as a line segment [p0, p2].
+    //
+    // Second, an upper bound on the shortest distance of any point on the quadratic
+    // Bézier curve to the line segment [p0, p2] is 1/2 of the control-point-to-line-segment
+    // distance.
+    //
+    // The derivation is similar to that for the cubic Bézier (see below). In
+    // short:
+    //
+    // q(t) = B0(t) p0 + B1(t) p1 + B2(t) p2
+    // dist(q(t), [p0, p1]) <= B1(t) dist(p1, [p0, p1])
+    //                       = 2 (1-t)t dist(p1, [p0, p1]).
+    //
+    // The maximum occurs at t=1/2, hence
+    // max(dist(q(t), [p0, p1] <= 1/2 dist(p1, [p0, p1])).
+    //
+    // The following takes the square to elide the square root of the Euclidean
+    // distance.
+    else if [p0, p1, p2].into_iter().all(|p| p.x < left)
+        || line.nearest(p1, 0.).distance_sq <= 4. * TOL_2
+    {
+        callback.callback(LinePathEl::LineTo(p2));
+    } else {
+        let q = QuadBez::new(p0, p1, p2);
+        let params = q.estimate_subdiv(SQRT_TOL);
+        let n = ((0.5 / SQRT_TOL * params.val).ceil() as usize).max(1);
+        let step = 1.0 / (n as f64);
+        for i in 1..n {
+            let u = (i as f64) * step;
+            let t = q.determine_subdiv_t(&params, u);
+            let p = q.eval(t);
+            callback.callback(LinePathEl::LineTo(p));
+        }
+        callback.callback(LinePathEl::LineTo(p2));
+    }
+}
+
+/// Flattens the cubic `p0 p1 p2 p3` (device space), culled against `rect`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments, reason = "the loop's state, passed as is")]
+fn flatten_cubic<S: Simd>(
+    simd: S,
+    p0: Point,
+    p1: Point,
+    p2: Point,
+    p3: Point,
+    rect: [f64; 4],
+    callback: &mut impl Callback,
+    flatten_ctx: &mut FlattenCtx,
+) {
+    let [left, top, right, bottom] = rect;
+    let line = Line::new(p0, p3);
+    // If the cubic Bézier is fully to the right, top, or bottom of the culling bbox,
+    // it does not impact pixel coverage or winding. We can ignore it. The following
+    // checks that conservatively by checking whether the bounding box of the Bézier's
+    // control points is fully outside the culling bbox.
+    if [p0, p1, p2, p3].into_iter().all(|p| p.x > right)
+        || [p0, p1, p2, p3].into_iter().all(|p| p.y < top)
+        || [p0, p1, p2, p3].into_iter().all(|p| p.y > bottom)
+    {
+        callback.callback(LinePathEl::MoveTo(p3));
+    }
+    // The following checks two things. First, if the cubic Bézier is fully to the left
+    // of the culling bbox, it may affect pixel coverage and winding, but its exact
+    // shape does not matter. It can be emitted as a line segment [p0, p3].
+    //
+    // Second, an upper bound on the shortest distance of any point on the cubic Bézier
+    // curve to the line segment [p0, p3] is 3/4 of the maximum of the
+    // control-point-to-line-segment distances.
+    //
+    // With Bernstein weights Bi(t), we have
+    // c(t) = B0(t) p0 + B1(t) p1 + B2(t) p2 + B3(t) p3
+    // with t from 0 to 1 (inclusive).
+    //
+    // Through convexivity of the Euclidean distance function and the line segment,
+    // we have
+    // dist(c(t), [p0, p3]) <= B1(t) dist(p1, [p0, p3]) + B2(t) dist(p2, [p0, p3])
+    //                      <= (B1(t) + B2(t)) max(dist(p1, [p0, p3]), dist(p2, [p0, p3]))
+    //                       = 3 ((1-t)t^2 + (1-t)^2t) max(dist(p1, [p0, p3]), dist(p2, [p0, p3])).
+    //
+    // The inner polynomial has its maximum of 1/4 at t=1/2, hence
+    // max(dist(c(t), [p0, p3])) <= 3/4 max(dist(p1, [p0, p3]), dist(p2, [p0, p3])).
+    //
+    // The following takes the square to elide the square root of the Euclidean
+    // distance.
+    else if [p0, p1, p2, p3].into_iter().all(|p| p.x < left)
+        || f64::max(
+            line.nearest(p1, 0.).distance_sq,
+            line.nearest(p2, 0.).distance_sq,
+        ) <= 16. / 9. * TOL_2
+    {
+        callback.callback(LinePathEl::LineTo(p3));
+    } else {
+        let c = CubicBez::new(p0, p1, p2, p3);
+        let max = flatten_cubic_simd(simd, c, flatten_ctx);
+
+        for p in &flatten_ctx.flattened_cubics[1..max] {
+            callback.callback(LinePathEl::LineTo(Point::new(p.x as f64, p.y as f64)));
+        }
+    }
+}
+
 /// Left, top, right and bottom of the device area a fill's curves are culled against
 /// (see `flatten`): `cull_bbox` with its top aligned to the strip row.
-pub(crate) fn fill_cull_rect(cull_bbox: RectU16) -> [f64; 4] {
+fn fill_cull_rect(cull_bbox: RectU16) -> [f64; 4] {
     [
         cull_bbox.x0 as f64,
         ((cull_bbox.y0 / Tile::HEIGHT) * Tile::HEIGHT) as f64,
@@ -313,7 +407,7 @@ impl FlattenParamsExt for QuadBez {
     }
 }
 
-trait FlattenParamsExt {
+pub(crate) trait FlattenParamsExt {
     fn estimate_subdiv(&self, sqrt_tol: f64) -> FlattenParams;
     fn determine_subdiv_t(&self, params: &FlattenParams, x: f64) -> f64;
 }
@@ -331,13 +425,13 @@ struct Point32 {
     y: f32,
 }
 
-struct FlattenParams {
+pub(crate) struct FlattenParams {
     a0: f64,
     a2: f64,
     u0: f64,
     uscale: f64,
     /// The number of `subdivisions * 2 * sqrt_tol`.
-    val: f64,
+    pub(crate) val: f64,
 }
 
 /// This limit was chosen based on the pre-existing GitHub gist.
