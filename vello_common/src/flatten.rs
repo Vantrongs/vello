@@ -3,10 +3,14 @@
 
 //! Flattening filled and stroked paths.
 
-use crate::flatten_simd::{Callback, LinePathEl};
+use crate::cull::{Cull, SplitHuge, split_huge};
+use crate::flatten_simd::{Callback, LinePathEl, fill_cull_rect};
 use crate::geometry::RectU16;
+#[cfg(not(feature = "std"))]
+use crate::kurbo::common::FloatFuncs as _;
 use crate::kurbo::{self, Affine, PathEl, Stroke, StrokeCtx, StrokeOpts};
 use alloc::vec::Vec;
+use core::f64::consts::SQRT_2;
 use fearless_simd::{Level, Simd, dispatch};
 use log::warn;
 
@@ -206,6 +210,8 @@ pub fn fill_impl<S: Simd>(
         is_nan: false,
     };
 
+    let cull = Cull::new(affine, fill_cull_rect(cull_bbox));
+    let path = split_huge(path, cull);
     crate::flatten_simd::flatten(simd, path, affine, &mut lb, flatten_ctx, cull_bbox);
 
     // A path that contains NaN is ill-defined, so ignore it.
@@ -233,15 +239,35 @@ pub fn stroke(
         line_buf.clear();
         return;
     }
+    let cull = Cull::new(affine, stroke_cull_rect(cull_bbox, style, scale));
     if style.width * scale <= HAIRLINE_MAX_WIDTH {
-        hairline(path, style, affine, scale, line_buf, flatten_ctx, cull_bbox);
+        hairline(
+            path,
+            style,
+            affine,
+            scale,
+            line_buf,
+            flatten_ctx,
+            cull_bbox,
+            cull,
+        );
         return;
     }
     // The tolerance is in user space, so it shrinks with the largest stretch of the
     // transform (rotated transforms included).
     let tolerance = TOL / scale.max(1.);
 
-    expand_stroke(path, style, tolerance, stroke_ctx);
+    if style.dash_pattern.is_empty() {
+        expand_stroke(split_huge(path, cull), style, tolerance, stroke_ctx);
+    } else {
+        let path = SplitHuge::new(path, cull, true);
+        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern);
+        let solid = Stroke {
+            dash_pattern: kurbo::Dashes::new(),
+            ..style.clone()
+        };
+        expand_stroke(dashed, &solid, tolerance, stroke_ctx);
+    }
     fill(
         level,
         stroke_ctx.output(),
@@ -256,6 +282,25 @@ pub fn stroke(
 /// segment becomes its own rectangle. Joins and caps then differ from the exact
 /// outline by at most half the width, which is below a pixel.
 pub const HAIRLINE_MAX_WIDTH: f64 = 1.0;
+
+/// `cull_bbox` widened by how far a stroke's outline reaches from its path, in device
+/// pixels: half the width times the miter limit for miter joins, else times √2 (square
+/// caps; the hairline joins that take the miter tip turn by at most 90°), plus a pixel
+/// for the flattening tolerance.
+fn stroke_cull_rect(cull_bbox: RectU16, style: &Stroke, scale: f64) -> [f64; 4] {
+    let miter = if style.join == kurbo::Join::Miter {
+        style.miter_limit
+    } else {
+        0.0
+    };
+    let reach = 0.5 * style.width * scale * miter.max(SQRT_2) + 1.0;
+    [
+        f64::from(cull_bbox.x0) - reach,
+        f64::from(cull_bbox.y0) - reach,
+        f64::from(cull_bbox.x1) + reach,
+        f64::from(cull_bbox.y1) + reach,
+    ]
+}
 
 /// The largest factor by which `affine` stretches any direction (its largest singular
 /// value).
@@ -276,8 +321,9 @@ pub fn max_scale(affine: Affine) -> f64 {
 /// intersection of the two offset lines, so the overlap is not counted twice, unless
 /// that point lies beyond one of the segments (then it goes through the join point, as
 /// kurbo does); the outer side takes the miter tip within the miter limit, else the
-/// bevel, and round joins add the arc's midpoint. Joins whose wedge is under
-/// `MIN_JOIN_AREA` take the miter tip whatever the style.
+/// bevel, and round joins add the arc's midpoint. Joins that turn by at most 90° and
+/// whose wedge is under `MIN_JOIN_AREA` take the miter tip whatever the style, so the
+/// outline reaches at most √2 half widths from the path there.
 ///
 /// Open ends are extended by the cap: half the width for square caps, a quarter of it
 /// for round caps. A quarter matches the area the expanded round cap keeps once
@@ -294,6 +340,7 @@ fn hairline(
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
     cull_bbox: RectU16,
+    cull: Cull,
 ) {
     line_buf.clear();
     let [left, right] = &mut flatten_ctx.hairline_sides;
@@ -324,9 +371,10 @@ fn hairline(
     };
     let tolerance = TOL / scale;
     if style.dash_pattern.is_empty() {
-        kurbo::flatten(path, tolerance, |el| sink.push(el));
+        kurbo::flatten(split_huge(path, cull), tolerance, |el| sink.push(el));
     } else {
-        let dashed = kurbo::dash(path.into_iter(), style.dash_offset, &style.dash_pattern);
+        let path = SplitHuge::new(path, cull, true);
+        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern);
         kurbo::flatten(dashed, tolerance, |el| sink.push(el));
     }
     sink.end_subpath(false);
@@ -336,8 +384,8 @@ fn hairline(
     }
 }
 
-/// Joins whose wedge is smaller than this many square device pixels take the miter
-/// tip whatever the join style (see `hairline`).
+/// Joins whose wedge is smaller than this many square device pixels (and that turn by
+/// at most 90°) take the miter tip whatever the join style (see `hairline`).
 const MIN_JOIN_AREA: f64 = 1.0 / 128.0;
 
 fn cap_extension(cap: kurbo::Cap, width: f64) -> f64 {
@@ -447,7 +495,8 @@ impl HairlineSink<'_> {
             inner.extend([p + n0, p, p + n1]);
         }
         // The outer side.
-        let negligible = tan_half.is_nan() || self.device_half_width2 * tan_half < MIN_JOIN_AREA;
+        let negligible = tan_half.is_nan()
+            || (tan_half <= 1.0 && self.device_half_width2 * tan_half < MIN_JOIN_AREA);
         let within_limit = (0.5 * (1.0 + cos)).sqrt() * self.miter_limit >= 1.0;
         match self.join {
             _ if negligible && reach.is_finite() => outer.push(p - miter),
@@ -589,14 +638,16 @@ mod hairline_tests {
 
     fn lines(path: &kurbo::BezPath, style: &Stroke, affine: Affine, cull: RectU16) -> Vec<Line> {
         let mut buf = Vec::new();
+        let scale = max_scale(affine);
         hairline(
             path.iter(),
             style,
             affine,
-            max_scale(affine),
+            scale,
             &mut buf,
             &mut FlattenCtx::default(),
             cull,
+            Cull::new(affine, stroke_cull_rect(cull, style, scale)),
         );
         buf
     }
@@ -723,6 +774,22 @@ mod hairline_tests {
         }
         p.line_to((f64::NAN, 10.0));
         assert!(lines(&p, &Stroke::new(1.0), Affine::IDENTITY, VIEW).is_empty());
+    }
+
+    /// A very thin stroke that nearly reverses: its wedge is tiny, but the miter tip
+    /// would lie 100 px out; the outline stays within √2 half widths of the path.
+    #[test]
+    fn thin_sharp_joins_stay_near_the_path() {
+        let mut p = kurbo::BezPath::new();
+        p.move_to((0.0, 50.0));
+        p.line_to((50.0, 50.0));
+        p.line_to((0.0, 50.000_002));
+        let hw = 1e-6;
+        let style = Stroke::new(2.0 * hw).with_join(kurbo::Join::Bevel);
+        let (x0, y0, x1, y1) = bounds(&lines(&p, &style, Affine::IDENTITY, VIEW));
+        let reach = (SQRT_2 * hw) as f32 + 1e-4;
+        assert!(x1 <= 50.0 + reach && x0 >= -reach, "{x0} {x1}");
+        assert!(y0 >= 50.0 - reach && y1 <= 50.000_002 + reach, "{y0} {y1}");
     }
 
     #[test]

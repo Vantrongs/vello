@@ -80,10 +80,7 @@ pub(crate) fn flatten<S: Simd>(
     // rendered at all, there will be other geometry above that edge of the cull bbox. If that
     // geometry extends above the row, there will be coarse winding for a sparse fill. If not, it
     // there will be geometry to generate the intermediate tiles.
-    let left = cull_bbox.x0 as f64;
-    let top = ((cull_bbox.y0 / Tile::HEIGHT) * Tile::HEIGHT) as f64;
-    let right = cull_bbox.x1 as f64;
-    let bottom = cull_bbox.y1 as f64;
+    let [left, top, right, bottom] = fill_cull_rect(cull_bbox);
 
     let mut path = path.into_iter();
     let Some(first_el) = path.next() else {
@@ -239,6 +236,17 @@ pub(crate) fn flatten<S: Simd>(
     if last_pt != start_pt {
         callback.callback(LinePathEl::LineTo(start_pt));
     }
+}
+
+/// Left, top, right and bottom of the device area a fill's curves are culled against
+/// (see `flatten`): `cull_bbox` with its top aligned to the strip row.
+pub(crate) fn fill_cull_rect(cull_bbox: RectU16) -> [f64; 4] {
+    [
+        cull_bbox.x0 as f64,
+        ((cull_bbox.y0 / Tile::HEIGHT) * Tile::HEIGHT) as f64,
+        cull_bbox.x1 as f64,
+        cull_bbox.y1 as f64,
+    ]
 }
 
 // The below methods are copied from kurbo and needed to implement flattening of normal quad curves.
