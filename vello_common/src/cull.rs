@@ -1,20 +1,20 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Keeps the cost of flattening, stroking and dashing a segment bounded by the view
-//! rather than by the size of its coordinates.
+//! Keeps the cost of stroking and dashing a segment bounded by the view rather than by
+//! the size of its coordinates. (Fills clip their segments to the view in device
+//! space instead: `fill_clip`.)
 //!
 //! Kurbo's `flatten` reserves memory for a cubic in proportion to the cube root of its
 //! size and emits lines in proportion to the square root, and dashing walks every dash,
-//! so one cubic with control points at 1e24 asks for gigabytes. A consumer that works
-//! in device space (fills) is bounded by a segment's device size; one that works in
-//! path space with its tolerance divided by the transform's largest stretch (thin
-//! strokes, dashing) by its path-space size times that stretch, which an anisotropic
-//! transform can make arbitrarily larger than its device size. Segments too large for
-//! their consumer are therefore split (de Casteljau, at the middle) until each piece
-//! is no larger than the view or its control box misses the view; a piece in view that
-//! is still too large in path space (the transform compresses it) is drawn as a
-//! polyline through points of the curve, spaced by its device size. Real drawings stay
+//! so one cubic with control points at 1e24 asks for gigabytes. Strokes and dashing
+//! work in path space with the tolerance divided by the transform's largest stretch,
+//! so their cost is bounded by a segment's path-space size times that stretch, which
+//! an anisotropic transform can make arbitrarily larger than its device size. Segments
+//! too large for their consumer are therefore split (de Casteljau, at the middle)
+//! until each piece is no larger than the view or its control box misses the view; a
+//! piece in view that is still too large in path space (the transform compresses it)
+//! is drawn as a polyline through points of the curve, spaced by its device size. Real drawings stay
 //! below these sizes, so their segments pass through unchanged.
 
 use crate::flatten::TOL;
@@ -54,6 +54,7 @@ pub(crate) struct Cull {
 
 impl Cull {
     /// For a consumer in device space.
+    #[cfg(test)]
     pub(crate) fn new(affine: Affine, rect: [f64; 4]) -> Self {
         Self {
             affine,

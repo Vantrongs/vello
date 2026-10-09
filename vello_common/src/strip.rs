@@ -296,7 +296,7 @@ impl Strip {
         F: FnMut(i32) -> bool,
     {
         windings.for_active_rows_in_range(start as usize, end as usize, |row| {
-            if should_fill(windings.coarse[row] as i32) {
+            if should_fill(windings.coarse[row]) {
                 let y_pos = row as u16 * Tile::HEIGHT;
                 strips.push(Self::new(0, y_pos, alphas.len() as u32, false));
                 // TODO: Would be nice to get rid of this, but the current clipping code only
@@ -369,7 +369,7 @@ fn render_impl<S: Simd>(
     // from x=0 to that tile if the coarse winding dictates a fill.
     let emit_captive_strip =
         |y: u16, is_left_viewport: bool, strips: &mut Vec<Strip>, alphas: &mut Vec<u8>| {
-            let coarse_wd = tiles.windings.coarse[y as usize] as i32;
+            let coarse_wd = tiles.windings.coarse[y as usize];
 
             if should_fill(coarse_wd) && !is_left_viewport {
                 strips.push(Strip::new(0, y * Tile::HEIGHT, alphas.len() as u32, false));
