@@ -605,6 +605,12 @@ impl RenderContext {
     }
 
     /// Pop the last-pushed layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the filter's complete bounds, including its halo, exceed the
+    /// source coordinate domain. In that case the layer remains open and the
+    /// viewport and transform stacks are unchanged.
     pub fn pop_layer(&mut self) {
         self.dispatcher.pop_layer();
         self.root_transforms.pop_root();

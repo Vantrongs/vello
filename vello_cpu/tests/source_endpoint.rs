@@ -81,3 +81,80 @@ fn maximum_source_endpoint_retains_pixels_in_both_axes() {
         }
     }
 }
+
+#[test]
+fn rejected_filter_halo_pop_preserves_context_and_reset_restores_rendering() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use vello_cpu::filter_effects::EdgeMode;
+    let mut context = RenderContext::new_with(
+        236,
+        16,
+        RenderSettings {
+            level: Level::baseline(),
+            num_threads: 0,
+        },
+    );
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+        dx: -4294967040.0,
+        dy: 0.0,
+    }));
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
+        std_deviation: 1.5,
+        edge_mode: EdgeMode::None,
+    }));
+    context.set_paint(RED);
+    context.fill_rect(&Rect::new(4294967272.0, 4.0, 4294967284.0, 12.0));
+    for record_after_failure in [false, true] {
+        if record_after_failure {
+            context.fill_rect(&Rect::new(4294967272.0, 4.0, 4294967276.0, 8.0));
+        }
+        let before = format!("{context:?}");
+        for _ in 0..2 {
+            let error = catch_unwind(AssertUnwindSafe(|| context.pop_layer()))
+                .expect_err("the full halo exceeds u32 source coordinates");
+            let message = error
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| error.downcast_ref::<&str>().copied());
+            assert_eq!(message, Some("source rectangle overflow"));
+            assert_eq!(
+                format!("{context:?}"),
+                before,
+                "a failed pop must not advance any layer, viewport, or transform stack"
+            );
+        }
+    }
+    context.reset();
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+        dx: 0.0,
+        dy: 0.0,
+    }));
+    context.set_paint(RED);
+    context.fill_rect(&Rect::new(0.0, 0.0, 4.0, 4.0));
+    context.pop_layer();
+    context.flush();
+    for mode in [
+        #[cfg(feature = "u8_pipeline")]
+        RenderMode::OptimizeSpeed,
+        #[cfg(feature = "f32_pipeline")]
+        RenderMode::OptimizeQuality,
+    ] {
+        let mut pixels = Pixmap::new(236, 16);
+        context.render_with(
+            &mut pixels,
+            &mut Resources::new(),
+            RasterizerSettings {
+                render_mode: mode,
+                ..Default::default()
+            },
+        );
+        for (index, pixel) in pixels.data_as_u8_slice().chunks_exact(4).enumerate() {
+            let expected = if index % 236 < 4 && index / 236 < 4 {
+                [255, 0, 0, 255]
+            } else {
+                [0; 4]
+            };
+            assert_eq!(pixel, expected, "{mode:?}: pixel {index}");
+        }
+    }
+}
