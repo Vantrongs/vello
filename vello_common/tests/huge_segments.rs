@@ -536,3 +536,59 @@ fn many_entries_on_hidden_pieces() {
         Draw::Stroke(many_entries(wide(), 1.0)),
     );
 }
+
+/// A shape whose far parts are at a given magnitude.
+type Scaled = (&'static str, fn(f64) -> BezPath);
+
+/// A fill's work follows what is visible, not its coordinates: the same visible
+/// geometry with its far parts at 1e6 or at 1e300 flattens to about as many lines,
+/// in about as much memory.
+#[test]
+fn fill_work_does_not_grow_with_magnitude() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let shapes: [Scaled; 4] = [
+        ("bent", |m| {
+            let mut p = BezPath::new();
+            p.move_to((10.0, 10.0));
+            p.curve_to((m, 10.0), (-m, 50.0), (20.0, 90.0));
+            p.close_path();
+            p
+        }),
+        ("slanted", |m| {
+            let mut p = BezPath::new();
+            p.move_to((10.0, 10.0));
+            p.curve_to((m, m), (-m, m), (90.0, 20.0));
+            p.close_path();
+            p
+        }),
+        ("quad", |m| {
+            let mut p = BezPath::new();
+            p.move_to((10.0, 10.0));
+            p.quad_to((m, -m), (90.0, 90.0));
+            p.close_path();
+            p
+        }),
+        ("triangle", |m| {
+            let mut p = BezPath::new();
+            p.move_to((-m, -m + 0.3));
+            p.line_to((m, m + 0.3));
+            p.line_to((-m, m));
+            p.close_path();
+            p
+        }),
+    ];
+    for (name, shape) in shapes {
+        let mut counts = Vec::new();
+        for m in [1e6, 1e12, 1e24, 1e48, 1e100, 1e200, 1e300] {
+            let lines = run(
+                &format!("{name} {m:e}"),
+                &shape(m),
+                &Draw::Fill,
+                Affine::IDENTITY,
+            );
+            counts.push(lines.len());
+        }
+        let most = counts.iter().copied().max().unwrap_or(0);
+        assert!(most <= counts[0] + 8, "{name}: lines {counts:?}");
+    }
+}
