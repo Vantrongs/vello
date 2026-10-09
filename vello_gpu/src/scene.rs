@@ -53,6 +53,8 @@ pub(crate) struct RecordedPath {
     pub(crate) strips: Range<usize>,
     /// Paint applied to the path.
     pub(crate) paint: Paint,
+    /// Whether this draw was recorded in a source viewport wider than physical u16 targets.
+    pub(crate) local_paint: bool,
 }
 
 /// Recorded rectangle and its paint.
@@ -62,15 +64,25 @@ pub(crate) struct RecordedRect {
     pub(crate) rect: Rect,
     /// Paint applied to the rectangle.
     pub(crate) paint: Paint,
+    /// Whether this draw was recorded in a source viewport wider than physical u16 targets.
+    pub(crate) local_paint: bool,
 }
 
 impl RecordedDraw {
-    fn new_path(strips: Range<usize>, paint: Paint) -> Self {
-        Self::Path(RecordedPath { strips, paint })
+    fn new_path(strips: Range<usize>, paint: Paint, local_paint: bool) -> Self {
+        Self::Path(RecordedPath {
+            strips,
+            paint,
+            local_paint,
+        })
     }
 
-    fn new_rect(rect: Rect, paint: Paint) -> Self {
-        Self::Rect(RecordedRect { rect, paint })
+    fn new_rect(rect: Rect, paint: Paint, local_paint: bool) -> Self {
+        Self::Rect(RecordedRect {
+            rect,
+            paint,
+            local_paint,
+        })
     }
 }
 
@@ -458,8 +470,10 @@ impl Scene {
             };
 
             if let Some(bounds) = ctx.fast_rect_bounds(rect) {
-                ctx.recorder
-                    .push_draw(RecordedDraw::new_rect(bounds, paint), &[]);
+                ctx.recorder.push_draw(
+                    RecordedDraw::new_rect(bounds, paint, ctx.uses_local_paint()),
+                    &[],
+                );
 
                 return;
             }
@@ -506,9 +520,14 @@ impl Scene {
             return;
         }
 
-        let draw = RecordedDraw::new_path(strips.clone(), paint);
+        let draw = RecordedDraw::new_path(strips.clone(), paint, self.uses_local_paint());
         let strip_storage = self.strip_storage.borrow();
         self.recorder.push_draw(draw, &strip_storage.strips[strips]);
+    }
+
+    fn uses_local_paint(&self) -> bool {
+        self.viewport_state.width() > u32::from(u16::MAX)
+            || self.viewport_state.height() > u32::from(u16::MAX)
     }
 
     fn fast_rect_bounds(&self, rect: &Rect) -> Option<Rect> {
@@ -581,8 +600,10 @@ impl Scene {
             };
 
             if let Some(bounds) = ctx.fast_rect_bounds(&inflated_rect) {
-                ctx.recorder
-                    .push_draw(RecordedDraw::new_rect(bounds, paint), &[]);
+                ctx.recorder.push_draw(
+                    RecordedDraw::new_rect(bounds, paint, ctx.uses_local_paint()),
+                    &[],
+                );
                 return;
             }
 
@@ -957,6 +978,7 @@ mod tests {
         let draw = RecordedDraw::new_rect(
             Rect::new(0.0, 0.0, 4.5, 4.5),
             Paint::Solid(PremulColor::from_alpha_color(BLUE)),
+            false,
         );
 
         assert_eq!(draw.bbox(&[]), Some(RectU32::new(0, 0, 8, 8)));

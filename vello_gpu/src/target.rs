@@ -257,10 +257,18 @@ impl LayerTextureRegion {
     pub(crate) fn crop_to(self, bounds: RectU32) -> Self {
         let layer_bbox = self.layer_bbox.intersect(bounds);
 
+        let rect = if layer_bbox.is_empty() {
+            // An empty source has no scene-to-texture mapping. Retain a valid zero-area
+            // region inside its allocation so destructive blends can consume transparent input.
+            let origin = self.texture.rect;
+            RectU16::new(origin.x0, origin.y0, origin.x0, origin.y0)
+        } else {
+            self.texture_rect(layer_bbox)
+        };
         Self {
             texture: TextureRegion {
                 target: self.texture.target,
-                rect: self.texture_rect(layer_bbox),
+                rect,
             },
             layer_bbox,
         }

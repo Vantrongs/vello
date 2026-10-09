@@ -151,7 +151,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         match draw {
             RecordedDraw::Path(path) => self.push_path(path, strip_storage, paint_resolver),
             RecordedDraw::Rect(rect) => {
-                self.push_rect(&rect.rect, &rect.paint, paint_resolver);
+                self.push_rect(&rect.rect, &rect.paint, rect.local_paint, paint_resolver);
             }
         }
     }
@@ -188,7 +188,8 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
             self,
             |builder, segment| {
                 let shifted = segment.shift(geometry_shift);
-                let (payload, paint_code) = paint.payload_at(segment.x0(), segment.y());
+                let (payload, paint_code) =
+                    paint.payload_at(segment.x0(), segment.y(), path.local_paint);
                 let strip = GpuStrip::from_fill_segment(
                     shifted,
                     Some(segment.col_idx()),
@@ -207,7 +208,8 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
             },
             |builder, segment| {
                 let shifted = segment.shift(geometry_shift);
-                let (payload, paint_code) = paint.payload_at(segment.x0(), segment.y());
+                let (payload, paint_code) =
+                    paint.payload_at(segment.x0(), segment.y(), path.local_paint);
                 let strip = GpuStrip::from_fill_segment(
                     shifted,
                     None,
@@ -226,7 +228,13 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         );
     }
 
-    fn push_rect(&mut self, rect: &Rect, paint: &Paint, paint_resolver: PaintResolver<'_>) {
+    fn push_rect(
+        &mut self,
+        rect: &Rect,
+        paint: &Paint,
+        local_paint: bool,
+        paint_resolver: PaintResolver<'_>,
+    ) {
         // Recordings might contain geometry that exceeds the actual layer
         // bounding box. This can happen when a clip path is associated with the layer.
         // Recordings will not cull those for us, so we need to do this manually here.
@@ -253,7 +261,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         .flatten()
         {
             let shifted = part.shift(self.state.target.geometry_shift());
-            let (payload, paint_code) = paint.payload_at(part.rect.x0, part.rect.y0);
+            let (payload, paint_code) = paint.payload_at(part.rect.x0, part.rect.y0, local_paint);
             let strip = GpuStrip::from_rect(
                 shifted,
                 // See the comment in `push_path`.
@@ -611,7 +619,12 @@ mod tests {
             paint: Paint,
             paint_resolver: PaintResolver<'_>,
         ) {
-            let recorded = RecordedDraw::Rect(RecordedRect { rect, paint });
+            let recorded = RecordedDraw::Rect(RecordedRect {
+                rect,
+                paint,
+                local_paint: self.state.target_bbox.x1 > u32::from(u16::MAX)
+                    || self.state.target_bbox.y1 > u32::from(u16::MAX),
+            });
             DrawBuilder::new(draw, &mut self.buffers, &mut self.state).push_draw(
                 &recorded,
                 &self.strip_storage,

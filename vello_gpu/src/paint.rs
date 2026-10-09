@@ -54,12 +54,10 @@ impl PackedPaint {
         clippy::cast_possible_truncation,
         reason = "GPU paint origins use f32 after cancellation is performed in f64"
     )]
-    pub(crate) fn payload_at(self, x: u32, y: u32) -> ([u32; 2], u32) {
+    pub(crate) fn payload_at(self, x: u32, y: u32, local_paint: bool) -> ([u32; 2], u32) {
         match self.payload {
             PaintPayload::Solid(rgba) => ([rgba, 0], self.paint),
-            PaintPayload::Position(transform)
-                if x > u32::from(u16::MAX) || y > u32::from(u16::MAX) =>
-            {
+            PaintPayload::Position(transform) if local_paint => {
                 // Preserve small paint coordinates when a wide source origin cancels a large
                 // inverse-transform translation; doing that subtraction in f32 loses color precision.
                 let origin = transform * Point::new(f64::from(x), f64::from(y));
