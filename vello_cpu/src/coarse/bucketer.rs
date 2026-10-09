@@ -8,7 +8,7 @@ use crate::filter::context::FilterContext;
 use crate::kurbo::{Affine, Vec2};
 use crate::peniko::{BlendMode, Extend, ImageQuality, ImageSampler};
 use crate::record::RecordedFill;
-use crate::span::{Span, TileAlignedSpan};
+use crate::span::TileAlignedSpan;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -21,7 +21,7 @@ use vello_common::pixmap::Pixmap;
 use vello_common::record::{LayerClip, LayerProps, Node, RecordedLayer, RecordedLayerKind};
 use vello_common::strip::{Strip, visit_strip_fill_segments};
 use vello_common::tile::Tile;
-use vello_common::util::{Clear, RectExt, RetainVec, VecPool};
+use vello_common::util::{Clear, RetainVec, VecPool};
 
 /// State for a single row of strips.
 #[derive(Debug, Default)]
@@ -150,9 +150,9 @@ fn debug_assert_tile_aligned(point: (u16, u16), description: &str) {
 /// A bucketer that groups commands into strip-row-sized buckets.
 #[derive(Debug)]
 pub(crate) struct CommandBucketer {
-    /// The viewport of the root/filter layer we are currently bucketing.
+    /// The viewport of the root/filter layer in tile coordinates.
     viewport: RectU16,
-    /// The currently active stack of clip bboxes (from layer clips), always anchored at the
+    /// The active clip bboxes in tile coordinates, always anchored at the
     /// (0, 0) origin, regardless of the viewport, tracked for two reasons:
     /// - So we can clamp fill commands to the bbox and avoid unnecessary rendering work.
     /// - In case we have a filter layer with a clip, it all happens in three steps:
@@ -188,15 +188,15 @@ impl CommandBucketer {
         Self::new(RectU16::new(0, 0, width, height))
     }
 
-    pub(crate) fn new(mut viewport: RectU16) -> Self {
+    pub(crate) fn new(viewport: RectU16) -> Self {
         // It's _very_ important that we snap to tile coordinates. Fine rasterization assumes
         // that the width is a multiple of the tile width, so if that's not the case bad things
         // could happen!
-        viewport = viewport.snap_to_tile_coordinates();
+        let viewport = viewport.to_tile_bounds();
         let clip_bbox = RectU16::new(0, 0, viewport.width(), viewport.height());
         // Note: `clip_bbox` is already snapped to tile coordinates because `viewport` is, so no
         // need to `div_ceil` here.
-        let num_rows = usize::from(clip_bbox.height() / Tile::HEIGHT);
+        let num_rows = usize::from(clip_bbox.height());
 
         Self {
             viewport,
@@ -218,9 +218,9 @@ impl CommandBucketer {
         // it should still be considered a zero-sized span, though.
         // TODO: Discard empty layers in an earlier stage.
         if bbox.is_empty() {
-            TileAlignedSpan::try_from(Span::new(bbox.x0, 0)).unwrap()
+            TileAlignedSpan::from_tiles(bbox.x0, 0)
         } else {
-            TileAlignedSpan::try_from(Span::new(bbox.x0, bbox.x1 - bbox.x0)).unwrap()
+            TileAlignedSpan::from_tiles(bbox.x0, bbox.x1 - bbox.x0)
         }
     }
 
@@ -228,19 +228,22 @@ impl CommandBucketer {
         self.rows.as_slice()
     }
 
-    pub(crate) fn width(&self) -> u16 {
-        self.clip_bboxes[0].width()
+    pub(crate) fn width(&self) -> usize {
+        usize::from(self.clip_bboxes[0].width()) * usize::from(Tile::WIDTH)
     }
 
     fn viewport_origin(&self) -> (u16, u16) {
-        (self.viewport.x0, self.viewport.y0)
+        (
+            self.viewport.x0 * Tile::WIDTH,
+            self.viewport.y0 * Tile::HEIGHT,
+        )
     }
 
-    pub(crate) fn reset(&mut self, mut viewport: RectU16) {
-        // See comments in `CommandBucketer::reset`.
-        viewport = viewport.snap_to_tile_coordinates();
+    pub(crate) fn reset(&mut self, viewport: RectU16) {
+        // Keep the same tile-coordinate contract as the constructor.
+        let viewport = viewport.to_tile_bounds();
         let clip_bbox = RectU16::new(0, 0, viewport.width(), viewport.height());
-        let num_rows = usize::from(viewport.height() / Tile::HEIGHT);
+        let num_rows = usize::from(viewport.height());
 
         self.rows.clear();
         self.rows.resize_with(num_rows, RowState::new);
@@ -375,7 +378,10 @@ impl CommandBucketer {
             .map(|clip| {
                 // Make sure to translate the clip path from viewport-space to local space, since
                 // `clip_bboxes` uses this coordinate system.
-                let clip_bbox = clip.bbox.relative_to_origin(self.viewport_origin());
+                let clip_bbox = clip
+                    .bbox
+                    .to_tile_bounds()
+                    .relative_to_origin((self.viewport.x0, self.viewport.y0));
                 clip_bbox.intersect(parent_bbox)
             })
             .unwrap_or(parent_bbox);
@@ -400,8 +406,8 @@ impl CommandBucketer {
         // since even areas where we didn't draw anything need to be blended with the destructive
         // blend mode.
         if props.blend_mode.is_destructive() && !bbox.is_empty() {
-            let row_start = usize::from(bbox.y0 / Tile::HEIGHT);
-            let row_end = usize::from(bbox.y1.div_ceil(Tile::HEIGHT)).min(self.rows.len());
+            let row_start = usize::from(bbox.y0);
+            let row_end = usize::from(bbox.y1).min(self.rows.len());
             for row_idx in row_start..row_end {
                 self.ensure_row_layers(row_idx);
             }
@@ -538,7 +544,9 @@ impl CommandBucketer {
         // of what `viewport_origin` is, when actually rendering we always shift the origin to
         // (0, 0). (Note: We did _not_ do this for computing `src_offset` because the shift for the
         // paint itself will be applied later when resolving the indexed paint)
-        let dest_bbox = dest_bbox.relative_to_origin(origin);
+        let dest_bbox = dest_bbox
+            .to_tile_bounds()
+            .relative_to_origin((self.viewport.x0, self.viewport.y0));
         let clip_bbox = *self.clip_bboxes.last().unwrap();
         // As noted in [`CommandBucketer::clip_bboxes`], we only need to composite the parts
         // of the filter layer that actually lie within clip bounding box.
@@ -575,8 +583,8 @@ impl CommandBucketer {
             thread_idx: 0,
             origin,
         });
-        let row_start = usize::from(clipped_dest_bbox.y0 / Tile::HEIGHT);
-        let row_end = usize::from(clipped_dest_bbox.y1.div_ceil(Tile::HEIGHT));
+        let row_start = usize::from(clipped_dest_bbox.y0);
+        let row_end = usize::from(clipped_dest_bbox.y1);
         for row_idx in row_start..row_end {
             self.push_fill(GeneratedFill { row_idx, span }, attrs_idx, None);
         }
@@ -646,16 +654,6 @@ impl CommandBucketer {
             return;
         }
 
-        // Note: Those will always be aligned to tile coordinates.
-        let clip_x0 = clip_bbox.x0;
-        let clip_x1 = clip_bbox.x1;
-
-        debug_assert_tile_aligned((clip_x0, clip_bbox.y0), "clip start");
-        debug_assert_tile_aligned((clip_x1, clip_bbox.y1), "clip end");
-
-        let origin = self.viewport_origin();
-        debug_assert_tile_aligned(origin, "viewport origin");
-
         // Note: the viewport of a filter layer is based on the bounds of its rendered contents.
         // Therefore, those are always guaranteed to be within the viewport rect. However, this does not
         // apply to any clip paths associated with the filter layer. Including those in the filter
@@ -664,20 +662,13 @@ impl CommandBucketer {
         // mean that this method might be called with strips that do not lie within the viewport.
         // Therefore, we need to make sure to clip those appropriately.
 
-        let origin_tile_x = origin.0 / Tile::WIDTH;
-        let origin_tile_y = origin.1 / Tile::HEIGHT;
-        let clip_scene_y0 = origin.1.saturating_add(clip_bbox.y0);
-        let clip_scene_y1 = origin.1.saturating_add(clip_bbox.y1);
-        // Convert to scene coordinates.
-        let clip_scene_x0 = origin.0.saturating_add(clip_x0);
-        let clip_scene_x1 = origin.0.saturating_add(clip_x1);
-
-        // Clip bounding box in tile units.
+        let origin_tile_x = self.viewport.x0;
+        let origin_tile_y = self.viewport.y0;
         let tile_bounds = RectU16::new(
-            clip_scene_x0 / Tile::WIDTH,
-            clip_scene_y0 / Tile::HEIGHT,
-            clip_scene_x1 / Tile::WIDTH,
-            clip_scene_y1 / Tile::HEIGHT,
+            origin_tile_x + clip_bbox.x0,
+            origin_tile_y + clip_bbox.y0,
+            origin_tile_x + clip_bbox.x1,
+            origin_tile_y + clip_bbox.y1,
         );
 
         visit_strip_fill_segments(
@@ -864,7 +855,7 @@ mod tests {
         assert_eq!(row.render_cmds.len(), 2);
         assert!(matches!(row.render_cmds[0], RenderCmd::PushBuf(_)));
         assert!(
-            matches!(row.render_cmds[1], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 0 && cmd.span.pixel_width() == DEPTH_BUCKET_WIDTH)
+            matches!(row.render_cmds[1], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 0 && cmd.span.pixel_width() == usize::from(DEPTH_BUCKET_WIDTH))
         );
     }
 
@@ -923,10 +914,10 @@ mod tests {
         assert_eq!(row.depth_cmds[0].bucket_range(), BucketRange::new(1, 2));
         assert_eq!(row.render_cmds.len(), 2);
         assert!(
-            matches!(row.render_cmds[0], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 4 && cmd.span.pixel_width() == DEPTH_BUCKET_WIDTH - 4)
+            matches!(row.render_cmds[0], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 4 && cmd.span.pixel_width() == usize::from(DEPTH_BUCKET_WIDTH - 4))
         );
         assert!(
-            matches!(row.render_cmds[1], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == DEPTH_BUCKET_WIDTH * 2 && cmd.span.pixel_width() == 4)
+            matches!(row.render_cmds[1], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == usize::from(DEPTH_BUCKET_WIDTH * 2) && cmd.span.pixel_width() == 4)
         );
     }
 
@@ -948,7 +939,7 @@ mod tests {
         assert_eq!(row.depth_cmds.len(), 0);
         assert_eq!(row.render_cmds.len(), 1);
         assert!(
-            matches!(row.render_cmds[0], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 0 && cmd.span.pixel_width() == DEPTH_BUCKET_WIDTH)
+            matches!(row.render_cmds[0], RenderCmd::PaintFill(cmd) if cmd.span.pixel_x() == 0 && cmd.span.pixel_width() == usize::from(DEPTH_BUCKET_WIDTH))
         );
     }
 

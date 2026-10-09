@@ -241,7 +241,7 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        mut start_x: u16,
+        mut start_x: usize,
         start_y: u16,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
@@ -252,9 +252,9 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
 
         let mask_iter = mask.map(|m| {
             iter::from_fn(|| {
-                let sample = |x: u16, y: u16| {
-                    if x < m.width() && y < m.height() {
-                        m.sample(x, y)
+                let sample = |x: usize, y: u16| {
+                    if x < usize::from(m.width()) && y < m.height() {
+                        m.sample(u16::try_from(x).unwrap(), y)
                     } else {
                         255
                     }

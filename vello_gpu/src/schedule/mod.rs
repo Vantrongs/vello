@@ -133,7 +133,7 @@ pub(crate) use self::execute::{Backend, execute};
 use self::round::{
     BlendOp, FilterOp, FilterTextureRegions, Round, RoundStage, Rounds, SchedulePoint,
 };
-use crate::draw::{Draw, DrawBuffers, DrawBuilder, DrawState, RectU16Ext};
+use crate::draw::{Draw, DrawBuffers, DrawBuilder, DrawState};
 use crate::filter::{FilterContext, FilterPassPlan, PreparedGpuFilter};
 use crate::paint::PaintResolver;
 use crate::scene::RecordedDraw;
@@ -179,7 +179,6 @@ impl Schedule {
         let scene_bbox = RectU16::new(
             0,
             0,
-            // Scene size is already snapped to tile coordinates.
             scene.recorder.scene_size.width(),
             scene.recorder.scene_size.height(),
         );

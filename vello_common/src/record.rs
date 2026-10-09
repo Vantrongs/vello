@@ -37,14 +37,13 @@ use crate::geometry::{RectU16, SizeU16};
 use crate::mask::Mask;
 use crate::peniko::BlendMode;
 use crate::strip::Strip;
-use crate::util::RectExt;
 use alloc::vec::Vec;
 use core::ops::Range;
 use smallvec::SmallVec;
 
 /// A drawable object that can report its bounding box.
 pub trait Drawable {
-    /// Return the **tile-aligned** bounding box of the given object, if it
+    /// Return the physical tile-covering bounding box of the given object, if it
     /// has one.
     fn bbox(&self, strips: &[Strip]) -> Option<RectU16>;
 
@@ -170,7 +169,7 @@ impl RecordedLayer {
 /// Recorder for a scene description.
 #[derive(Debug)]
 pub struct CommandRecorder<D> {
-    /// Tile-aligned dimensions of the root scene.
+    /// Actual physical dimensions of the root scene.
     pub scene_size: SizeU16,
     /// The nodes of the root layer.
     pub nodes: Vec<Node>,
@@ -229,7 +228,7 @@ impl<D> CommandRecorder<D> {
     /// Create a new command recorder.
     pub fn new(width: u16, height: u16) -> Self {
         Self {
-            scene_size: snapped_scene_size(width, height),
+            scene_size: SizeU16::from_wh(width, height),
             ..Self::default()
         }
     }
@@ -242,7 +241,7 @@ impl<D> CommandRecorder<D> {
     /// Reset the command recorder.
     #[inline]
     pub fn reset(&mut self, width: u16, height: u16) {
-        self.scene_size = snapped_scene_size(width, height);
+        self.scene_size = SizeU16::from_wh(width, height);
         self.nodes.clear();
         self.draws.clear();
 
@@ -414,12 +413,6 @@ impl<D> CommandRecorder<D> {
     }
 }
 
-fn snapped_scene_size(width: u16, height: u16) -> SizeU16 {
-    RectU16::new(0, 0, width, height)
-        .snap_to_tile_coordinates()
-        .into()
-}
-
 impl<D: Drawable> CommandRecorder<D> {
     /// Push a draw command.
     #[inline]
@@ -548,12 +541,12 @@ mod tests {
     }
 
     #[test]
-    fn scene_size_is_tile_aligned() {
+    fn scene_size_preserves_physical_dimensions() {
         let mut recorder = CommandRecorder::<TestDraw>::new(10, 10);
-        assert_eq!(recorder.scene_size, SizeU16::new(12));
+        assert_eq!(recorder.scene_size, SizeU16::new(10));
 
         recorder.reset(13, 7);
-        assert_eq!(recorder.scene_size, SizeU16::from_wh(16, 8));
+        assert_eq!(recorder.scene_size, SizeU16::from_wh(13, 7));
 
         recorder.reset(Tile::WIDTH * 5, Tile::HEIGHT * 3);
         assert_eq!(
@@ -760,7 +753,7 @@ mod tests {
 
         recorder.reset(13, 7);
 
-        assert_eq!(recorder.scene_size, SizeU16::from_wh(16, 8));
+        assert_eq!(recorder.scene_size, SizeU16::from_wh(13, 7));
         assert!(!recorder.root_is_blend_target);
         assert!(!recorder.has_non_default_blend);
         assert_eq!(recorder.max_layer_depth, 0);

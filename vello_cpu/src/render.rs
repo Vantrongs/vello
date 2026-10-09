@@ -500,6 +500,7 @@ impl RenderContext {
     /// # Panics
     ///
     /// Panics if `filter` is provided when this context uses multi-threaded rendering.
+    /// Also panics if the filter's required source viewport exceeds `u16` dimensions.
     pub fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,
@@ -533,8 +534,6 @@ impl RenderContext {
             let (shift_x, shift_y) = data.source_shift();
             Affine::translate((f64::from(shift_x), f64::from(shift_y)))
         });
-        self.root_transforms.push_root(relative_transform);
-
         self.dispatcher.push_layer(
             clip_path,
             self.state.fill_rule,
@@ -545,6 +544,7 @@ impl RenderContext {
             mask,
             filter_data,
         );
+        self.root_transforms.push_root(relative_transform);
     }
 
     /// Push a new clip layer.
