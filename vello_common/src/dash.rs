@@ -8,19 +8,14 @@
 //!   by its chord, drawn solid: its whole dash periods are skipped in one step, and
 //!   it paints nothing in view whatever its dashes. Kurbo walks every dash, so a
 //!   dashed segment with huge coordinates took time in proportion to its length.
-//! - A segment along which walking the pattern would take more than
-//!   `DENSE_ENTRIES_PER_PX` entries per device pixel, or more than the `PATH_ENTRIES`
-//!   the path may still walk, is cut into windows of `WINDOW_PX` device pixels, and
-//!   each window draws one dash holding the dashed length the pattern has in it
-//!   (`Filter`): the dashes keep their ink and gaps wider than a window stay
-//!   unpainted, at a cost set by the segment's device length. Kurbo emits every
-//!   dash, so a pattern far finer than a pixel along a segment (a transform that
-//!   compresses its direction, or many tiny entries) emitted dashes in proportion to
-//!   the inverse of their device size.
-//!
-//! A pattern whose whole period is under half a device pixel at the transform's
-//! largest stretch has no gap a pixel resolves; `flatten::stroke` strokes it solid
-//! ([`unresolved`]), as `MuPDF` does (1.28 `draw-path.c`, `do_flatten_stroke`).
+//! - A segment along which dashes and gaps (the pattern's entries walked) average
+//!   under `1 / DENSE_ENTRIES_PER_PX` device pixels, or beyond the `PATH_ENTRIES` a
+//!   path may walk, is drawn solid, its dash phase carried on as if dashed. Kurbo
+//!   emits every dash, so a pattern far finer than a pixel (a tiny scale, a transform
+//!   that compresses one direction, or many tiny entries) emitted dashes in
+//!   proportion to the inverse of their device size. `MuPDF` draws such patterns
+//!   solid too, below half a pixel per period at the transform's largest stretch
+//!   (1.28 `draw-path.c`, `do_flatten_stroke`).
 //!
 //! Every other segment is dashed exactly as kurbo does.
 
@@ -33,29 +28,20 @@ use alloc::vec::Vec;
 
 const DASH_ACCURACY: f64 = 1e-6;
 
-/// Pattern entries (dashes and gaps) per device pixel along a segment beyond which
-/// the segment is drawn in windows (`Filter`) instead of dash by dash. Entries, not
+/// Pattern entries (dashes and gaps) per device pixel, on average along a segment,
+/// beyond which the segment is drawn solid: for a pattern of a dash and a gap, a
+/// period under a sixteenth of a pixel. Such dashes are a fine texture no output
+/// resolves, and drawing them all could take any amount of memory. Entries, not
 /// periods, are counted: each is an element out, and a period can hold any number.
 const DENSE_ENTRIES_PER_PX: f64 = 32.0;
 
-/// Pattern entries, or windows, one path may walk; segments beyond are drawn in
-/// fewer windows, down to one per segment. Segments larger than the view are split
-/// and their hidden pieces skipped (`cull::SplitHuge`), so drawings stay far below
-/// this; it bounds the work for a path whose geometry is numerically noisy
-/// (coordinates near the limits of `f64` under a nearly singular transform), whose
-/// split pieces can each look long on the device. A dash and its gap take about 64
-/// bytes as a thin outline and 300 as an expanded one.
+/// Pattern entries one path may walk; segments beyond are drawn solid. Segments
+/// larger than the view are split and their hidden pieces skipped (`cull::SplitHuge`),
+/// so drawings stay far below this; it bounds the dashes of a path whose geometry is
+/// numerically noisy (coordinates near the limits of `f64` under a nearly singular
+/// transform), whose split pieces can each look long on the device. A dash and its
+/// gap take about 64 bytes as a thin outline and 300 as an expanded one.
 const PATH_ENTRIES: f64 = (1 << 22) as f64;
-
-/// The device length of a window of a segment drawn in windows (`Filter`).
-const WINDOW_PX: f64 = 0.25;
-
-/// Whether `dashes` has no gap a device pixel resolves under a transform whose
-/// largest stretch is `scale`: its whole period is under half a pixel there (or it is
-/// empty of length). Such a stroke is drawn solid, as `MuPDF` does.
-pub(crate) fn unresolved(dashes: &[f64], scale: f64) -> bool {
-    dashes.iter().sum::<f64>() * scale < 0.5
-}
 
 /// Dashes `inner` like `kurbo::dash`, skipping the dash periods of the segments
 /// flagged `true`; `affine` maps the path to device space.
@@ -113,9 +99,7 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
         needs_moveto: true,
         period,
         entries_per_period: entries as f64,
-        solid: None,
-        filter: None,
-        pattern: None,
+        dense: None,
         affine,
         entries_left: PATH_ENTRIES,
     }
@@ -146,20 +130,15 @@ pub(crate) struct DashIterator<'a, T> {
     period: f64,
     /// The pattern entries walked along `period`.
     entries_per_period: f64,
-    /// Whether `current_seg` is a hidden piece drawn solid (`set_segment`), and if so
-    /// how far it is out.
-    solid: Option<Solid>,
-    /// Whether `current_seg` is drawn in windows (`set_segment`): then `is_active` and
-    /// `dash_remaining` describe its windows' dashes, not the pattern.
-    filter: Option<Filter>,
-    /// The pattern's prefix sums, made when a segment is first drawn in windows.
-    pattern: Option<Pattern>,
+    /// Whether `current_seg` is drawn solid (`set_segment`), and if so how far it is
+    /// out.
+    dense: Option<Solid>,
     affine: Affine,
-    /// Pattern entries (or windows) the path may still walk (`PATH_ENTRIES`).
+    /// Pattern entries the path may still walk (`PATH_ENTRIES`).
     entries_left: f64,
 }
 
-/// How far a hidden piece drawn solid is out.
+/// How far a segment drawn solid is out.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Solid {
     Start,
@@ -281,59 +260,32 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
     /// by its chord, drawn solid, with whole dash periods taken off its length: the
     /// dash state after it is the same, and it paints nothing in view, as its control
     /// box misses the view widened by the outline's reach. One whose dashes are too
-    /// dense to walk one by one (see the module) is drawn in windows.
+    /// dense (see the module) keeps its length less whole periods too, and is drawn
+    /// solid.
     fn set_segment(&mut self, seg: PathSeg, skip: bool) {
-        self.filter = None;
         if skip {
             // Relative accuracy: kurbo's absolute 1e-6 on a huge segment recurses to
             // its depth limit for nothing.
             let len = seg.arclen(DASH_ACCURACY.max(1e-9 * control_length(&seg)));
-            self.solid = Some(Solid::Start);
+            self.dense = Some(Solid::Start);
             self.seg_remaining = self.less_whole_periods(len);
             self.current_seg = PathSeg::Line(Line::new(seg.start(), seg.end()));
             return;
         }
-        self.solid = None;
         let len = seg.arclen(DASH_ACCURACY);
         self.current_seg = seg;
-        self.seg_remaining = len;
         let entries = len / self.period * self.entries_per_period;
-        if self.period.is_nan() || self.period <= 0.0 {
-            return;
-        }
-        let device_length = self.device_length(&seg);
-        if entries > self.entries_left || entries > DENSE_ENTRIES_PER_PX * (device_length + 1.0) {
-            let windows = (device_length / WINDOW_PX)
-                .ceil()
-                .min(self.entries_left)
-                .max(1.0);
-            self.entries_left = (self.entries_left - windows).max(0.0);
-            self.start_filter(len, windows);
+        if self.period > 0.0
+            && (entries > self.entries_left
+                || entries > DENSE_ENTRIES_PER_PX * (self.device_length(&seg) + 1.0))
+        {
+            self.dense = Some(Solid::Start);
+            self.seg_remaining = self.less_whole_periods(len);
         } else {
+            self.dense = None;
             self.entries_left -= entries;
+            self.seg_remaining = len;
         }
-    }
-
-    /// Draws the current segment, `len` long, in `windows` windows.
-    #[cold]
-    fn start_filter(&mut self, len: f64, windows: f64) {
-        let pattern = self
-            .pattern
-            .get_or_insert_with(|| Pattern::new(self.dashes));
-        let entry = pattern.entry_of(self.dash_ix, self.is_active, self.dashes.len());
-        let start = (pattern.starts[entry + 1] - self.dash_remaining).clamp(0.0, pattern.period());
-        let mut filter = Filter {
-            window: len / windows,
-            windows,
-            next: 0.0,
-            second: false,
-            start,
-            dashing_at_start: self.is_active,
-            len,
-            laid_out: (-1.0, false, 0.0, 0.0),
-        };
-        self.dash_remaining = filter.run(pattern, self.is_active);
-        self.filter = Some(filter);
     }
 
     /// `len` less as many whole periods as leave it longer than the current dash, so
@@ -363,7 +315,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             } else {
                 self.state = DashState::Working;
             }
-        } else if let Some(solid) = self.solid {
+        } else if let Some(solid) = self.dense {
             if solid == Solid::Stashed {
                 let end = self.current_seg.end();
                 self.get_input();
@@ -371,7 +323,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             }
             if solid == Solid::Start && !self.is_active {
                 // A dash starts with the segment.
-                self.solid = Some(Solid::Moved);
+                self.dense = Some(Solid::Moved);
                 return Some(PathEl::MoveTo(self.current_seg.start()));
             }
             result = Some(crate::cull::seg_to_el(&self.current_seg));
@@ -391,7 +343,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             }
             self.dash_remaining -= self.seg_remaining;
             if stashing && self.state == DashState::Working && self.is_active {
-                self.solid = Some(Solid::Stashed);
+                self.dense = Some(Solid::Stashed);
             } else {
                 self.get_input();
             }
@@ -410,51 +362,20 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             self.is_active = !self.is_active;
             self.t += t1 * (1.0 - self.t);
             self.seg_remaining -= self.dash_remaining;
-            if let (Some(filter), Some(pattern)) = (&mut self.filter, &self.pattern) {
-                self.dash_remaining = filter.run(pattern, self.is_active);
-            } else {
-                self.dash_ix += 1;
-                if self.dash_ix == self.dashes.len() {
-                    self.dash_ix = 0;
-                }
-                self.dash_remaining = self.dashes[self.dash_ix];
+            self.dash_ix += 1;
+            if self.dash_ix == self.dashes.len() {
+                self.dash_ix = 0;
             }
+            self.dash_remaining = self.dashes[self.dash_ix];
         } else {
             if self.is_active {
                 let seg = self.current_seg.subsegment(self.t..1.0);
                 result = Some(crate::cull::seg_to_el(&seg));
             }
-            if self.filter.is_some() {
-                if let Some(el) = self.end_filter() {
-                    result = Some(el);
-                }
-            } else {
-                self.dash_remaining -= self.seg_remaining;
-            }
+            self.dash_remaining -= self.seg_remaining;
             self.get_input();
         }
         result
-    }
-
-    /// Ends a segment drawn in windows: the dash state becomes the pattern's at the
-    /// segment's end. Where the windows' dash and the pattern's state differ there, the
-    /// dash ends (as a dash ending in a gap does), or a move starts the pattern's dash
-    /// at the end.
-    #[cold]
-    fn end_filter(&mut self) -> Option<PathEl> {
-        let (Some(filter), Some(pattern)) = (self.filter.take(), &self.pattern) else {
-            return None;
-        };
-        let drawing = self.is_active;
-        let at = (filter.start + filter.len).rem_euclid(pattern.period());
-        let entry = pattern.entry_at(at);
-        self.dash_ix = entry % self.dashes.len();
-        self.is_active = entry % 2 == 0;
-        self.dash_remaining = pattern.starts[entry + 1] - at;
-        if drawing && !self.is_active {
-            self.state = DashState::Working;
-        }
-        (!drawing && self.is_active).then(|| PathEl::MoveTo(self.current_seg.end()))
     }
 
     fn handle_closepath(&mut self) {
@@ -477,152 +398,6 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
     }
 }
 
-/// The pattern as the walk repeats it (an odd-length array twice), with prefix sums,
-/// for the dash state and the dashed length at any distance into a period.
-struct Pattern {
-    /// Where each entry starts, then the period.
-    starts: Vec<f64>,
-    /// The dashed length before each entry, then the period's.
-    dashed: Vec<f64>,
-}
-
-impl Pattern {
-    fn new(dashes: &[f64]) -> Self {
-        let entries = if dashes.len() % 2 == 1 {
-            2 * dashes.len()
-        } else {
-            dashes.len()
-        };
-        let mut starts = Vec::with_capacity(entries + 1);
-        let mut dashed = Vec::with_capacity(entries + 1);
-        let (mut at, mut on) = (0.0, 0.0);
-        for i in 0..entries {
-            starts.push(at);
-            dashed.push(on);
-            let d = dashes[i % dashes.len()];
-            at += d;
-            if i % 2 == 0 {
-                on += d;
-            }
-        }
-        starts.push(at);
-        dashed.push(on);
-        Self { starts, dashed }
-    }
-
-    fn period(&self) -> f64 {
-        self.starts[self.starts.len() - 1]
-    }
-
-    /// The entry the walk is in at `dash_ix` of `len` entries, dashing or not: an
-    /// odd-length array's second pass has the other parity.
-    fn entry_of(&self, dash_ix: usize, is_active: bool, len: usize) -> usize {
-        if dash_ix.is_multiple_of(2) == is_active {
-            dash_ix
-        } else {
-            dash_ix + len
-        }
-    }
-
-    /// The entry at `at` in `[0, period)`: the last that starts at or before it.
-    fn entry_at(&self, at: f64) -> usize {
-        let entries = self.starts.len() - 1;
-        self.starts[..entries]
-            .partition_point(|&s| s <= at)
-            .saturating_sub(1)
-    }
-
-    /// The dashed length in `[0, at)`, `at` in `[0, period]`.
-    fn dashed_before(&self, at: f64) -> f64 {
-        let i = self.entry_at(at);
-        let mut d = self.dashed[i];
-        if i.is_multiple_of(2) {
-            d += (at - self.starts[i]).clamp(0.0, self.starts[i + 1] - self.starts[i]);
-        }
-        d
-    }
-
-    /// The dashed length in `width` from `at` in `[0, period)`.
-    fn dashed(&self, at: f64, width: f64) -> f64 {
-        let period = self.period();
-        let whole = (width / period).floor();
-        let end = at + (width - whole * period);
-        let total = self.dashed[self.dashed.len() - 1];
-        let part = if end <= period {
-            self.dashed_before(end) - self.dashed_before(at)
-        } else {
-            total - self.dashed_before(at) + self.dashed_before(end - period)
-        };
-        whole * total + part
-    }
-}
-
-/// A segment drawn in windows. Each window draws one dash holding the dashed length
-/// the pattern has in it: first if the pattern dashes at the window's start, else
-/// last, so the dashes of consecutive windows join where the pattern runs on, and a
-/// gap wider than a window stays a gap. Consecutive parts of the same kind form one
-/// run, a dash or a gap, which the walk steps over like a pattern entry.
-struct Filter {
-    /// The arc length of a window (the last may be shorter).
-    window: f64,
-    /// The number of windows.
-    windows: f64,
-    /// The window the walk is in, and whether in its second part.
-    next: f64,
-    second: bool,
-    /// Where in the period the segment starts, whether the walk dashes there, and the
-    /// segment's arc length.
-    start: f64,
-    dashing_at_start: bool,
-    len: f64,
-    /// The last window laid out: its index and `layout`.
-    laid_out: (f64, bool, f64, f64),
-}
-
-impl Filter {
-    /// Whether window `k` starts with its dash, and the lengths of its two parts.
-    fn layout(&mut self, pattern: &Pattern, k: f64) -> (bool, f64, f64) {
-        if self.laid_out.0 == k {
-            return (self.laid_out.1, self.laid_out.2, self.laid_out.3);
-        }
-        let from = k * self.window;
-        let width = (self.len - from).clamp(0.0, self.window);
-        let at = (self.start + from).rem_euclid(pattern.period());
-        let dash_first = if k == 0.0 {
-            self.dashing_at_start
-        } else {
-            pattern.entry_at(at).is_multiple_of(2)
-        };
-        let ink = pattern.dashed(at, width).clamp(0.0, width);
-        let first = if dash_first { ink } else { width - ink };
-        self.laid_out = (k, dash_first, first, width - first);
-        (dash_first, first, width - first)
-    }
-
-    /// The length of the run of dashes (`dash`) or gaps from where the walk is, which
-    /// it then steps past; infinite if the run reaches the segment's end.
-    fn run(&mut self, pattern: &Pattern, dash: bool) -> f64 {
-        let mut len = 0.0;
-        while self.next < self.windows {
-            let (dash_first, a, b) = self.layout(pattern, self.next);
-            let (kind, part) = if self.second {
-                (!dash_first, b)
-            } else {
-                (dash_first, a)
-            };
-            if part > 0.0 && kind != dash {
-                return len;
-            }
-            len += part;
-            if self.second {
-                self.next += 1.0;
-            }
-            self.second = !self.second;
-        }
-        f64::INFINITY
-    }
-}
-
 /// The length of the control polygon of `seg`, at least its arc length.
 fn control_length(seg: &PathSeg) -> f64 {
     match *seg {
@@ -637,7 +412,6 @@ mod tests {
     use super::*;
     use crate::cull::{Cull, SplitHuge};
     use crate::kurbo::{Affine, BezPath, ParamCurveNearest};
-    use alloc::vec;
 
     const VIEW: [f64; 4] = [0.0, 0.0, 100.0, 100.0];
 
@@ -865,134 +639,10 @@ mod tests {
         same_dashes_in_view(&a, &b, Line::new((-200.0, 50.0), (100.0, 50.0)), 1e-6);
     }
 
-    /// The dashed length of horizontal `out` (lines only) in each unit of x from
-    /// `x0`, `n` units, x scaled by `scale` to the device.
-    fn ink_per_pixel(out: &[PathEl], x0: f64, scale: f64, n: usize) -> Vec<f64> {
-        let mut ink = vec![0.0; n];
-        let mut last = Point::ORIGIN;
-        for el in out {
-            match *el {
-                PathEl::MoveTo(p) => last = p,
-                PathEl::LineTo(p) => {
-                    let (a, b) = ((last.x - x0) * scale, (p.x - x0) * scale);
-                    let (a, b) = (a.min(b), a.max(b));
-                    for (i, v) in ink.iter_mut().enumerate() {
-                        let (l, r) = (i as f64, i as f64 + 1.0);
-                        *v += (b.min(r) - a.max(l)).max(0.0);
-                    }
-                    last = p;
-                }
-                PathEl::ClosePath => {}
-                _ => panic!("lines only: {el:?}"),
-            }
-        }
-        ink
-    }
-
-    /// Dashing `line` with `dashes` under `affine` (device x = `scale` path x).
-    fn dash_line(line: Line, dashes: &[f64], affine: Affine) -> Vec<PathEl> {
-        let input = [
-            (PathEl::MoveTo(line.p0), false),
-            (PathEl::LineTo(line.p1), false),
-        ];
-        starts_with_a_move(dash(input.into_iter(), 0.0, dashes, affine).collect())
-    }
-
-    /// The `dash-mixed` probe: a wide dash and gap, then 10 000 entries of 5e-6, at
-    /// 2 px per unit. Walking it takes 250 entries per pixel, so it is drawn in
-    /// windows; the 20 px gap stays unpainted and each pixel keeps the ink the exact
-    /// dashes give it, up to a window's worth (a quarter pixel).
+    /// A segment whose dashes are far below a pixel on the device is drawn whole, and
+    /// the next one starts at the phase walking it would leave.
     #[test]
-    fn a_dense_pattern_keeps_its_wide_gaps_and_ink() {
-        let mut dashes = vec![10.0, 10.0];
-        dashes.extend(core::iter::repeat_n(5e-6, 10_000));
-        let line = Line::new((0.0, 25.0), (50.0, 25.0));
-        let affine = Affine::scale(2.0);
-        let a = dash_line(line, &dashes, affine);
-        assert!(a.len() < 2 * 400 + 4, "{} elements", a.len());
-        let exact = kurbo(
-            &BezPath::from_vec(vec![PathEl::MoveTo(line.p0), PathEl::LineTo(line.p1)]),
-            0.0,
-            &dashes,
-        );
-        let (ia, ie) = (
-            ink_per_pixel(&a, 0.0, 2.0, 100),
-            ink_per_pixel(&exact, 0.0, 2.0, 100),
-        );
-        for x in 0..100 {
-            assert!(
-                (ia[x] - ie[x]).abs() <= 0.25 + 1e-9,
-                "pixel {x}: {} vs {}",
-                ia[x],
-                ie[x]
-            );
-        }
-        assert!(ia[20..40].iter().all(|&v| v == 0.0), "{:?}", &ia[20..40]);
-        assert!(
-            ia[..20].iter().all(|&v| (v - 1.0).abs() < 1e-9),
-            "{:?}",
-            &ia[..20]
-        );
-        let total = |v: &[f64]| v.iter().sum::<f64>();
-        assert!((total(&ia) - total(&ie)).abs() < 1e-6);
-    }
-
-    /// Windows that do not line up with pixels move ink by at most a window; a closed
-    /// subpath drawn in windows keeps its ink (its first dash held back for the
-    /// closing one, as kurbo does).
-    #[test]
-    fn windows_keep_the_ink_of_each_pixel() {
-        let mut dashes = vec![5.0, 3.0];
-        dashes.extend(core::iter::repeat_n(0.001, 1000));
-        let line = Line::new((0.37, 10.0), (97.0, 10.0));
-        let a = dash_line(line, &dashes, Affine::IDENTITY);
-        let path = BezPath::from_vec(vec![PathEl::MoveTo(line.p0), PathEl::LineTo(line.p1)]);
-        let exact = kurbo(&path, 0.0, &dashes);
-        let (ia, ie) = (
-            ink_per_pixel(&a, 0.0, 1.0, 100),
-            ink_per_pixel(&exact, 0.0, 1.0, 100),
-        );
-        for x in 0..100 {
-            assert!(
-                (ia[x] - ie[x]).abs() <= 0.25 + 1e-9,
-                "pixel {x}: {} vs {}",
-                ia[x],
-                ie[x]
-            );
-        }
-        let mut square = BezPath::new();
-        square.move_to((10.0, 10.0));
-        square.line_to((90.0, 10.0));
-        square.line_to((90.0, 90.0));
-        square.line_to((10.0, 90.0));
-        square.close_path();
-        for offset in [0.0, 6.0] {
-            let a = mine(&square, offset, &dashes, VIEW);
-            let b = kurbo(&square, offset, &dashes);
-            assert!(a.len() < 4 * 2 * 330, "{} elements", a.len());
-            let length = |out: &[PathEl]| {
-                let (mut last, mut sum) = (Point::ORIGIN, 0.0);
-                for el in out {
-                    match *el {
-                        PathEl::MoveTo(p) => last = p,
-                        PathEl::LineTo(p) => {
-                            sum += last.distance(p);
-                            last = p;
-                        }
-                        _ => {}
-                    }
-                }
-                sum
-            };
-            assert!((length(&a) - length(&b)).abs() < 1e-6, "{offset}");
-        }
-    }
-
-    /// A segment whose pattern is far below a pixel on the device, though not at the
-    /// transform's largest stretch, is drawn in windows that keep its ink, and the
-    /// next one starts at the phase walking it would leave.
-    #[test]
-    fn dense_dashes_keep_their_ink_and_phase() {
+    fn dense_dashes_are_drawn_solid_in_phase() {
         let dashes = [3.0, 7.0];
         // x is compressed 1000-fold: the first line, 1000.3 long in path space (100
         // periods), is 1 px on the device; the second, vertical, is not compressed.
@@ -1002,57 +652,24 @@ mod tests {
         p.line_to((0.0, 50.0));
         p.line_to((0.0, 100.0));
         let wide = Cull::new(affine, [-1e6, -1e6, 1e6, 1e6]);
-        for offset in [1.5, 4.0] {
-            let split = SplitHuge::new(p.iter(), wide, true);
-            let a = starts_with_a_move(dash(split, offset, &dashes, affine).collect());
-            let mut first = BezPath::new();
-            first.move_to((-1000.3, 50.0));
-            first.line_to((0.0, 50.0));
-            let exact = kurbo(&first, offset, &dashes);
-            // Its ink, in the five quarter-pixel windows the first line is cut into.
-            let horizontal: Vec<PathEl> = {
-                let (mut out, mut last) = (Vec::new(), Point::ORIGIN);
-                for el in &a {
-                    match *el {
-                        PathEl::MoveTo(q) => last = q,
-                        PathEl::LineTo(q) => {
-                            if last.y == 50.0 && q.y == 50.0 {
-                                out.extend([PathEl::MoveTo(last), PathEl::LineTo(q)]);
-                            }
-                            last = q;
-                        }
-                        _ => {}
-                    }
-                }
-                out
-            };
-            assert!(horizontal.len() <= 2 * 6, "{a:?}");
-            let window = 1000.3 / 5.0;
-            let (ia, ie) = (
-                ink_per_pixel(&horizontal, -1000.3, 1.0 / window, 5),
-                ink_per_pixel(&exact, -1000.3, 1.0 / window, 5),
-            );
-            for k in 0..5 {
-                assert!(
-                    (ia[k] - ie[k]).abs() < 1e-9,
-                    "{offset} window {k}: {ia:?} {ie:?}"
-                );
-            }
-            // The vertical line is dashed from phase (offset + 1000.3) mod 10, as kurbo
-            // dashes the whole path.
-            let b = kurbo(&p, offset, &dashes);
-            same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
-        }
-    }
-
-    /// The whole period under half a device pixel: no gap is resolved.
-    #[test]
-    fn unresolved_patterns() {
-        assert!(unresolved(&[0.1, 0.1], 2.0));
-        assert!(!unresolved(&[0.125, 0.125], 2.0));
-        assert!(unresolved(&[0.0, 0.0], 1.0));
-        let mut mixed = vec![10.0, 10.0];
-        mixed.extend(core::iter::repeat_n(5e-6, 10_000));
-        assert!(!unresolved(&mixed, 2.0));
+        let split = SplitHuge::new(p.iter(), wide, true);
+        let a = starts_with_a_move(dash(split, 1.5, &dashes, affine).collect());
+        // Starting inside a dash (offset 1.5 < 3), the first line is one stroke (out
+        // last: kurbo holds a subpath's first dash back to join a closing one).
+        let whole = [
+            PathEl::MoveTo(Point::new(-1000.3, 50.0)),
+            PathEl::LineTo(Point::new(0.0, 50.0)),
+        ];
+        assert!(a.windows(2).any(|w| w == whole), "{a:?}");
+        // The vertical line is dashed from phase (1.5 + 1000.3) mod 10 = 1.8, as kurbo
+        // dashes the whole path.
+        let b = kurbo(&p, 1.5, &dashes);
+        same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
+        // Starting in a gap (offset 4), the first line still is one stroke.
+        let split = SplitHuge::new(p.iter(), wide, true);
+        let a = starts_with_a_move(dash(split, 4.0, &dashes, affine).collect());
+        assert!(a.windows(2).any(|w| w == whole), "{a:?}");
+        let b = kurbo(&p, 4.0, &dashes);
+        same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
     }
 }

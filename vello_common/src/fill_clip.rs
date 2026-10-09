@@ -276,6 +276,14 @@ impl<S: Simd, C: Callback> Clip<'_, S, C> {
 
     /// Draws a part of a piece between cuts, over `t0..t1` from `p0` to `p1`.
     fn part(&mut self, t0: f64, p0: Point, t1: f64, p1: Point) {
+        // Separate boundary cuts can also leave adjacent parameters. Reconstructing
+        // their controls from endpoint derivatives amplifies cancellation into an
+        // enormous fictitious loop; the precision-floor rule applies to every span.
+        let mid = t0 + 0.5 * (t1 - t0);
+        if !(mid > t0 && mid < t1) {
+            clip_line(&mut self.out, self.rect, p0, p1);
+            return;
+        }
         match region(self.rect, p0, p1) {
             Region::Out => {}
             Region::Left => left_edge(&mut self.out, self.rect, p0, p1),
@@ -373,6 +381,130 @@ impl<S: Simd, C: Callback> Clip<'_, S, C> {
             flatten_block(self.simd, block, self.out.callback, self.ctx);
             p0 = block.p3;
             i += 1.0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fearless_simd::{Level, dispatch};
+
+    /// Check work as it is emitted, so a regression fails before retaining a large
+    /// polyline or walking quadrillions of incorrectly reconstructed cubic blocks.
+    struct CheckedOutput {
+        at: Point,
+        lines: usize,
+    }
+
+    impl Callback for CheckedOutput {
+        fn callback(&mut self, el: LinePathEl) {
+            match el {
+                LinePathEl::MoveTo(p) => self.at = p,
+                LinePathEl::LineTo(p) => {
+                    self.lines += 1;
+                    assert!(self.lines <= 1024, "unbounded clipped output");
+                    for p in [self.at, p] {
+                        assert!(p.x.is_finite() && p.y.is_finite(), "{p:?}");
+                        assert!(
+                            (-TOL..=100.0 + TOL).contains(&p.x)
+                                && (-TOL..=100.0 + TOL).contains(&p.y),
+                            "retained point outside the view: {p:?}"
+                        );
+                    }
+                    self.at = p;
+                }
+            }
+        }
+    }
+
+    fn checked(c: CubicBez) -> usize {
+        let mut out = CheckedOutput { at: c.p0, lines: 0 };
+        let mut ctx = FlattenCtx::default();
+        dispatch!(Level::new(), simd => flatten_seg(
+            simd, PathSeg::Cubic(c), [0.0, 0.0, 100.0, 100.0], &mut out, &mut ctx
+        ));
+        out.lines
+    }
+
+    #[test]
+    fn adjacent_boundary_cuts_do_not_reconstruct_a_huge_loop() {
+        // Two boundary cuts leave adjacent parameters near 1.56e-105. Their
+        // endpoint values cancel to the same visible point; derivative-based
+        // subsegment reconstruction instead creates controls around +/-3e34.
+        let c = CubicBez::new(
+            (94.89934485887838, 12.046420206253082),
+            (9.934373707850248e92, 1.5597482089393162e155),
+            (-8.423477738983641e32, -1e260),
+            (85.3758328038139, -8.604126786062645),
+        );
+        assert!(checked(c) < 64, "single clipped cubic work");
+    }
+
+    #[test]
+    fn finite_controls_near_f64_limit_keep_visible_edges() {
+        assert!(
+            checked(CubicBez::new(
+                (10.0, 10.0),
+                (1e308, 1e308),
+                (-1e308, 1e308),
+                (90.0, 20.0)
+            )) > 0,
+            "finite near-limit controls must not erase visible edges"
+        );
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1_u64 << 53) as f64
+        }
+
+        fn coord(&mut self, huge: bool) -> f64 {
+            let sign = if self.next() < 0.5 { -1.0 } else { 1.0 };
+            if huge {
+                let exponent = (self.next() * 300.0).floor();
+                let mantissa = if self.next() < 0.3 {
+                    1.0
+                } else {
+                    self.next() * 9.0 + 1.0
+                };
+                sign * mantissa * 10_f64.powf(exponent)
+            } else {
+                -20.0 + self.next() * 140.0
+            }
+        }
+
+        fn point(&mut self, huge: bool) -> Point {
+            Point::new(self.coord(huge), self.coord(huge))
+        }
+    }
+
+    #[test]
+    fn deterministic_huge_cubics_keep_work_and_output_in_the_view() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        // Fixed seed/case count, including independent and cancelling controls.
+        // The numeric exponent varies independently per coordinate, through 1e300.
+        for case in 0..4096 {
+            let p0 = rng.point(false);
+            let mut controls = [Point::ZERO; 3];
+            for p in &mut controls {
+                let huge = rng.next() < 0.8;
+                *p = rng.point(huge);
+            }
+            if case % 3 == 0 {
+                controls[1] = Point::new(-controls[0].x, -controls[0].y);
+            }
+            let p3 = if case % 2 == 0 {
+                rng.point(false)
+            } else {
+                controls[2]
+            };
+            checked(CubicBez::new(p0, controls[0], controls[1], p3));
         }
     }
 }

@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Fills whose geometry reaches far beyond the view, or whose winding numbers are
-//! large, and dashes too dense to walk, render the pixels the geometry covers: checked
-//! pixel by pixel against an independent reference, under an allocator that refuses
-//! any request over 1 GiB.
+//! large, render the pixels the geometry covers: checked pixel by pixel against a
+//! sampled reference, under an allocator that refuses any request over 1 GiB.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use vello_cpu::kurbo::{
-    Affine, BezPath, Cap, Circle, CubicBez, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point,
-    Rect, Shape, Stroke,
+    Affine, BezPath, Circle, CubicBez, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point, Rect,
+    Shape,
 };
 use vello_cpu::peniko::Fill;
 use vello_cpu::{Pixmap, RenderContext, Resources, color::palette::css::BLACK};
@@ -513,56 +512,4 @@ fn curves_beyond_sixteen_quadratics() {
     let shift = Point::new(50.0, 50.0) - c.eval(0.263);
     let s = cubic([c.p0 + shift, c.p1 + shift, c.p2 + shift, c.p3 + shift].map(|p| (p.x, p.y)));
     matches_coverage("s curve", &s, Fill::NonZero, Affine::IDENTITY);
-}
-
-/// The `dash-mixed.pdf` and `dash-large-gaps.pdf` probes: a line 50 units long at
-/// scale 2 (1 px wide, butt caps), dashed 10 on, 10 off, then entries far finer than a
-/// pixel. The fine entries are drawn by their ink, the wide gap stays empty, and each
-/// pixel's ink is within a quarter pixel of the pattern's.
-#[test]
-fn dense_dashes_keep_wide_gaps() {
-    let mut mixed = vec![10.0, 10.0];
-    mixed.extend(std::iter::repeat_n(5e-6, 10_000));
-    for (name, dashes) in [
-        ("mixed", mixed),
-        ("large gaps", vec![10.0, 10.0, 0.025, 0.025]),
-    ] {
-        let mut line = BezPath::new();
-        line.move_to((0.0, 25.0));
-        line.line_to((50.0, 25.0));
-        let stroke = Stroke::new(0.5)
-            .with_caps(Cap::Butt)
-            .with_dashes(0.0, dashes.iter().copied());
-        let alphas = draw(|ctx| {
-            ctx.set_transform(Affine::scale(2.0));
-            ctx.set_stroke(stroke);
-            ctx.stroke_path(&line);
-        });
-        // The pattern's ink over each pixel (half a unit), from its on intervals.
-        let mut ink = [0.0; 100];
-        let (mut at, mut i) = (0.0, 0);
-        while at < 50.0 {
-            let end = (at + dashes[i % dashes.len()]).min(50.0);
-            if i % 2 == 0 {
-                for (x, v) in ink.iter_mut().enumerate() {
-                    let (a, b) = (x as f64 / 2.0, (x + 1) as f64 / 2.0);
-                    *v += (end.min(b) - at.max(a)).max(0.0) * 2.0;
-                }
-            }
-            at = end;
-            i += 1;
-        }
-        for x in 0..100 {
-            for y in [49, 50] {
-                let a = f64::from(alphas[y * 100 + x]);
-                let want = 255.0 * 0.5 * ink[x];
-                assert!(
-                    (a - want).abs() <= 0.25 * 127.5 + 2.0,
-                    "{name}: ({x}, {y}) {a} vs {want}"
-                );
-            }
-        }
-        let gap = (21..40).all(|x| alphas[49 * 100 + x] == 0 && alphas[50 * 100 + x] == 0);
-        assert!(gap, "{name}: the gap at x 20..40 has ink");
-    }
 }
