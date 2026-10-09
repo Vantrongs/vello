@@ -50,7 +50,7 @@ const _: () = assert!(
 #[derive(Debug, Clone, Default)]
 pub struct CulledWindings {
     /// Fractional winding coverage for each individual scanline in a row.
-    pub partial: Vec<[f32; Tile::HEIGHT as usize]>,
+    pub partial: Vec<[f32; Tile::HEIGHT_U32 as usize]>,
     /// Accumulated integer winding deltas for each tile row. Each line changes a row by
     /// at most one and a path has at most `MAX_LINES_PER_PATH` lines, so this cannot wrap.
     pub coarse: Vec<i32>,
@@ -58,7 +58,7 @@ pub struct CulledWindings {
     pub active: Vec<u32>,
     /// Flag indicating if any geometry was early-culled outside the viewport.
     pub culled: bool,
-    height: u16,
+    height: u32,
 }
 
 impl CulledWindings {
@@ -70,11 +70,11 @@ impl CulledWindings {
     const WORD_MASK: usize = 31;
 
     /// Constructor chained to `Tiles`' constructor and matching its initial viewport height.
-    pub fn new(height: u16) -> Self {
+    pub fn new(height: u32) -> Self {
         let (num_rows, num_bits) = Self::sizes(height);
 
         Self {
-            partial: vec![[0.0; Tile::HEIGHT as usize]; num_rows],
+            partial: vec![[0.0; Tile::HEIGHT_U32 as usize]; num_rows],
             coarse: vec![0; num_rows],
             active: vec![0; num_bits],
             culled: false,
@@ -82,18 +82,19 @@ impl CulledWindings {
         }
     }
 
-    fn sizes(height: u16) -> (usize, usize) {
-        let num_rows = usize::from(height).div_ceil(Tile::HEIGHT as usize);
+    fn sizes(height: u32) -> (usize, usize) {
+        let num_rows = (height as usize).div_ceil(Tile::HEIGHT_U32 as usize);
         let num_bits = num_rows.div_ceil(Self::WORD_BITS);
 
         (num_rows, num_bits)
     }
 
     /// Reset the winding buffers.
-    pub fn reset(&mut self, height: u16) {
+    pub fn reset(&mut self, height: u32) {
         if self.height != height {
             let (num_rows, num_bits) = Self::sizes(height);
-            self.partial.resize(num_rows, [0.0; Tile::HEIGHT as usize]);
+            self.partial
+                .resize(num_rows, [0.0; Tile::HEIGHT_U32 as usize]);
             self.coarse.resize(num_rows, 0);
             self.active.resize(num_bits, 0);
             self.height = height;
@@ -102,7 +103,7 @@ impl CulledWindings {
         // TODO: Maybe consider tracking touched regions and only resetting those
         // instead of always the full array?
         if self.culled {
-            self.partial.fill([0.0; Tile::HEIGHT as usize]);
+            self.partial.fill([0.0; Tile::HEIGHT_U32 as usize]);
             self.coarse.fill(0);
             self.active.fill(0);
             self.culled = false;
@@ -216,26 +217,14 @@ impl CulledWindings {
 /// Keep in mind that it is possible to have multiple tiles with the same index,
 /// namely if we have multiple lines crossing the same 4x4 area!
 ///
-/// # Note
-///
-/// This struct is `#[repr(C)]`, but the byte order of its fields is dependent on the endianness of
-/// the compilation target.
+/// Source coordinates are independent of the physical target dimensions.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Tile {
-    // The field ordering is important.
-    //
-    // The given ordering (variant over little and big endian compilation targets), ensures that
-    // `Tile::to_bits` doesn't do any actual work, as the ordering of the fields is such that the
-    // numeric value of a `Tile` in memory is identical as returned by that method. This allows
-    // for, e.g., comparison and sorting.
-    #[cfg(target_endian = "big")]
     /// The index of the tile in the y direction.
-    pub y: u16,
-
-    #[cfg(target_endian = "big")]
+    pub y: u32,
     /// The index of the tile in the x direction.
-    pub x: u16,
+    pub x: u32,
 
     /// The index of the line this tile belongs to into the line buffer, intersection data,
     /// and winding data packed together.
@@ -253,37 +242,35 @@ pub struct Tile {
     /// tiles with the same (x, y) coordinates, they are sorted by their line index first,
     /// and then by their intersection mask.
     pub packed_winding_line_idx: u32,
-
-    #[cfg(target_endian = "little")]
-    /// The index of the tile in the x direction.
-    pub x: u16,
-
-    #[cfg(target_endian = "little")]
-    /// The index of the tile in the y direction.
-    pub y: u16,
 }
 
 impl Tile {
     /// The width of a tile in pixels.
     pub const WIDTH: u16 = 4;
 
+    /// The width of a tile in the source coordinate domain.
+    pub const WIDTH_U32: u32 = 4;
+
     /// The height of a tile in pixels.
     pub const HEIGHT: u16 = 4;
 
+    /// The height of a tile in the source coordinate domain.
+    pub const HEIGHT_U32: u32 = 4;
+
     /// A special tile used to signal the end of a tile stream during rendering.
-    pub const SENTINEL: Self = Self::new(u16::MAX, u16::MAX, 0, 0);
+    pub const SENTINEL: Self = Self::new(u32::MAX, u32::MAX, 0, 0);
 
     /// Create a new tile.
     /// `x` and `y` will be clamped to the largest possible coordinate if they are too large.
     ///
     /// `line_idx` must be smaller than [`MAX_LINES_PER_PATH`].
     #[inline]
-    pub fn new_clamped(x: u16, y: u16, line_idx: u32, intersection_mask: u32) -> Self {
+    pub fn new_clamped(x: u32, y: u32, line_idx: u32, intersection_mask: u32) -> Self {
         Self::new(
             // Make sure that x and y stay in range when multiplying
             // with the tile width and height during strips generation.
-            x.min(u16::MAX / Self::WIDTH),
-            y.min(u16::MAX / Self::HEIGHT),
+            x.min(u32::MAX / Self::WIDTH_U32),
+            y.min(u32::MAX / Self::HEIGHT_U32),
             line_idx,
             intersection_mask,
         )
@@ -293,9 +280,9 @@ impl Tile {
     ///
     /// Unlike [`Self::new_clamped`], this constructor stores `x` and `y` exactly as provided.
     /// Callers must ensure these coordinates do not exceed the limits required by downstream
-    /// processing (typically `u16::MAX / WIDTH` and `u16::MAX / HEIGHT`).
+    /// processing (typically `u32::MAX / WIDTH` and `u32::MAX / HEIGHT`).
     #[inline]
-    pub const fn new(x: u16, y: u16, line_idx: u32, intersection_mask: u32) -> Self {
+    pub const fn new(x: u32, y: u32, line_idx: u32, intersection_mask: u32) -> Self {
         #[cfg(debug_assertions)]
         if line_idx >= MAX_LINES_PER_PATH {
             panic!("Max. number of lines per path exceeded.");
@@ -376,20 +363,13 @@ impl Tile {
         (self.intersection_mask() & R) != 0
     }
 
-    /// Return the `u64` representation of this tile.
-    ///
-    /// This is the u64 interpretation of `(y, x, packed_winding_line_idx)` where `y` is the
-    /// most-significant part of the number and `packed_winding_line_idx` the least significant.
+    /// Ordering key: coordinates first, then line index for strip-rendering locality.
     #[inline(always)]
-    const fn to_bits(self) -> u64 {
-        // Note that for correct rendering, tiles only need to be sorted on `(y, x)`. Sorting on
-        // the line index in addition to the coordinate improves data locality in strip rendering.
-        // This is trading off increased sorting time for decreased strip rendering time. How the
-        // trade-off falls is scene-dependent.
-        //
-        // This operation compiles to a no-op: `Tile`'s field order is such that this is exactly
-        // the in-memory representation.
-        ((self.y as u64) << 48) | ((self.x as u64) << 32) | self.packed_winding_line_idx as u64
+    const fn sort_key(self) -> (u64, u32) {
+        (
+            ((self.y as u64) << 32) | self.x as u64,
+            self.packed_winding_line_idx,
+        )
     }
 
     /// Whether a tile is a sentinel tile
@@ -398,21 +378,21 @@ impl Tile {
     // the division by tile size on creation, so checking on x is sufficient to identify it.
     #[inline(always)]
     pub const fn is_sentinel(&self) -> bool {
-        self.x == u16::MAX
+        self.x == u32::MAX
     }
 }
 
 impl PartialEq for Tile {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        self.to_bits() == other.to_bits()
+        self.sort_key() == other.sort_key()
     }
 }
 
 impl Ord for Tile {
     #[inline(always)]
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.to_bits().cmp(&other.to_bits())
+        self.sort_key().cmp(&other.sort_key())
     }
 }
 
@@ -431,15 +411,15 @@ pub struct Tiles {
     tile_buf: Vec<Tile>,
     level: Level,
     sorted: bool,
-    width: u16,
-    height: u16,
+    width: u32,
+    height: u32,
     /// Auxiliary data tracking row windings and active rows for early culling.
     pub windings: CulledWindings,
 }
 
 impl Tiles {
     /// Create a new tiles container.
-    pub fn new(level: Level, width: u16, height: u16) -> Self {
+    pub fn new(level: Level, width: u32, height: u32) -> Self {
         Self {
             tile_buf: vec![],
             level,
@@ -452,7 +432,7 @@ impl Tiles {
 
     /// Get the number of tiles in the container.
     pub fn len(&self) -> u32 {
-        self.tile_buf.len() as u32
+        u32::try_from(self.tile_buf.len()).expect("tile buffer exceeds u32 index domain")
     }
 
     /// Returns `true` if the container has no tiles.
@@ -461,7 +441,7 @@ impl Tiles {
     }
 
     /// Get the viewport width used for this tile buffer.
-    pub(crate) fn width(&self) -> u16 {
+    pub(crate) fn width(&self) -> u32 {
         self.width
     }
 
@@ -471,7 +451,7 @@ impl Tiles {
     }
 
     /// Reset the tiles' container and resize to the given dimensions.
-    pub fn reset(&mut self, width: u16, height: u16) {
+    pub fn reset(&mut self, width: u32, height: u32) {
         self.windings.reset(height);
         self.width = width;
         self.height = height;
@@ -520,8 +500,8 @@ impl Tiles {
         &mut self,
         level: Level,
         lines: &[Line],
-        width: u16,
-        height: u16,
+        width: u32,
+        height: u32,
     ) -> bool {
         dispatch!(level, simd => self.make_tiles_analytic_aa_impl::<_>(
             simd,
@@ -536,8 +516,8 @@ impl Tiles {
         &mut self,
         s: S,
         lines: &[Line],
-        width: u16,
-        height: u16,
+        width: u32,
+        height: u32,
     ) -> bool {
         self.reset(width, height);
 
@@ -552,21 +532,21 @@ impl Tiles {
             lines.len()
         );
 
-        let tile_columns = width.div_ceil(Tile::WIDTH);
-        let tile_rows = height.div_ceil(Tile::HEIGHT);
+        let tile_columns = width.div_ceil(Tile::WIDTH_U32);
+        let tile_rows = height.div_ceil(Tile::HEIGHT_U32);
 
         let px_top = f32x4::from_slice(s, &[0.0, 1.0, 2.0, 3.0]);
         let px_bottom = px_top + f32x4::splat(s, 1.0);
         let simd_zero = f32x4::splat(s, 0.0);
-        let tile_height_f32 = Tile::HEIGHT as f32;
+        let tile_height_f32 = Tile::HEIGHT_U32 as f32;
 
         for (line_idx, line) in lines.iter().take(MAX_LINES_PER_PATH as usize).enumerate() {
             let line_idx = line_idx as u32;
 
-            let p0_x = line.p0.x / f32::from(Tile::WIDTH);
-            let p0_y = line.p0.y / f32::from(Tile::HEIGHT);
-            let p1_x = line.p1.x / f32::from(Tile::WIDTH);
-            let p1_y = line.p1.y / f32::from(Tile::HEIGHT);
+            let p0_x = line.p0.x / Tile::WIDTH_U32 as f32;
+            let p0_y = line.p0.y / Tile::HEIGHT_U32 as f32;
+            let p1_x = line.p1.x / Tile::WIDTH_U32 as f32;
+            let p1_y = line.p1.y / Tile::HEIGHT_U32 as f32;
 
             let (line_left_x, line_right_x) = if p0_x < p1_x {
                 (p0_x, p1_x)
@@ -585,10 +565,10 @@ impl Tiles {
                 (p1_y, p1_x, p0_y, p0_x)
             };
 
-            // The `as u16` casts here intentionally clamp negative coordinates to 0.
-            let y_top_tiles = (line_top_y as u16).min(tile_rows);
+            // The `as u32` casts here intentionally clamp negative coordinates to 0.
+            let y_top_tiles = (line_top_y as u32).min(tile_rows);
             let line_bottom_y_ceil = line_bottom_y.ceil();
-            let y_bottom_tiles = (line_bottom_y_ceil as u16).min(tile_rows);
+            let y_bottom_tiles = (line_bottom_y_ceil as u32).min(tile_rows);
 
             // If y_top_tiles == y_bottom_tiles, then the line is either completely above or below
             // the viewport OR it is perfectly horizontal and aligned to the tile grid, contributing
@@ -605,7 +585,7 @@ impl Tiles {
 
             macro_rules! calc_fractional_coverage {
                 ($y_idx:expr, $segment_top_y:expr, $segment_bottom_y:expr) => {{
-                    let y_idx_f32 = f32::from($y_idx);
+                    let y_idx_f32 = ($y_idx as f32);
                     let local_y_start = ($segment_top_y - y_idx_f32) * tile_height_f32;
                     let local_y_end = ($segment_bottom_y - y_idx_f32) * tile_height_f32;
 
@@ -630,7 +610,7 @@ impl Tiles {
                     // Note: In theory, == should be enough, but just as
                     // additional safety against numerical precision errors we
                     // use <=.
-                    let at_top_of_tile = line_top_y <= f32::from(y_top_tiles);
+                    let at_top_of_tile = line_top_y <= y_top_tiles as f32;
                     if at_top_of_tile {
                         self.windings.coarse[y_top_tiles as usize] += dir;
                     }
@@ -653,7 +633,7 @@ impl Tiles {
                     y_top_tiles + 1
                 };
                 let line_bottom_floor = line_bottom_y.floor();
-                let y_end_middle = (line_bottom_floor as u16).min(tile_rows);
+                let y_end_middle = (line_bottom_floor as u32).min(tile_rows);
 
                 for y_idx in y_start_middle..y_end_middle {
                     self.windings.coarse[y_idx as usize] += dir;
@@ -695,13 +675,13 @@ impl Tiles {
                 // Case vertical lines: By definition, these cannot be horizontally crossing, and
                 // thus require no additional left-edge culling handling.
                 if line_left_x == line_right_x {
-                    let x = (line_left_x as u16).min(tile_columns.saturating_sub(1));
+                    let x = (line_left_x as u32).min(tile_columns.saturating_sub(1));
 
                     // Row Start, not culled.
                     let is_start_culled = line_top_y < 0.0;
                     if !is_start_culled {
                         let winding =
-                            ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
+                            (((y_top_tiles as f32) >= line_top_y) as u32) << WINDING_SHIFT;
                         let tile = Tile::new_clamped(x, y_top_tiles, line_idx, winding);
                         self.tile_buf.push(tile);
                     }
@@ -732,14 +712,14 @@ impl Tiles {
                     let push_row_extents = {
                         #[inline(always)]
                         |tile_buf: &mut Vec<Tile>,
-                         y_idx: u16,
+                         y_idx: u32,
                          row_left_x: f32,
                          row_right_x: f32,
                          w_start: u32,
                          w_end: u32,
                          w_single: u32| {
-                            let x_start = row_left_x as u16;
-                            let x_end = (row_right_x as u16).min(tile_columns - 1);
+                            let x_start = row_left_x as u32;
+                            let x_end = (row_right_x as u32).min(tile_columns - 1);
 
                             if x_start <= x_end {
                                 let winding = if x_start == x_end { w_single } else { w_start };
@@ -759,7 +739,7 @@ impl Tiles {
 
                     let mut push_row = {
                         #[inline(always)]
-                        |y_idx: u16,
+                        |y_idx: u32,
                          row_top_y: f32,
                          row_bottom_y: f32,
                          w_start: u32,
@@ -845,7 +825,7 @@ impl Tiles {
                     // otherwise would need to be made viewport culling work.
                     if line_left_x >= 0.0 && line_right_x < tile_columns as f32 {
                         if !is_start_culled {
-                            let y = f32::from(y_top_tiles);
+                            let y = y_top_tiles as f32;
                             let row_bottom_y = (y + 1.0).min(line_bottom_y);
                             let row_bottom_x = if row_bottom_y == line_bottom_y {
                                 line_bottom_x
@@ -871,9 +851,9 @@ impl Tiles {
                         };
 
                         if y_start < y_bottom_tiles {
-                            let mut row_top_x = p0_x + (f32::from(y_start) - p0_y) * x_slope;
+                            let mut row_top_x = p0_x + ((y_start as f32) - p0_y) * x_slope;
                             for y_idx in y_start..y_bottom_tiles {
-                                let y = f32::from(y_idx);
+                                let y = y_idx as f32;
                                 // Note: We purposefully don't precompute it once
                                 // and just increment by `x_slope` after every iteration
                                 // to avoid errors due to floating point inaccuracies.
@@ -896,7 +876,7 @@ impl Tiles {
                         }
                     } else {
                         if !is_start_culled {
-                            let y = f32::from(y_top_tiles);
+                            let y = y_top_tiles as f32;
                             let row_bottom_y = (y + 1.0).min(line_bottom_y);
                             let mask = ((y >= line_top_y) as u32) << WINDING_SHIFT;
                             push_row(
@@ -916,7 +896,7 @@ impl Tiles {
                         };
 
                         for y_idx in y_start..y_bottom_tiles {
-                            let y = f32::from(y_idx);
+                            let y = y_idx as f32;
                             let row_bottom_y = (y + 1.0).min(line_bottom_y);
                             push_row(y_idx, y, row_bottom_y, w_start_base, w_end_base, W);
                         }
@@ -925,10 +905,10 @@ impl Tiles {
             } else {
                 // Case line is fully contained within a single tile: These also cannot cross edges!
                 let tile = Tile::new_clamped(
-                    (line_left_x as u16).min(tile_columns + 1),
+                    (line_left_x as u32).min(tile_columns + 1),
                     y_top_tiles,
                     line_idx,
-                    ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT,
+                    (((y_top_tiles as f32) >= line_top_y) as u32) << WINDING_SHIFT,
                 );
                 self.tile_buf.push(tile);
             }
@@ -960,7 +940,7 @@ impl Tiles {
     ///
     /// - W (Winding): Tracks whether the line touched the top edge of the tile.
     /// - R/L/B/T: Right, Left, Bottom, and Top edge intersections.
-    pub fn make_tiles_msaa(&mut self, lines: &[Line], width: u16, height: u16) {
+    pub fn make_tiles_msaa(&mut self, lines: &[Line], width: u32, height: u32) {
         self.reset(width, height);
 
         if width == 0 || height == 0 {
@@ -974,16 +954,16 @@ impl Tiles {
             lines.len()
         );
 
-        let tile_columns = width.div_ceil(Tile::WIDTH);
-        let tile_rows = height.div_ceil(Tile::HEIGHT);
+        let tile_columns = width.div_ceil(Tile::WIDTH_U32);
+        let tile_rows = height.div_ceil(Tile::HEIGHT_U32);
 
         for (line_idx, line) in lines.iter().take(MAX_LINES_PER_PATH as usize).enumerate() {
             let line_idx = line_idx as u32;
 
-            let p0_x = line.p0.x / f32::from(Tile::WIDTH);
-            let p0_y = line.p0.y / f32::from(Tile::HEIGHT);
-            let p1_x = line.p1.x / f32::from(Tile::WIDTH);
-            let p1_y = line.p1.y / f32::from(Tile::HEIGHT);
+            let p0_x = line.p0.x / Tile::WIDTH_U32 as f32;
+            let p0_y = line.p0.y / Tile::HEIGHT_U32 as f32;
+            let p1_x = line.p1.x / Tile::WIDTH_U32 as f32;
+            let p1_y = line.p1.y / Tile::HEIGHT_U32 as f32;
 
             let (line_left_x, line_right_x) = if p0_x < p1_x {
                 (p0_x, p1_x)
@@ -1002,10 +982,10 @@ impl Tiles {
                 (p1_y, p1_x, p0_y, p0_x)
             };
 
-            // The `as u16` casts here intentionally clamp negative coordinates to 0.
-            let y_top_tiles = (line_top_y as u16).min(tile_rows);
+            // The `as u32` casts here intentionally clamp negative coordinates to 0.
+            let y_top_tiles = (line_top_y as u32).min(tile_rows);
             let line_bottom_y_ceil = line_bottom_y.ceil();
-            let y_bottom_tiles = (line_bottom_y_ceil as u16).min(tile_rows);
+            let y_bottom_tiles = (line_bottom_y_ceil as u32).min(tile_rows);
 
             // If y_top_tiles == y_bottom_tiles, then the line is either completely above or below
             // the viewport OR it is perfectly horizontal and aligned to the tile grid, contributing
@@ -1030,13 +1010,13 @@ impl Tiles {
             if not_same_tile {
                 // For ease of logic, special-case purely vertical tiles.
                 if line_left_x == line_right_x {
-                    let x = (line_left_x as u16).min(tile_columns.saturating_sub(1));
+                    let x = (line_left_x as u32).min(tile_columns.saturating_sub(1));
 
                     // Row Start, not culled.
                     let is_start_culled = line_top_y < 0.0;
                     if !is_start_culled {
                         let winding =
-                            ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
+                            (((y_top_tiles as f32) >= line_top_y) as u32) << WINDING_SHIFT;
                         let intersection_mask = B | winding;
                         let tile = Tile::new_clamped(x, y_top_tiles, line_idx, intersection_mask);
                         self.tile_buf.push(tile);
@@ -1050,7 +1030,7 @@ impl Tiles {
                         y_top_tiles + 1
                     };
                     let line_bottom_floor = line_bottom_y.floor();
-                    let y_end_idx = (line_bottom_floor as u16).min(tile_rows);
+                    let y_end_idx = (line_bottom_floor as u32).min(tile_rows);
 
                     if y_start < y_end_idx {
                         let y_last = y_end_idx - 1;
@@ -1158,18 +1138,18 @@ impl Tiles {
                             let (row_left_x, row_right_x, x_end) = if $clamped {
                                 let lx = f32::min(row_top_x, row_bottom_x).max(line_left_x);
                                 let rx = f32::max(row_top_x, row_bottom_x).min(line_right_x);
-                                let xe = (rx as u16).min(tile_columns.saturating_sub(1));
+                                let xe = (rx as u32).min(tile_columns.saturating_sub(1));
                                 (lx, rx, xe)
                             } else {
                                 let lx = f32::min(row_top_x, row_bottom_x);
                                 let rx = f32::max(row_top_x, row_bottom_x);
-                                let xe = rx as u16; // Safe because we checked bounds earlier
+                                let xe = rx as u32; // Safe because we checked bounds earlier
                                 (lx, rx, xe)
                             };
 
                             let canonical_x_start = row_left_x.floor() as i32;
-                            let canonical_x_end = row_right_x as u16;
-                            let x_start = row_left_x as u16;
+                            let canonical_x_end = row_right_x as u32;
+                            let x_start = row_left_x as u32;
 
                             if x_start <= x_end {
                                 let is_single = (x_start == x_end) as u32;
@@ -1216,7 +1196,7 @@ impl Tiles {
                             // Top Row
                             let is_start_culled = line_top_y < 0.0;
                             if !is_start_culled {
-                                let y = f32::from(y_top_tiles);
+                                let y = y_top_tiles as f32;
                                 let row_bottom_y = (y + 1.0).min(line_bottom_y);
                                 let mask = ((y >= line_top_y) as u32) << WINDING_SHIFT;
                                 process_row!(
@@ -1236,14 +1216,14 @@ impl Tiles {
                                 y_top_tiles + 1
                             };
                             let line_bottom_floor = line_bottom_y.floor();
-                            let y_end_middle = (line_bottom_floor as u16).min(tile_rows);
+                            let y_end_middle = (line_bottom_floor as u32).min(tile_rows);
                             let has_separate_bottom_row = line_bottom_y != line_bottom_floor
                                 && y_end_middle < tile_rows
                                 && (is_start_culled || y_end_middle != y_top_tiles);
 
                             if y_start_middle < y_end_middle {
                                 for y_idx in y_start_middle..y_end_middle {
-                                    let y = f32::from(y_idx);
+                                    let y = y_idx as f32;
                                     let row_bottom_y = (y + 1.0).min(line_bottom_y);
                                     let is_last_middle = y_idx == y_end_middle - 1;
                                     let check_end = is_last_middle && !has_separate_bottom_row;
@@ -1263,7 +1243,7 @@ impl Tiles {
                             // Bottom Row
                             if has_separate_bottom_row {
                                 let y_idx = y_end_middle;
-                                let y = f32::from(y_idx);
+                                let y = y_idx as f32;
                                 process_row!(
                                     y_idx,
                                     y,
@@ -1286,10 +1266,10 @@ impl Tiles {
             } else {
                 // Case: Line is fully contained within a single tile.
                 let tile = Tile::new_clamped(
-                    (line_left_x as u16).min(tile_columns + 1),
+                    (line_left_x as u32).min(tile_columns + 1),
                     y_top_tiles,
                     line_idx,
-                    ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT,
+                    (((y_top_tiles as f32) >= line_top_y) as u32) << WINDING_SHIFT,
                 );
                 self.tile_buf.push(tile);
             }
@@ -1300,14 +1280,14 @@ impl Tiles {
 #[cfg(test)]
 mod tests {
     use crate::flatten::{FlattenCtx, Line, Point, fill};
-    use crate::geometry::RectU16;
+    use crate::geometry::RectU32;
     use crate::kurbo::{Affine, BezPath};
     use crate::tile::CulledWindings;
     use crate::tile::{B, L, R, T, Tile, Tiles, W};
     use fearless_simd::Level;
     use std::vec::Vec;
 
-    const VIEW_DIM: u16 = 100;
+    const VIEW_DIM: u32 = 100;
     const F_V_DIM: f32 = VIEW_DIM as f32;
 
     fn new_tiles() -> Tiles {
@@ -1322,8 +1302,8 @@ mod tests {
         fn assert_tiles_match(
             &mut self,
             lines: &[Line],
-            width: u16,
-            height: u16,
+            width: u32,
+            height: u32,
             expected: &[Tile],
         ) {
             self.make_tiles_msaa(lines, width, height);
@@ -1695,8 +1675,8 @@ mod tests {
 
     #[test]
     fn vertical_path_on_the_right_of_viewport() {
-        const VIEWPORT_WIDTH: u16 = 10;
-        const VIEWPORT_HEIGHT: u16 = 10;
+        const VIEWPORT_WIDTH: u32 = 10;
+        const VIEWPORT_HEIGHT: u32 = 10;
 
         let path = BezPath::from_svg("M261,0 L78848,0 L78848,4 L261,4 Z").unwrap();
         let mut line_buf: Vec<Line> = Vec::new();
@@ -1706,7 +1686,7 @@ mod tests {
             Affine::IDENTITY,
             &mut line_buf,
             &mut FlattenCtx::default(),
-            RectU16::new(0, 0, VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
+            RectU32::new(0, 0, VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
         );
 
         let mut tiles = new_tiles();
@@ -2243,11 +2223,11 @@ mod tests {
     // position, causing a filled 4x4 block artifact to appear.
     #[test]
     fn issue_early_winding_emission() {
-        const WIDTH: u16 = Tile::WIDTH * 35;
-        const HEIGHT: u16 = Tile::HEIGHT * 7;
+        const WIDTH: u32 = Tile::WIDTH_U32 * 35;
+        const HEIGHT: u32 = Tile::HEIGHT_U32 * 7;
 
-        let tile_width = f32::from(Tile::WIDTH);
-        let tile_height = f32::from(Tile::HEIGHT);
+        let tile_width = Tile::WIDTH_U32 as f32;
+        let tile_height = Tile::HEIGHT_U32 as f32;
         let lines = [Line {
             p0: Point {
                 x: 32.89 * tile_width,

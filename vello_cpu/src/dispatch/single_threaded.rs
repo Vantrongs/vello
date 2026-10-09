@@ -6,21 +6,22 @@ use crate::coarse::CommandBucketer;
 use crate::coarse::depth::DepthBuffer;
 use crate::dispatch::Dispatcher;
 use crate::filter::context::FilterContext;
+use crate::filter::pixmap::FilterPixmap;
 use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_region};
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
 use crate::record::RecordedFill;
-use crate::region::Regions;
+use crate::region::{RasterTarget, Regions};
 use core::cell::RefCell;
 use vello_common::TargetInit;
 use vello_common::color::AlphaColor;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd};
 use vello_common::filter::FilterData;
-use vello_common::geometry::RectU16;
+use vello_common::geometry::RectU32;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint, PremulColor};
-use vello_common::pixmap::{Pixmap, PixmapMut};
+use vello_common::pixmap::PixmapMut;
 use vello_common::record::{
     CommandRecorder, LayerClip, LayerProps, Node, PoppedLayer, RecordedLayerKind,
 };
@@ -52,8 +53,11 @@ impl SingleThreadedDispatcher {
     /// * `level` - SIMD level to use for rasterization.
     pub(crate) fn new(width: u16, height: u16, level: Level) -> Self {
         Self {
-            bucketer: RefCell::new(CommandBucketer::from_wh(width, height)),
-            viewport: ViewportState::new(width, height, level),
+            bucketer: RefCell::new(CommandBucketer::from_wh(
+                u32::from(width),
+                u32::from(height),
+            )),
+            viewport: ViewportState::new(u32::from(width), u32::from(height), level),
             recorder: CommandRecorder::new(width, height),
             strip_storage: StripStorage::new(GenerationMode::Append),
             level,
@@ -103,7 +107,7 @@ impl SingleThreadedDispatcher {
     fn rasterize_with<S: Simd, F: FineKernel<S>>(
         &self,
         simd: S,
-        target: PixmapMut<'_>,
+        mut target: PixmapMut<'_>,
         scene_width: u16,
         scene_height: u16,
         settings: RasterizerSettings,
@@ -113,16 +117,17 @@ impl SingleThreadedDispatcher {
         let filters = self.rasterize_filter_layers::<S, F>(simd, encoded_paints, image_resolver);
         let target_init = settings.target_init.map(PremulColor::from_alpha_color);
         let params = FineRenderParams {
-            scene_size: (scene_width, scene_height),
-            target_offset: settings.offset,
+            scene_size: (u32::from(scene_width), u32::from(scene_height)),
+            target_offset: (u32::from(settings.offset.0), u32::from(settings.offset.1)),
+            source_shift: (0, 0),
         };
 
         self.bucket_and_rasterize::<S, F>(
             simd,
             &self.recorder.nodes,
-            RectU16::new(0, 0, scene_width, scene_height),
+            RectU32::new(0, 0, u32::from(scene_width), u32::from(scene_height)),
             &filters,
-            target,
+            RasterTarget::from_pixmap(&mut target),
             params,
             target_init,
             self.recorder.root_is_blend_target,
@@ -135,9 +140,9 @@ impl SingleThreadedDispatcher {
         &self,
         simd: S,
         cmds: &[Node],
-        viewport: RectU16,
+        viewport: RectU32,
         filter_ctx: &FilterContext,
-        mut target: PixmapMut<'_>,
+        mut target: RasterTarget<'_>,
         params: FineRenderParams,
         target_init: TargetInit<PremulColor>,
         root_is_blend_target: bool,
@@ -145,7 +150,7 @@ impl SingleThreadedDispatcher {
         image_resolver: &dyn ImageResolver,
     ) {
         let mut bucketer = self.bucketer.borrow_mut();
-        bucketer.reset(viewport);
+        bucketer.reset(viewport, params.source_shift);
         bucketer.bucket_commands(
             cmds,
             &self.recorder.draws,
@@ -246,10 +251,11 @@ impl SingleThreadedDispatcher {
             let height = pixmap_bbox.height();
             // TODO: See https://github.com/linebender/vello/pull/1701#discussion_r3400709986, explore
             // using pools for more resources.
-            let mut pixmap = Pixmap::new(width, height);
+            let mut pixmap = FilterPixmap::new(width, height);
             let params = FineRenderParams {
                 scene_size: (width, height),
                 target_offset: (0, 0),
+                source_shift: self.recorder.layers[id as usize].source_shift,
             };
 
             self.bucket_and_rasterize::<S, F>(
@@ -257,7 +263,7 @@ impl SingleThreadedDispatcher {
                 &self.recorder.layers[id as usize].nodes,
                 pixmap_bbox,
                 &filter_ctx,
-                (&mut pixmap).into(),
+                pixmap.as_mut(),
                 params,
                 TargetInit::Clear(PremulColor::from_alpha_color(AlphaColor::TRANSPARENT)),
                 false,
@@ -267,9 +273,8 @@ impl SingleThreadedDispatcher {
 
             F::filter_layer(
                 &mut pixmap,
-                &filter_plan.filter,
+                filter_plan.prepare_for_layer(),
                 filter_ctx.scratch(),
-                filter_plan.transform,
             );
 
             // Save the filtered pixmap to disk for debugging.
@@ -388,7 +393,7 @@ impl Dispatcher for SingleThreadedDispatcher {
                     let strip_range = strip_start..strip_storage.strips.len();
                     LayerClip {
                         bbox: strip_bbox(&strip_storage.strips[strip_range.clone()])
-                            .unwrap_or(RectU16::ZERO),
+                            .unwrap_or(RectU32::ZERO),
                         strip_range,
                         thread_idx: 0,
                     }
@@ -419,7 +424,7 @@ impl Dispatcher for SingleThreadedDispatcher {
         // Bucketer will be reset on demand, so no need to reset it here.
         self.recorder.reset(width, height);
         self.strip_storage.clear();
-        self.viewport.reset(width, height);
+        self.viewport.reset(u32::from(width), u32::from(height));
     }
 
     fn flush(&mut self) {
@@ -528,21 +533,29 @@ impl Dispatcher for SingleThreadedDispatcher {
 }
 
 /// Saves a filtered pixmap to disk for debugging purposes.
-/// Only available in debug builds with `std` and `png` features enabled.
-#[allow(
-    dead_code,
-    reason = "useful debug utility, can be enabled by uncommenting the call site"
-)]
+#[allow(dead_code, reason = "useful debug utility; enable at the call site")]
 #[cfg(all(debug_assertions, feature = "std", feature = "png"))]
-fn save_filtered_layer_debug(pixmap: &Pixmap, layer_id: usize) {
-    use std::path::PathBuf;
-
-    let diffs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vello_tests/diffs");
-    let _ = std::fs::create_dir_all(&diffs_path);
+#[expect(
+    clippy::print_stderr,
+    reason = "opt-in debug export reports filesystem and PNG errors"
+)]
+fn save_filtered_layer_debug(pixmap: &FilterPixmap, layer_id: usize) {
+    let diffs_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vello_tests/diffs");
     let filename = diffs_path.join(alloc::format!("filtered_layer_{layer_id}.png"));
-
-    if let Ok(png_data) = pixmap.clone().into_png() {
-        let _ = std::fs::write(&filename, &png_data);
+    let save = || -> Result<(), alloc::boxed::Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(&diffs_path)?;
+        let mut pixels = bytemuck::cast_slice(pixmap.data()).to_vec();
+        vello_common::pixmap::unpremultiply_rgba8(&mut pixels);
+        let file = std::fs::File::create(filename)?;
+        let mut encoder = png::Encoder::new(file, pixmap.width(), pixmap.height());
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header()?.write_image_data(&pixels)?;
+        Ok(())
+    };
+    if let Err(error) = save() {
+        std::eprintln!("could not save filtered layer: {error}");
     }
 }
 

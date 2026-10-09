@@ -500,7 +500,8 @@ impl RenderContext {
     /// # Panics
     ///
     /// Panics if `filter` is provided when this context uses multi-threaded rendering.
-    /// Also panics if the filter's required source viewport exceeds `u16` dimensions.
+    /// Also panics if filter parameters or their transform are non-finite, or if the
+    /// filter's required source viewport exceeds `u32` dimensions.
     pub fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,
@@ -583,7 +584,7 @@ impl RenderContext {
     ///
     /// # Panics
     ///
-    /// Panics when this context uses multi-threaded rendering.
+    /// Panics under the same conditions as [`Self::push_layer`].
     pub fn push_filter_layer(&mut self, filter: Filter) {
         self.push_layer(None, None, None, None, Some(filter));
     }

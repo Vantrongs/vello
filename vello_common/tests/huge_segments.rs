@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{FlattenCtx, Line, fill, stroke};
-use vello_common::geometry::RectU16;
+use vello_common::geometry::RectU32;
 use vello_common::kurbo::{Affine, BezPath, Join, Stroke, StrokeCtx};
 
 /// Counts the bytes in use and their peak, and refuses requests over `CAP`, so code
@@ -48,7 +48,7 @@ unsafe impl GlobalAlloc for Capped {
 #[global_allocator]
 static ALLOC: Capped = Capped;
 
-const VIEW: RectU16 = RectU16 {
+const VIEW: RectU32 = RectU32 {
     x0: 0,
     y0: 0,
     x1: 100,

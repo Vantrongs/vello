@@ -17,16 +17,16 @@ use super::FilterEffect;
 use super::gaussian_blur::apply_blur;
 use super::shift::offset_pixels;
 use crate::filter::context::ScratchBuffer;
+use crate::filter::pixmap::FilterPixmap;
 use vello_common::color::{AlphaColor, Srgb};
 use vello_common::filter::drop_shadow::DropShadow;
 use vello_common::filter_effects::EdgeMode;
 use vello_common::peniko::color::PremulRgba8;
 #[cfg(not(feature = "std"))]
 use vello_common::peniko::kurbo::common::FloatFuncs as _;
-use vello_common::pixmap::Pixmap;
 
 impl FilterEffect for DropShadow {
-    fn execute_lowp(&self, pixmap: &mut Pixmap, filter_scratch: &mut ScratchBuffer) {
+    fn execute_lowp(&self, pixmap: &mut FilterPixmap, filter_scratch: &mut ScratchBuffer) {
         apply_drop_shadow(
             pixmap,
             self.dx,
@@ -41,7 +41,7 @@ impl FilterEffect for DropShadow {
         );
     }
 
-    fn execute_highp(&self, pixmap: &mut Pixmap, filter_scratch: &mut ScratchBuffer) {
+    fn execute_highp(&self, pixmap: &mut FilterPixmap, filter_scratch: &mut ScratchBuffer) {
         // TODO: Currently only lowp is implemented and used for highp as well.
         // This needs to be updated to use proper high-precision arithmetic.
         Self::execute_lowp(self, pixmap, filter_scratch);
@@ -55,7 +55,7 @@ impl FilterEffect for DropShadow {
 /// 2. Blur the already-offset shadow
 /// 3. Apply shadow color and optionally composite with original
 fn apply_drop_shadow(
-    pixmap: &mut Pixmap,
+    pixmap: &mut FilterPixmap,
     dx: f32,
     dy: f32,
     std_deviation: f32,
@@ -95,8 +95,8 @@ fn apply_drop_shadow(
 /// the shadow color to the alpha channel and, when requested, composites the
 /// original over it using source-over.
 fn write_colored_shadow(
-    shadow: &Pixmap,
-    dst: &mut Pixmap,
+    shadow: &FilterPixmap,
+    dst: &mut FilterPixmap,
     color: AlphaColor<Srgb>,
     composite_original: bool,
 ) {
@@ -291,8 +291,8 @@ mod tests {
     /// Test `write_colored_shadow` applies color correctly.
     #[test]
     fn test_compose_shadow_color() {
-        let mut shadow_pixmap = Pixmap::new(2, 2);
-        let mut dst_pixmap = Pixmap::new(2, 2);
+        let mut shadow_pixmap = FilterPixmap::new(2, 2);
+        let mut dst_pixmap = FilterPixmap::new(2, 2);
 
         // Shadow has alpha=255 at (0,0)
         shadow_pixmap.set_pixel(

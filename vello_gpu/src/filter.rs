@@ -356,14 +356,15 @@ impl<T: CastToFilterData> From<T> for GpuFilterData {
     }
 }
 
-impl From<&PreparedFilter> for GpuFilterData {
-    fn from(filter: &PreparedFilter) -> Self {
-        match filter {
+impl GpuFilterData {
+    fn from_prepared(filter: &PreparedFilter) -> Option<Self> {
+        Some(match filter {
+            PreparedFilter::Identity => return None,
             PreparedFilter::Offset(f) => GpuOffset::from(f).into(),
             PreparedFilter::Flood(f) => GpuFlood::from(f).into(),
             PreparedFilter::GaussianBlur(f) => GpuGaussianBlur::from(f).into(),
             PreparedFilter::DropShadow(f) => GpuDropShadow::from(f).into(),
-        }
+        })
     }
 }
 
@@ -502,8 +503,8 @@ struct FilterPassBuilder<'a> {
 impl<'a> FilterPassBuilder<'a> {
     fn new(op: FilterOp, texture_size: SizeU16, passes: &'a mut FilterPassPlan) -> Self {
         let sizer = DecimationSizer::new(
-            op.textures.original.rect.width(),
-            op.textures.original.rect.height(),
+            u32::from(op.textures.original.rect.width()),
+            u32::from(op.textures.original.rect.height()),
         );
 
         Self {
@@ -518,20 +519,26 @@ impl<'a> FilterPassBuilder<'a> {
 
     /// Compute and update source and destination sizes based on the pass kind.
     fn apply_pass_dimensions(&mut self, kind: u32) -> (SizeU16, SizeU16) {
+        let size = |w, h| {
+            SizeU16::from_wh(
+                u16::try_from(w).expect("filter width is bounded by its atlas allocation"),
+                u16::try_from(h).expect("filter height is bounded by its atlas allocation"),
+            )
+        };
         match kind {
             pass_kind::DOWNSCALE => {
                 let (sw, sh) = self.sizer.current();
                 let (dw, dh) = self.sizer.downscale();
-                (SizeU16::from_wh(sw, sh), SizeU16::from_wh(dw, dh))
+                (size(sw, sh), size(dw, dh))
             }
             pass_kind::UPSCALE => {
                 let (sw, sh) = self.sizer.current();
                 let (dw, dh) = self.sizer.upscale();
-                (SizeU16::from_wh(sw, sh), SizeU16::from_wh(dw, dh))
+                (size(sw, sh), size(dw, dh))
             }
             _ => {
                 let (w, h) = self.sizer.current();
-                let size = SizeU16::from_wh(w, h);
+                let size = size(w, h);
                 (size, size)
             }
         }
@@ -622,13 +629,13 @@ impl FilterContext {
         self.filters.clear();
     }
 
-    pub(crate) fn push(&mut self, filter_data: &FilterData) -> PreparedGpuFilter {
+    pub(crate) fn push(&mut self, filter_data: &FilterData) -> Option<PreparedGpuFilter> {
+        let prepared = filter_data.prepare_for_layer();
+        let data = GpuFilterData::from_prepared(&prepared)?;
         let data_offset = self.total_texels();
-        let prepared = PreparedFilter::new(&filter_data.filter, &filter_data.transform);
-        let data = GpuFilterData::from(&prepared);
         self.filters.push(data);
 
-        PreparedGpuFilter { data_offset, data }
+        Some(PreparedGpuFilter { data_offset, data })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -723,6 +730,38 @@ mod tests {
             AlphaColor::new([0.0, 0.0, 0.0, 1.0]),
         ))
         .into()
+    }
+
+    #[test]
+    fn placement_only_offset_does_not_allocate_filter_data() {
+        use vello_common::filter_effects::{Filter, FilterPrimitive};
+        use vello_common::kurbo::Affine;
+
+        let mut context = FilterContext::default();
+        let offset = FilterData::new(
+            Filter::from_primitive(FilterPrimitive::Offset {
+                dx: -70_000.0,
+                dy: -0.5,
+            }),
+            Affine::IDENTITY,
+        );
+        assert!(context.push(&offset).is_none());
+        assert!(context.is_empty());
+        assert_eq!(context.required_filter_data_height(1), None);
+
+        let flood = FilterData::new(
+            Filter::from_primitive(FilterPrimitive::Flood {
+                color: AlphaColor::new([1.0, 0.0, 0.0, 1.0]),
+            }),
+            Affine::IDENTITY,
+        );
+        assert_eq!(context.push(&flood).unwrap().data_offset, 0);
+        assert_eq!(context.total_texels(), GpuFilterData::SIZE_TEXELS);
+        assert!(context.push(&offset).is_none());
+        assert_eq!(
+            context.push(&flood).unwrap().data_offset,
+            GpuFilterData::SIZE_TEXELS
+        );
     }
 
     #[test]

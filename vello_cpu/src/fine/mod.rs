@@ -8,12 +8,15 @@
 //! various paint types including solid colors, gradients, images, and blurred rounded rectangles.
 
 mod common;
+#[doc(hidden)]
+pub use common::filter::FilterPaint;
 mod highp;
 mod lowp;
 
 use crate::coarse::depth::DepthBuffer;
 use crate::coarse::{CommandBucketer, RenderCmd, RowState};
 use crate::filter::context::ScratchBuffer;
+use crate::filter::pixmap::FilterPixmap;
 use crate::fine::common::gradient::GradientPainter;
 pub(crate) use crate::fine::common::gradient::calculate_t_vals;
 pub(crate) use crate::fine::common::gradient::linear::SimdLinearKind;
@@ -37,8 +40,7 @@ use vello_common::fearless_simd::{
     Bytes, Simd, SimdBase, SimdFloat, SimdInt, SimdInto, f32x4, f32x8, f32x16, u8x16, u8x32, u32x4,
     u32x8,
 };
-use vello_common::filter_effects::Filter;
-use vello_common::kurbo::Affine;
+use vello_common::filter::PreparedFilter;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, ImageSource, Paint, PremulColor, Tint};
 use vello_common::pixmap::Pixmap;
@@ -62,7 +64,7 @@ const PIXEL_CENTER_OFFSET: f64 = 0.5;
 pub(crate) const COLOR_COMPONENTS: usize = 4;
 
 /// Number of color components in a single column of a tile (height * components).
-pub(crate) const TILE_HEIGHT_COMPONENTS: usize = Tile::HEIGHT as usize * COLOR_COMPONENTS;
+pub(crate) const TILE_HEIGHT_COMPONENTS: usize = Tile::HEIGHT_U32 as usize * COLOR_COMPONENTS;
 
 /// Trait for numeric types used in fine rasterization.
 ///
@@ -253,18 +255,16 @@ pub trait FineKernel<S: Simd>: Send + Sync + 'static {
     /// spatial filters (like blur) that need to access neighboring pixels. The filter
     /// is applied in-place to the provided pixmap.
     ///
-    /// The transform parameter is used to scale filter parameters based on the current
-    /// transformation matrix (e.g., zoom level), ensuring filters look consistent
-    /// regardless of scale.
+    /// The prepared operation already incorporates the transform and any work performed
+    /// by layer placement, such as a pure integer offset.
     #[expect(
         private_interfaces,
         reason = "`FineKernel` is public but this specific method is not needed."
     )]
     fn filter_layer(
-        pixmap: &mut Pixmap,
-        filter: &Filter,
+        pixmap: &mut FilterPixmap,
+        filter: PreparedFilter,
         filter_scratch: &mut ScratchBuffer,
-        transform: Affine,
     );
 
     /// Fill the target buffer with a solid color.
@@ -443,12 +443,13 @@ pub trait FineKernel<S: Simd>: Send + Sync + 'static {
     /// Blend the source into the destination with a specified blend mode.
     ///
     /// Applies advanced blending operations (e.g., multiply, screen, overlay) as specified
-    /// by the blend mode. Optionally applies additional per-pixel alpha values.
+    /// by the blend mode. Optionally applies additional per-pixel alpha values. The start
+    /// coordinates are physical scene coordinates used to sample the mask.
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        start_x: usize,
-        start_y: u16,
+        start_x: i64,
+        start_y: i64,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
         alphas: Option<&[u8]>,
@@ -467,6 +468,15 @@ pub trait FineKernel<S: Simd>: Send + Sync + 'static {
     }
 }
 
+#[inline(always)]
+fn sample_mask(mask: &Mask, x: i64, y: i64) -> u8 {
+    if x >= 0 && x < i64::from(mask.width()) && y >= 0 && y < i64::from(mask.height()) {
+        mask.sample(x as u16, y as u16)
+    } else {
+        0
+    }
+}
+
 pub(crate) fn rasterize_region<S: Simd, T: FineKernel<S>>(
     fine: &mut Fine<S, T>,
     depth: &mut DepthBuffer,
@@ -476,11 +486,12 @@ pub(crate) fn rasterize_region<S: Simd, T: FineKernel<S>>(
     mut target_init: TargetInit<PremulColor>,
     root_is_blend_target: bool,
 ) {
-    let scene_y = region.row_idx as u16 * Tile::HEIGHT;
+    let scene_y = region.row_idx as u32 * Tile::HEIGHT_U32;
     let row = &bucketer.rows()[region.row_idx];
     let span = Span::new(0, region.width()).tile_aligned();
 
     fine.set_row_y(scene_y);
+    fine.mask_offset = bucketer.mask_offset();
     depth.clear();
 
     let has_cmds = !row.depth_cmds.is_empty() || !row.render_cmds.is_empty();
@@ -545,9 +556,11 @@ pub struct Fine<S: Simd, T: FineKernel<S>> {
     /// Buffer for storing gradient interpolation parameters (t values).
     f32_buf: Vec<f32>,
     /// The current strip row y-coordinate in scene/filter coordinates.
-    row_y: u16,
+    row_y: u32,
     /// The origin of the current target we are rendering into.
-    origin: (u16, u16),
+    origin: (u32, u32),
+    /// Translation from target-local coordinates to the physical root mask.
+    mask_offset: (i64, i64),
 }
 
 impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
@@ -557,14 +570,16 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     #[doc(hidden)]
     pub fn new(simd: S, buffer_width: usize) -> Self {
         assert!(
-            buffer_width.is_multiple_of(usize::from(Tile::WIDTH)),
+            buffer_width.is_multiple_of(Tile::WIDTH_U32 as usize),
             "fine buffer width must be tile-aligned"
         );
         let buffer_span = TileAlignedSpan::from_tiles(
             0,
-            u16::try_from(buffer_width / usize::from(Tile::WIDTH)).unwrap(),
+            u32::try_from(buffer_width / (Tile::WIDTH_U32 as usize)).unwrap(),
         );
-        let scratch_len = buffer_width * TILE_HEIGHT_COMPONENTS;
+        let scratch_len = buffer_width
+            .checked_mul(TILE_HEIGHT_COMPONENTS)
+            .expect("fine scratch exceeds address space");
         Self {
             simd,
             buffer_span,
@@ -574,14 +589,15 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             f32_buf: Vec::new(),
             row_y: 0,
             origin: (0, 0),
+            mask_offset: (0, 0),
         }
     }
 
-    fn set_row_y(&mut self, row_y: u16) {
+    fn set_row_y(&mut self, row_y: u32) {
         self.row_y = row_y;
     }
 
-    fn set_paint_offset(&mut self, paint_offset: (u16, u16)) {
+    fn set_paint_offset(&mut self, paint_offset: (u32, u32)) {
         self.origin = paint_offset;
     }
 
@@ -676,7 +692,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     /// Writes the current buffer contents to the output row.
     #[doc(hidden)]
     pub fn pack(&self, region: &mut Region<'_>) {
-        let width = usize::from(region.width());
+        let width = region.width() as usize;
         let scratch = self.blend_buffers.last().unwrap();
 
         T::pack(self.simd, scratch, width, region);
@@ -686,9 +702,9 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     ///
     /// This does the opposite of [`Fine::pack`].
     #[doc(hidden)]
-    pub fn unpack(&mut self, scratch_x_start: u16, region: &mut Region<'_>) {
-        let scratch_x = usize::from(scratch_x_start);
-        let width = usize::from(region.width());
+    pub fn unpack(&mut self, scratch_x_start: u32, region: &mut Region<'_>) {
+        let scratch_x = scratch_x_start as usize;
+        let width = region.width() as usize;
         let scratch = self.blend_buffers.last_mut().unwrap();
 
         T::unpack(
@@ -708,7 +724,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         cmd: RenderCmd,
         bucketer: &CommandBucketer,
         row: &RowState,
-        row_y: u16,
+        row_y: u32,
         resources: FineResources<'_>,
         depth: &DepthBuffer,
     ) {
@@ -724,7 +740,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                 let paint_fill = |fine: &mut Self, span: TileAlignedSpan| {
                     let alphas = cmd.alpha_idx().map(|alpha_idx| {
                         let alpha_offset = alpha_idx as usize
-                            + (span.pixel_x() - cmd.span.pixel_x()) * Tile::HEIGHT as usize;
+                            + (span.pixel_x() - cmd.span.pixel_x()) * Tile::HEIGHT_U32 as usize;
                         &alpha_buffer[alpha_offset..]
                     });
 
@@ -755,7 +771,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                 let layer_fill = |fine: &mut Self, span: TileAlignedSpan| {
                     let alphas = cmd.alpha_idx().map(|alpha_idx| {
                         let alpha_offset = alpha_idx as usize
-                            + (span.pixel_x() - cmd.span.pixel_x()) * Tile::HEIGHT as usize;
+                            + (span.pixel_x() - cmd.span.pixel_x()) * Tile::HEIGHT_U32 as usize;
                         &alpha_buffer[alpha_offset..]
                     });
 
@@ -795,29 +811,19 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         );
     }
 
-    fn mask(&mut self, row_y: u16, span: TileAlignedSpan, mask: &Mask) {
+    fn mask(&mut self, row_y: u32, span: TileAlignedSpan, mask: &Mask) {
         let x = span.pixel_x();
         let width = span.pixel_width();
         let target = self.blend_buffers.last_mut().unwrap();
         let target = &mut target[Self::scratch_range(span)];
-        let y = u32::from(row_y) + u32x4::from_slice(self.simd, &[0, 1, 2, 3]);
+        let y = i64::from(row_y) + self.mask_offset.1;
+        let offset_x = self.mask_offset.0;
         let iter = (x..x + width).map(|x| {
-            let x_in_range = x < usize::from(mask.width());
-
-            macro_rules! sample {
-                ($idx:expr) => {
-                    if x_in_range && (y[$idx] as u16) < mask.height() {
-                        mask.sample(u16::try_from(x).unwrap(), y[$idx] as u16)
-                    } else {
-                        0
-                    }
-                };
-            }
-
-            let s1 = sample!(0);
-            let s2 = sample!(1);
-            let s3 = sample!(2);
-            let s4 = sample!(3);
+            let x = x as i64 + offset_x;
+            let s1 = sample_mask(mask, x, y);
+            let s2 = sample_mask(mask, x, y + 1);
+            let s3 = sample_mask(mask, x, y + 2);
+            let s4 = sample_mask(mask, x, y + 3);
 
             let samples = u8x16::from_slice(
                 self.simd,
@@ -833,7 +839,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
 
     fn layer_fill(
         &mut self,
-        row_y: u16,
+        row_y: u32,
         span: TileAlignedSpan,
         blend_mode: BlendMode,
         opacity: f32,
@@ -860,8 +866,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             T::blend(
                 self.simd,
                 target,
-                x,
-                row_y,
+                x as i64 + self.mask_offset.0,
+                i64::from(row_y) + self.mask_offset.1,
                 source
                     .chunks_exact(T::Composite::LENGTH)
                     .map(|s| T::Composite::from_slice(self.simd, s)),
@@ -921,8 +927,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         T::blend(
             simd,
             &mut scratch[Self::scratch_range(span)],
-            x,
-            self.row_y,
+            x as i64 + self.mask_offset.0,
+            i64::from(self.row_y) + self.mask_offset.1,
             iter::repeat(color),
             attrs.blend_mode,
             alphas,
@@ -940,15 +946,17 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     ) {
         let x = span.pixel_x();
         let y = self.row_y;
-        let sample_x = x + usize::from(self.origin.0);
-        let sample_y = y.saturating_add(self.origin.1);
+        let sample_x = x + (self.origin.0 as usize);
+        let sample_y = y
+            .checked_add(self.origin.1)
+            .expect("paint sample row overflow");
         let width = span.pixel_width();
         let len = width * TILE_HEIGHT_COMPONENTS;
         if self.paint_buf.len() < len {
             self.paint_buf.resize(len, T::Numeric::ZERO);
         }
 
-        let t_len = width * Tile::HEIGHT as usize;
+        let t_len = width * Tile::HEIGHT_U32 as usize;
         if self.f32_buf.len() < t_len {
             self.f32_buf.resize(t_len, 0.0);
         }
@@ -957,13 +965,6 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         let start = x * TILE_HEIGHT_COMPONENTS;
         let dest = &mut self.blend_buffers.last_mut().unwrap()[start..start + len];
         let color_buf = &mut self.paint_buf[..len];
-        let encoded_paint = resources
-            .encoded_paints
-            .get(paint_index)
-            .unwrap_or_else(|| {
-                &resources.filter_paints[paint_index - resources.encoded_paints.len()]
-            });
-
         let sampler_x = sample_x as f64 + PIXEL_CENTER_OFFSET;
         let sampler_y = f64::from(sample_y) + PIXEL_CENTER_OFFSET;
         let default_blend = attrs.blend_mode == BlendMode::default();
@@ -991,8 +992,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                         T::blend(
                             simd,
                             dest,
-                            x,
-                            y,
+                            x as i64 + self.mask_offset.0,
+                            i64::from(y) + self.mask_offset.1,
                             color_buf
                                 .chunks_exact(T::Composite::LENGTH)
                                 .map(|s| T::Composite::from_slice(simd, s)),
@@ -1012,6 +1013,16 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             };
         }
 
+        if paint_index >= resources.encoded_paints.len() {
+            let paint = &resources.filter_paints[paint_index - resources.encoded_paints.len()];
+            fill_complex_paint!(
+                true,
+                common::filter::FilterPainter::new(simd, paint, sample_x, sample_y)
+            );
+            return;
+        }
+        let encoded_paint = &resources.encoded_paints[paint_index];
+
         match encoded_paint {
             EncodedPaint::BlurredRoundedRect(rect) => {
                 fill_complex_paint!(
@@ -1025,7 +1036,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                 // the t values on the fly in the iterator. The latter would be faster, but
                 // it would probably increase code size a lot, because the functions for
                 // position calculation need to be inlined for good performance.
-                let t_vals = &mut self.f32_buf[..width * Tile::HEIGHT as usize];
+                let t_vals = &mut self.f32_buf[..width * Tile::HEIGHT_U32 as usize];
 
                 match &gradient.kind {
                     EncodedKind::Linear(kind) => {
@@ -1159,7 +1170,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
 pub struct FineResources<'a> {
     pub alpha_buffers: &'a [&'a [u8]],
     pub encoded_paints: &'a [EncodedPaint],
-    pub filter_paints: &'a [EncodedPaint],
+    pub filter_paints: &'a [FilterPaint],
     pub image_resolver: &'a dyn ImageResolver,
 }
 
@@ -1177,9 +1188,11 @@ impl Debug for FineResources<'_> {
 #[derive(Clone, Copy)]
 pub(crate) struct FineRenderParams {
     /// Scene/filter dimensions before clipping to the destination pixmap.
-    pub(crate) scene_size: (u16, u16),
+    pub(crate) scene_size: (u32, u32),
     /// Destination offset in the target pixmap.
-    pub(crate) target_offset: (u16, u16),
+    pub(crate) target_offset: (u32, u32),
+    /// Cumulative translation applied when recording this filter's source.
+    pub(crate) source_shift: (u32, u32),
 }
 
 /// A trait for objects that can render pixel data into buffers.
@@ -1214,7 +1227,7 @@ pub trait PosExt<S: Simd> {
 impl<S: Simd> PosExt<S> for f32x4<S> {
     #[inline(always)]
     fn splat_pos(simd: S, pos: f32, _: f32, y_advance: f32) -> Self {
-        let columns: [f32; Tile::HEIGHT as usize] = [0.0, 1.0, 2.0, 3.0];
+        let columns: [f32; Tile::HEIGHT_U32 as usize] = [0.0, 1.0, 2.0, 3.0];
         let column_mask: Self = columns.simd_into(simd);
 
         column_mask.mul_add(Self::splat(simd, y_advance), Self::splat(simd, pos))

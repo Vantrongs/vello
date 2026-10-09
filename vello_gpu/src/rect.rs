@@ -3,24 +3,24 @@
 
 //! Helpers for decomposing rectangles used by the rectangle fast path.
 
-use vello_common::geometry::RectU16;
+use vello_common::geometry::RectU32;
 use vello_common::kurbo::Rect;
 
 /// The threshold of the rectangle size after which a rectangle should be split up
 /// into multiple smaller ones.
-const LARGE_RECT_SPLIT_THRESHOLD: u16 = 32;
+const LARGE_RECT_SPLIT_THRESHOLD: u32 = 32;
 
 /// Integer rectangle geometry and its packed fractional edge coverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RectPart {
     /// Pixel-aligned bounds of this rectangle part.
-    pub(crate) rect: RectU16,
+    pub(crate) rect: RectU32,
     /// Packed fractional coverage for the four edges.
     pub(crate) frac: u32,
 }
 
 impl RectPart {
-    pub(crate) fn shift(self, shift: (i32, i32)) -> Self {
+    pub(crate) fn shift(self, shift: (i64, i64)) -> Self {
         Self {
             rect: self.rect.shift(shift),
             ..self
@@ -45,7 +45,7 @@ pub(crate) struct SplitRect {
 
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "recorded rect coordinates are clipped to the u16 viewport domain before packing"
+    reason = "recorded rect coordinates are clipped to the u32 viewport domain before packing"
 )]
 pub(crate) fn split_rect(rect: &Rect) -> SplitRect {
     let sx0 = rect.x0.floor();
@@ -53,11 +53,11 @@ pub(crate) fn split_rect(rect: &Rect) -> SplitRect {
     let sx1 = rect.x1.ceil();
     let sy1 = rect.y1.ceil();
 
-    let x = sx0 as u16;
-    let y = sy0 as u16;
+    let x = sx0 as u32;
+    let y = sy0 as u32;
     // Are guaranteed to be > 0 since we rejected negative rectangles.
-    let width = (sx1 - sx0) as u16;
-    let height = (sy1 - sy0) as u16;
+    let width = (sx1 - sx0) as u32;
+    let height = (sy1 - sy0) as u32;
 
     // Note that `top_frac` and `left_frac` store the actual coverage, while
     // `right_frac` and `bottom_frac` store one minus the coverage. This is on purpose
@@ -77,7 +77,7 @@ pub(crate) fn split_rect(rect: &Rect) -> SplitRect {
     {
         return SplitRect {
             main: RectPart {
-                rect: RectU16::new(x, y, x + width, y + height),
+                rect: RectU32::new(x, y, x + width, y + height),
                 frac: pack_unorm4x8([left_frac, top_frac, right_frac, bottom_frac]),
             },
             top: None,
@@ -93,10 +93,10 @@ pub(crate) fn split_rect(rect: &Rect) -> SplitRect {
     let has_bottom_aa = bottom_frac > 0.0;
     let has_top_strip = has_top_aa || has_left_aa || has_right_aa;
     let has_bottom_strip = has_bottom_aa || has_left_aa || has_right_aa;
-    let left_inset = u16::from(has_left_aa);
-    let right_inset = u16::from(has_right_aa);
-    let top_inset = u16::from(has_top_strip);
-    let bottom_inset = u16::from(has_bottom_strip);
+    let left_inset = u32::from(has_left_aa);
+    let right_inset = u32::from(has_right_aa);
+    let top_inset = u32::from(has_top_strip);
+    let bottom_inset = u32::from(has_bottom_strip);
     let inner_x = x + left_inset;
     let inner_y = y + top_inset;
     // Can't underflow because rectangles have at least `LARGE_RECT_SPLIT_THRESHOLD` in each
@@ -106,7 +106,7 @@ pub(crate) fn split_rect(rect: &Rect) -> SplitRect {
 
     SplitRect {
         main: RectPart {
-            rect: RectU16::new(
+            rect: RectU32::new(
                 inner_x,
                 inner_y,
                 inner_x + inner_width,
@@ -115,19 +115,19 @@ pub(crate) fn split_rect(rect: &Rect) -> SplitRect {
             frac: 0,
         },
         top: has_top_strip.then_some(RectPart {
-            rect: RectU16::new(x, y, x + width, y + 1),
+            rect: RectU32::new(x, y, x + width, y + 1),
             frac: pack_unorm4x8([left_frac, top_frac, right_frac, 0.0]),
         }),
         bottom: has_bottom_strip.then_some(RectPart {
-            rect: RectU16::new(x, y + height - 1, x + width, y + height),
+            rect: RectU32::new(x, y + height - 1, x + width, y + height),
             frac: pack_unorm4x8([left_frac, 0.0, right_frac, bottom_frac]),
         }),
         left: has_left_aa.then_some(RectPart {
-            rect: RectU16::new(x, inner_y, x + 1, inner_y + inner_height),
+            rect: RectU32::new(x, inner_y, x + 1, inner_y + inner_height),
             frac: pack_unorm4x8([left_frac, 0.0, 0.0, 0.0]),
         }),
         right: has_right_aa.then_some(RectPart {
-            rect: RectU16::new(x + width - 1, inner_y, x + width, inner_y + inner_height),
+            rect: RectU32::new(x + width - 1, inner_y, x + width, inner_y + inner_height),
             frac: pack_unorm4x8([0.0, 0.0, right_frac, 0.0]),
         }),
     }
@@ -149,12 +149,12 @@ fn pack_unorm4x8(v: [f32; 4]) -> u32 {
 mod tests {
     use super::{RectPart, SplitRect, pack_unorm4x8, split_rect};
 
-    use vello_common::geometry::RectU16;
+    use vello_common::geometry::RectU32;
     use vello_common::kurbo::Rect;
 
-    fn part(x: u16, y: u16, width: u16, height: u16, frac: [f32; 4]) -> RectPart {
+    fn part(x: u32, y: u32, width: u32, height: u32, frac: [f32; 4]) -> RectPart {
         RectPart {
-            rect: RectU16::new(x, y, x + width, y + height),
+            rect: RectU32::new(x, y, x + width, y + height),
             frac: pack_unorm4x8(frac),
         }
     }

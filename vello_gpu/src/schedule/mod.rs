@@ -144,7 +144,7 @@ use crate::target::{
 use crate::{IntermediateTextureError, RenderError, Scene, blend::BlendStrip};
 use alloc::vec::Vec;
 use vello_common::filter::FilterLayerPlacement;
-use vello_common::geometry::{RectU16, SizeU16};
+use vello_common::geometry::{RectU16, RectU32, SizeU16};
 use vello_common::peniko::BlendMode;
 use vello_common::record::{CommandRecorder, LayerProps, Node, RecordedLayer, RecordedLayerKind};
 use vello_common::strip::visit_strip_fill_segments;
@@ -176,7 +176,7 @@ impl Schedule {
         storage.clear();
 
         let strip_storage = scene.strip_storage.borrow();
-        let scene_bbox = RectU16::new(
+        let scene_bbox = RectU32::new(
             0,
             0,
             scene.recorder.scene_size.width(),
@@ -273,7 +273,7 @@ struct Scheduler<'a, 'p> {
     /// Recorded scene graph and draws being scheduled.
     recorder: &'a CommandRecorder<RecordedDraw>,
     /// Bounds of the root target in scene coordinates.
-    scene_bbox: RectU16,
+    scene_bbox: RectU32,
     /// Strip data referenced by recorded path draws and clips.
     strip_storage: &'a StripStorage,
     /// Destination used for root-level draws.
@@ -294,7 +294,7 @@ impl<'a, 'p> Scheduler<'a, 'p> {
     /// Create a scheduler.
     fn new(
         recorder: &'a CommandRecorder<RecordedDraw>,
-        scene_bbox: RectU16,
+        scene_bbox: RectU32,
         strip_storage: &'a StripStorage,
         root_render_target: RootTarget,
         use_depth_buffer: bool,
@@ -407,7 +407,7 @@ impl<'a, 'p> Scheduler<'a, 'p> {
             // First make sure that the child node is scheduled, in case it exists. Unlike for root
             // layers, we need to make sure to do this _before_ pushing any draws.
             // TODO: Similarly to Vello CPU, flatten this to avoid stack overflows for deep layers
-            let child = self.schedule_child_layer(cmd, layer.sample_placement.dest_bbox, rounds)?;
+            let child = self.schedule_child_layer(cmd, layer.bbox, rounds)?;
 
             // Keep this after `schedule_child_layer`: allocating lazily is what makes traversal
             // bottom-up with respect to memory, while still allowing compatible layers to batch.
@@ -431,7 +431,7 @@ impl<'a, 'p> Scheduler<'a, 'p> {
 
         if let Some(filter) = target.filter {
             let temporary = self.cursor.allocate_layer(LayerAllocationRequest::new(
-                region.texture.rect,
+                region.texture.rect.into(),
                 layer.kind,
                 region.texture.target.texture_parity.opposite(),
             ))?;
@@ -484,7 +484,7 @@ impl<'a, 'p> Scheduler<'a, 'p> {
     fn schedule_child_layer(
         &mut self,
         cmd: &Node,
-        parent_bounds: RectU16,
+        parent_bounds: RectU32,
         rounds: &mut Rounds,
     ) -> Result<Option<PreparedChild<'a>>, RenderError> {
         let Some(layer_id) = cmd.layer else {
@@ -532,15 +532,22 @@ impl<'a, 'p> Scheduler<'a, 'p> {
     }
 
     /// Create an unallocated scheduling view of a recorded layer with the given visible bounds.
-    fn open_layer(&self, layer: &'a RecordedLayer, bbox: RectU16) -> OpenLayer<'a> {
-        let sample_placement = match &layer.kind {
+    fn open_layer(&self, layer: &'a RecordedLayer, bbox: RectU32) -> OpenLayer<'a> {
+        // An empty filter has no source region, including Flood. Its destructive blend still
+        // needs a transparent parent-sized layer, but must not prepare or execute a filter.
+        let kind = if layer.bbox.is_empty() {
+            &REGULAR_LAYER_KIND
+        } else {
+            &layer.kind
+        };
+        let sample_placement = match kind {
             RecordedLayerKind::Regular => LayerSamplePlacement::regular(bbox),
             RecordedLayerKind::Filter { placement, .. } => LayerSamplePlacement::filter(*placement),
         };
 
         OpenLayer {
             cmds: &layer.nodes,
-            kind: &layer.kind,
+            kind,
             texture_parity: self.layer_texture_parity(layer.depth),
             bbox,
             sample_placement,
@@ -667,16 +674,27 @@ impl<'a, 'p> Scheduler<'a, 'p> {
                 tile_bounds,
                 &mut self.storage.buffers.blend_strips,
                 |blend_strips, segment| {
-                    blend_strips.push(BlendStrip::from_fill_segment(
-                        segment.shift(geometry_shift),
-                        Some(segment.alpha_idx / u32::from(Tile::HEIGHT)),
-                    ));
+                    let clipped = segment.shift((0, 0)).intersect(blend_bbox);
+                    if !clipped.is_empty() {
+                        blend_strips.push(BlendStrip::from_fill_segment(
+                            clipped.shift(geometry_shift),
+                            Some(
+                                segment.alpha_idx / u32::from(Tile::HEIGHT) + clipped.x0
+                                    - segment.x0(),
+                            ),
+                            u8::try_from(clipped.y0 - segment.y()).unwrap(),
+                        ));
+                    }
                 },
                 |blend_strips, segment| {
-                    blend_strips.push(BlendStrip::from_fill_segment(
-                        segment.shift(geometry_shift),
-                        None,
-                    ));
+                    let clipped = segment.shift((0, 0)).intersect(blend_bbox);
+                    if !clipped.is_empty() {
+                        blend_strips.push(BlendStrip::from_fill_segment(
+                            clipped.shift(geometry_shift),
+                            None,
+                            0,
+                        ));
+                    }
                 },
             );
 
@@ -803,7 +821,7 @@ impl<'a, 'p> Scheduler<'a, 'p> {
         if layer.target.is_none() {
             let filter = match layer.kind {
                 RecordedLayerKind::Filter { filter_data, .. } => {
-                    Some(self.storage.filter_context.push(filter_data))
+                    self.storage.filter_context.push(filter_data)
                 }
                 RecordedLayerKind::Regular => None,
             };
@@ -863,7 +881,7 @@ struct OpenLayer<'a> {
     /// Texture group into which this layer must be allocated.
     texture_parity: TextureParity,
     /// Bounds that must be rendered into the layer allocation.
-    bbox: RectU16,
+    bbox: RectU32,
     /// Placement used when the completed layer is sampled by its parent.
     sample_placement: LayerSamplePlacement,
     /// Lazily allocated target and its scheduling state.
@@ -874,13 +892,13 @@ struct OpenLayer<'a> {
 #[derive(Debug, Clone, Copy)]
 struct LayerSamplePlacement {
     /// Offset within the rendered layer at which the region sampled by the parent begins.
-    src_offset: (u16, u16),
+    src_offset: (u32, u32),
     /// Bounds where the sampled region is placed in the parent.
-    dest_bbox: RectU16,
+    dest_bbox: RectU32,
 }
 
 impl LayerSamplePlacement {
-    fn regular(bbox: RectU16) -> Self {
+    fn regular(bbox: RectU32) -> Self {
         Self {
             src_offset: (0, 0),
             dest_bbox: bbox,
@@ -895,18 +913,19 @@ impl LayerSamplePlacement {
     }
 
     fn resolve_sample_region(self, allocation: LayerTextureRegion) -> LayerTextureRegion {
-        let x0 = allocation.texture.rect.x0 + self.src_offset.0;
-        let y0 = allocation.texture.rect.y0 + self.src_offset.1;
+        let x0 = u32::from(allocation.texture.rect.x0) + self.src_offset.0;
+        let y0 = u32::from(allocation.texture.rect.y0) + self.src_offset.1;
 
         LayerTextureRegion {
             texture: TextureRegion {
                 target: allocation.texture.target,
-                rect: RectU16::new(
+                rect: RectU16::try_from(RectU32::new(
                     x0,
                     y0,
                     x0 + self.dest_bbox.width(),
                     y0 + self.dest_bbox.height(),
-                ),
+                ))
+                .unwrap(),
             },
             layer_bbox: self.dest_bbox,
         }
@@ -1013,7 +1032,7 @@ struct TargetScheduleState<T: ScheduleTarget> {
 }
 
 impl<T: ScheduleTarget> TargetScheduleState<T> {
-    fn new(target: T, start_round: usize, target_bbox: RectU16, use_depth_buffer: bool) -> Self {
+    fn new(target: T, start_round: usize, target_bbox: RectU32, use_depth_buffer: bool) -> Self {
         Self {
             draw_state: DrawState::new(target, target_bbox, use_depth_buffer),
             ready: SchedulePoint::start(start_round),

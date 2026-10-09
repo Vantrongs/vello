@@ -14,7 +14,7 @@ use crate::kurbo::{
 };
 use crate::{
     flatten::{SQRT_TOL, TOL, TOL_2},
-    geometry::RectU16,
+    geometry::RectU32,
     kurbo::Affine,
     tile::Tile,
 };
@@ -60,7 +60,7 @@ pub(crate) fn flatten<S: Simd>(
     affine: Affine,
     callback: &mut impl Callback,
     flatten_ctx: &mut FlattenCtx,
-    cull_bbox: RectU16,
+    cull_bbox: RectU32,
 ) {
     flatten_ctx.flattened_cubics.clear();
 
@@ -347,10 +347,10 @@ fn emit_cubic<S: Simd>(
 
 /// Left, top, right and bottom of the device area a fill's curves are culled against
 /// (see `flatten`): `cull_bbox` with its top aligned to the strip row.
-fn fill_cull_rect(cull_bbox: RectU16) -> [f64; 4] {
+fn fill_cull_rect(cull_bbox: RectU32) -> [f64; 4] {
     [
         cull_bbox.x0 as f64,
-        ((cull_bbox.y0 / Tile::HEIGHT) * Tile::HEIGHT) as f64,
+        ((cull_bbox.y0 / Tile::HEIGHT_U32) * Tile::HEIGHT_U32) as f64,
         cull_bbox.x1 as f64,
         cull_bbox.y1 as f64,
     ]
@@ -363,7 +363,11 @@ fn fill_cull_rect(cull_bbox: RectU16) -> [f64; 4] {
 /// This is used for flattening curves.
 fn approx_parabola_integral(x: f64) -> f64 {
     const D: f64 = 0.67;
-    x / (1.0 - D + (D.powi(4) + 0.25 * x * x).sqrt().sqrt())
+    #[cfg(feature = "std")]
+    let d4 = D.powi(4);
+    #[cfg(not(feature = "std"))]
+    let d4 = crate::kurbo::common::FloatFuncs::powi(D, 4);
+    x / (1.0 - D + (d4 + 0.25 * x * x).sqrt().sqrt())
 }
 
 /// An approximation to the inverse parabola integral.

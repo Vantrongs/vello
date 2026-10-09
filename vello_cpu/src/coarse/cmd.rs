@@ -119,7 +119,7 @@ pub struct PaintFillAttrs {
     pub draw_id: u32,
     pub thread_idx: u8,
     /// See the comment in `CommandBucketer::bucket_commands`.
-    pub origin: (u16, u16),
+    pub origin: (u32, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn render_cmd_assertions() {
-        assert_eq!(size_of::<RenderCmd>(), 16);
+        assert_eq!(size_of::<RenderCmd>(), 20);
         assert!(!needs_drop::<RenderCmd>());
     }
 }

@@ -162,9 +162,8 @@ fn binding_case() -> ScheduledCase {
     case.layer_with(
         None,
         Some(BlendMode::new(Mix::Multiply, Compose::SrcOver)),
-        Some(Filter::from_primitive(FilterPrimitive::Offset {
-            dx: 0.0,
-            dy: 0.0,
+        Some(Filter::from_primitive(FilterPrimitive::Flood {
+            color: Color::WHITE,
         })),
         |case| case.draw(Rect::new(0.0, 0.0, 60.0, 60.0), 0.5),
     );
@@ -180,8 +179,10 @@ fn sibling_case(count: u16) -> SceneCase {
     case
 }
 
-fn offset_filter() -> Filter {
-    Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 })
+fn pixel_filter() -> Filter {
+    Filter::from_primitive(FilterPrimitive::Flood {
+        color: Color::WHITE,
+    })
 }
 
 fn filter_page_size() -> SizeU16 {
@@ -312,9 +313,8 @@ fn clipped_away_blend() {
         case.layer_with(
             Some(Rect::new(24.0, 0.0, 32.0, 8.0)),
             Some(BlendMode::new(Mix::Multiply, Compose::SrcOver)),
-            Some(Filter::from_primitive(FilterPrimitive::Offset {
-                dx: 0.0,
-                dy: 0.0,
+            Some(Filter::from_primitive(FilterPrimitive::Flood {
+                color: Color::WHITE,
             })),
             |case| case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5),
         );
@@ -338,7 +338,7 @@ fn clipped_away_filtered_blend_under_atlas_pressure() {
         case.layer_with(
             Some(Rect::new(8.0, 0.0, 16.0, 8.0)),
             Some(BlendMode::new(Mix::Multiply, Compose::SrcOver)),
-            Some(offset_filter()),
+            Some(pixel_filter()),
             |case| case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5),
         );
     });
@@ -747,7 +747,7 @@ fn layer_clip() {
 }
 
 #[test]
-fn filter_layer() {
+fn offset_layer_uses_placement_without_a_filter_pass() {
     let mut case = SceneCase::new(64, 16);
     let clip = Rect::new(16.0, 0.0, 24.0, 8.0);
     let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 8.0, dy: 0.0 });
@@ -760,12 +760,12 @@ fn filter_layer() {
         .unwrap();
     let rounds_view = scheduled.views();
 
-    assert_eq!(scheduled.page_counts(), [1, 1]);
+    assert_eq!(scheduled.page_counts(), [0, 1]);
     assert_eq!(rounds_view.len(), 1);
     assert_eq!(rounds_view[0].odd.x.len(), 1);
-    assert_eq!(rounds_view[0].filter_passes, [0, 1]);
+    assert_eq!(rounds_view[0].filter_passes, [0, 0]);
     assert!(rounds_view[0].root.has_child_layer);
-    assert_eq!(scheduled.total_clears(), 2);
+    assert_eq!(scheduled.total_clears(), 1);
 }
 
 #[test]
@@ -794,7 +794,7 @@ fn drop_shadow_only_uses_two_layer_textures() {
 fn filter_round_resolving() {
     let mut case = SceneCase::new(8, 8);
 
-    case.layer_with(None, None, Some(offset_filter()), |case| {
+    case.layer_with(None, None, Some(pixel_filter()), |case| {
         case.layer(|case| case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5));
     });
 
@@ -837,7 +837,7 @@ fn filter_siblings() {
     let mut case = SceneCase::new(8, 8);
 
     for _ in 0..2 {
-        case.layer_with(None, None, Some(offset_filter()), |case| {
+        case.layer_with(None, None, Some(pixel_filter()), |case| {
             case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5);
         });
     }
@@ -868,9 +868,8 @@ fn storage_reuse() {
         case.layer_with(
             None,
             None,
-            Some(Filter::from_primitive(FilterPrimitive::Offset {
-                dx: 4.0,
-                dy: 0.0,
+            Some(Filter::from_primitive(FilterPrimitive::Flood {
+                color: Color::WHITE,
             })),
             |case| case.draw(Rect::new(32.0, 0.0, 40.0, 8.0), 0.5),
         );

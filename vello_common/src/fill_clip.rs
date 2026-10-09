@@ -467,7 +467,7 @@ mod tests {
     fn checked(c: CubicBez) -> usize {
         let mut out = CheckedOutput { at: c.p0, lines: 0 };
         let mut ctx = FlattenCtx::default();
-        dispatch!(Level::new(), simd => flatten_seg(
+        dispatch!(Level::try_detect().unwrap_or(Level::baseline()), simd => flatten_seg(
             simd, PathSeg::Cubic(c), [0.0, 0.0, 100.0, 100.0], &mut out, &mut ctx
         ));
         out.lines

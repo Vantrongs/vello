@@ -10,7 +10,7 @@ use vello_cpu::Level;
 
 fn run_tile_benchmark<const SHIFT: bool, F>(c: &mut Criterion, group_name: &str, mut op: F)
 where
-    F: FnMut(&mut Tiles, &[Line], u16, u16),
+    F: FnMut(&mut Tiles, &[Line], u32, u32),
 {
     let mut g = c.benchmark_group(group_name);
     g.sample_size(50);
@@ -24,8 +24,8 @@ where
 
         g.bench_with_input(BenchmarkId::from_parameter(&item.name), &item, |b, item| {
             b.iter(|| {
-                let mut tiler = Tiles::new(Level::new(), item.width, item.height);
-                op(&mut tiler, &lines, item.width, item.height);
+                let mut tiler = Tiles::new(Level::new(), item.width.into(), item.height.into());
+                op(&mut tiler, &lines, item.width.into(), item.height.into());
             });
         });
     }

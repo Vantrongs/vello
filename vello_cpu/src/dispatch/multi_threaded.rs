@@ -12,7 +12,7 @@ use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_r
 use crate::kurbo::{Affine, BezPath, PathEl, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
 use crate::record::RecordedFill;
-use crate::region::Regions;
+use crate::region::{RasterTarget, Regions};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -29,7 +29,7 @@ use vello_common::clip::{ClipContext, ClipShape};
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd, dispatch};
 use vello_common::filter::FilterData;
-use vello_common::geometry::RectU16;
+use vello_common::geometry::RectU32;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint, PremulColor};
 use vello_common::pixmap::PixmapMut;
@@ -139,7 +139,10 @@ impl MultiThreadedDispatcher {
         let flushed = true;
 
         Self {
-            bucketer: Mutex::new(CommandBucketer::from_wh(width, height)),
+            bucketer: Mutex::new(CommandBucketer::from_wh(
+                u32::from(width),
+                u32::from(height),
+            )),
             thread_pool,
             allocations: Allocations::default(),
             allocation_group: AllocationGroup::default(),
@@ -151,7 +154,7 @@ impl MultiThreadedDispatcher {
             recorder: CommandRecorder::new(width, height),
             task_sender: None,
             recorded_command_receiver: None,
-            strip_generator: StripGenerator::new(width, height, level),
+            strip_generator: StripGenerator::new(u32::from(width), u32::from(height), level),
             strip_storage: StripStorage::new(GenerationMode::Append),
             level,
             alpha_storage,
@@ -402,7 +405,10 @@ impl MultiThreadedDispatcher {
     ) {
         let mut bucketer = self.bucketer.lock().unwrap();
         let filters = FilterContext::new(0);
-        bucketer.reset(RectU16::new(0, 0, scene_width, scene_height));
+        bucketer.reset(
+            RectU32::new(0, 0, u32::from(scene_width), u32::from(scene_height)),
+            (0, 0),
+        );
         let target_init = settings.target_init.map(PremulColor::from_alpha_color);
         bucketer.bucket_commands(
             &self.recorder.nodes,
@@ -423,12 +429,14 @@ impl MultiThreadedDispatcher {
                 image_resolver,
             };
             let params = FineRenderParams {
-                scene_size: (scene_width, scene_height),
-                target_offset: settings.offset,
+                scene_size: (u32::from(scene_width), u32::from(scene_height)),
+                target_offset: (u32::from(settings.offset.0), u32::from(settings.offset.1)),
+                source_shift: (0, 0),
             };
 
+            let mut raster_target = RasterTarget::from_pixmap(&mut target);
             let mut regions = Regions::new(
-                &mut target,
+                &mut raster_target,
                 params.scene_size,
                 params.target_offset,
                 bucketer.rows().len(),
@@ -478,9 +486,10 @@ impl Dispatcher for MultiThreadedDispatcher {
         aliasing_threshold: Option<u8>,
         mask: Option<Mask>,
     ) {
-        let start = self.allocation_group.path.len() as u32;
+        let start =
+            u32::try_from(self.allocation_group.path.len()).expect("path range exceeds u32");
         self.allocation_group.path.extend(path);
-        let end = self.allocation_group.path.len() as u32;
+        let end = u32::try_from(self.allocation_group.path.len()).expect("path range exceeds u32");
         self.register_task(RenderTaskType::FillPath {
             path_range: start..end,
             transform,
@@ -502,9 +511,10 @@ impl Dispatcher for MultiThreadedDispatcher {
         aliasing_threshold: Option<u8>,
         mask: Option<Mask>,
     ) {
-        let start = self.allocation_group.path.len() as u32;
+        let start =
+            u32::try_from(self.allocation_group.path.len()).expect("path range exceeds u32");
         self.allocation_group.path.extend(path);
-        let end = self.allocation_group.path.len() as u32;
+        let end = u32::try_from(self.allocation_group.path.len()).expect("path range exceeds u32");
         self.register_task(RenderTaskType::StrokePath {
             path_range: start..end,
             transform,
@@ -550,9 +560,11 @@ impl Dispatcher for MultiThreadedDispatcher {
         }
 
         let clip_path = clip_path.map(|c| {
-            let start = self.allocation_group.path.len() as u32;
+            let start =
+                u32::try_from(self.allocation_group.path.len()).expect("path range exceeds u32");
             self.allocation_group.path.extend(c);
-            let end = self.allocation_group.path.len() as u32;
+            let end =
+                u32::try_from(self.allocation_group.path.len()).expect("path range exceeds u32");
 
             (start..end, clip_transform)
         });
@@ -589,7 +601,8 @@ impl Dispatcher for MultiThreadedDispatcher {
         self.layer_depth = 0;
         self.task_sender = None;
         self.recorded_command_receiver = None;
-        self.strip_generator.reset(width, height);
+        self.strip_generator
+            .reset(u32::from(width), u32::from(height));
         self.alpha_storage.with_inner(|alphas| {
             for alpha in alphas {
                 alpha.clear();
@@ -740,8 +753,8 @@ pub(crate) struct OwnedClip {
     /// A coarse bounding box of the clip path in pixel coordinates.
     ///
     /// These bounds have already been intersected with the viewport.
-    bbox: RectU16,
-    opaque_bbox: Option<RectU16>,
+    bbox: RectU32,
+    opaque_bbox: Option<RectU32>,
     /// The known geometric shape of this clip.
     shape: ClipShape,
 }
@@ -892,7 +905,7 @@ pub(crate) enum RecordedCommand {
     PushLayer {
         thread_id: u8,
         clip_path: Option<Range<u32>>,
-        clip_bbox: Option<RectU16>,
+        clip_bbox: Option<RectU32>,
         blend_mode: BlendMode,
         mask: Option<Mask>,
         opacity: f32,

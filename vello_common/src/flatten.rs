@@ -5,7 +5,7 @@
 
 use crate::cull::{Cull, SplitHuge};
 use crate::flatten_simd::{Callback, LinePathEl};
-use crate::geometry::RectU16;
+use crate::geometry::RectU32;
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
 use crate::kurbo::{self, Affine, PathEl, Stroke, StrokeCtx, StrokeOpts};
@@ -185,7 +185,7 @@ pub fn fill(
     affine: Affine,
     line_buf: &mut Vec<Line>,
     ctx: &mut FlattenCtx,
-    cull_bbox: RectU16,
+    cull_bbox: RectU32,
 ) {
     dispatch!(level, simd => fill_impl(simd, path, affine, line_buf, ctx, cull_bbox));
 }
@@ -200,7 +200,7 @@ pub fn fill_impl<S: Simd>(
     affine: Affine,
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
-    cull_bbox: RectU16,
+    cull_bbox: RectU32,
 ) {
     line_buf.clear();
     let mut lb = FlattenerCallback {
@@ -231,7 +231,7 @@ pub fn stroke(
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
     stroke_ctx: &mut StrokeCtx,
-    cull_bbox: RectU16,
+    cull_bbox: RectU32,
 ) {
     let scale = max_scale(affine);
     if scale.is_nan() || scale <= 0.0 {
@@ -292,7 +292,7 @@ pub const HAIRLINE_MAX_WIDTH: f64 = 1.0;
 /// pixels: half the width times the miter limit for miter joins, else times √2 (square
 /// caps; the hairline joins that take the miter tip turn by at most 90°), plus a pixel
 /// for the flattening tolerance.
-fn stroke_cull_rect(cull_bbox: RectU16, style: &Stroke, scale: f64) -> [f64; 4] {
+pub(crate) fn stroke_cull_rect(cull_bbox: RectU32, style: &Stroke, scale: f64) -> [f64; 4] {
     let miter = if style.join == kurbo::Join::Miter {
         style.miter_limit
     } else {
@@ -344,7 +344,7 @@ fn hairline(
     scale: f64,
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
-    cull_bbox: RectU16,
+    cull_bbox: RectU32,
     cull: Cull,
 ) {
     line_buf.clear();
@@ -641,7 +641,7 @@ impl Callback for FlattenerCallback<'_> {
 mod hairline_tests {
     use super::*;
 
-    fn lines(path: &kurbo::BezPath, style: &Stroke, affine: Affine, cull: RectU16) -> Vec<Line> {
+    fn lines(path: &kurbo::BezPath, style: &Stroke, affine: Affine, cull: RectU32) -> Vec<Line> {
         let mut buf = Vec::new();
         let scale = max_scale(affine);
         hairline(
@@ -664,7 +664,7 @@ mod hairline_tests {
         )
     }
 
-    const VIEW: RectU16 = RectU16 {
+    const VIEW: RectU32 = RectU32 {
         x0: 0,
         y0: 0,
         x1: 100,
@@ -804,7 +804,7 @@ mod hairline_tests {
         p.line_to((20.0, 10.0));
         let mut buf = Vec::new();
         stroke(
-            Level::new(),
+            Level::try_detect().unwrap_or(Level::baseline()),
             p.iter(),
             &Stroke::new(4.0),
             Affine::IDENTITY,

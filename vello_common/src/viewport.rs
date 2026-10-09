@@ -23,7 +23,7 @@ pub struct ViewportState {
 
 impl ViewportState {
     /// Create a new viewport state.
-    pub fn new(width: u16, height: u16, level: Level) -> Self {
+    pub fn new(width: u32, height: u32, level: Level) -> Self {
         Self {
             clip_state: ClipState::new(),
             strip_generator: StripGenerator::new(width, height, level),
@@ -33,12 +33,12 @@ impl ViewportState {
     }
 
     /// Width of the active viewport.
-    pub fn width(&self) -> u16 {
+    pub fn width(&self) -> u32 {
         self.strip_generator.width()
     }
 
     /// Height of the active viewport.
-    pub fn height(&self) -> u16 {
+    pub fn height(&self) -> u32 {
         self.strip_generator.height()
     }
 
@@ -114,7 +114,7 @@ impl ViewportState {
     }
 
     /// Reset strip generation and clipping for a new viewport.
-    pub fn reset(&mut self, width: u16, height: u16) {
+    pub fn reset(&mut self, width: u32, height: u32) {
         self.clip_state.reset();
         self.strip_generator_stack.clear();
         self.strip_generator.reset(width, height);

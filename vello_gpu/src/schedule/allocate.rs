@@ -6,7 +6,7 @@
 use crate::filter::FILTER_ATLAS_PADDING;
 use crate::target::{LayerTextureId, TextureParity, TextureRegion};
 use alloc::vec::Vec;
-use vello_common::geometry::{RectU16, SizeU16};
+use vello_common::geometry::{RectU16, RectU32, SizeU16, SizeU32};
 use vello_common::multi_atlas::{AllocId, Atlas, AtlasId};
 use vello_common::record::RecordedLayerKind;
 use vello_common::tile::Tile;
@@ -111,7 +111,7 @@ pub(super) struct LayerAllocationRequest {
 
 impl LayerAllocationRequest {
     pub(super) fn new(
-        bbox: RectU16,
+        bbox: RectU32,
         kind: &RecordedLayerKind,
         texture_parity: TextureParity,
     ) -> Self {
@@ -124,7 +124,7 @@ impl LayerAllocationRequest {
         };
 
         let region = RegionProps {
-            size: SizeU16::from_wh(bbox.width(), bbox.height()),
+            size: SizeU32::from_wh(bbox.width(), bbox.height()),
             padding,
         };
 
@@ -134,7 +134,7 @@ impl LayerAllocationRequest {
         }
     }
 
-    pub(super) fn allocation_size(self) -> (u32, u32) {
+    pub(super) fn allocation_size(self) -> (u64, u64) {
         self.region.allocation_size()
     }
 }
@@ -143,24 +143,24 @@ impl LayerAllocationRequest {
 #[derive(Debug, Clone, Copy)]
 struct RegionProps {
     /// Size of the usable region.
-    size: SizeU16,
+    size: SizeU32,
     /// Transparent padding reserved around the usable region.
     padding: u16,
 }
 
 impl RegionProps {
     /// Size of the atlas allocation needed to hold the region and its padding.
-    fn allocation_size(self) -> (u32, u32) {
+    fn allocation_size(self) -> (u64, u64) {
         let (width, height) = tile_covered_size(self.size);
-        let padding = u32::from(self.padding) * 2;
+        let padding = u64::from(self.padding) * 2;
         (width + padding, height + padding)
     }
 }
 
-fn tile_covered_size(size: SizeU16) -> (u32, u32) {
+fn tile_covered_size(size: SizeU32) -> (u64, u64) {
     (
-        u32::from(size.width()).next_multiple_of(u32::from(Tile::WIDTH)),
-        u32::from(size.height()).next_multiple_of(u32::from(Tile::HEIGHT)),
+        u64::from(size.width()).next_multiple_of(u64::from(Tile::WIDTH)),
+        u64::from(size.height()).next_multiple_of(u64::from(Tile::HEIGHT)),
     )
 }
 
@@ -189,14 +189,17 @@ impl AllocatedTextureRegion {
         // end inside a tile. Clear their entire footprint before atlas reuse.
         // The separate filter halo is never drawn into and stays transparent.
         let rect = self.region.rect;
-        let (width, height) = tile_covered_size(rect.into());
+        let (width, height) = tile_covered_size(SizeU32::from_wh(
+            u32::from(rect.width()),
+            u32::from(rect.height()),
+        ));
         TextureRegion {
             target: self.region.target,
             rect: RectU16::new(
                 rect.x0,
                 rect.y0,
-                u16::try_from(u32::from(rect.x0) + width).unwrap(),
-                u16::try_from(u32::from(rect.y0) + height).unwrap(),
+                u16::try_from(u64::from(rect.x0) + width).unwrap(),
+                u16::try_from(u64::from(rect.y0) + height).unwrap(),
             ),
         }
     }
@@ -229,8 +232,8 @@ impl AtlasExt for Atlas {
         props: RegionProps,
     ) -> Option<AllocatedTextureRegion> {
         let padding = props.padding;
-        let width = props.size.width();
-        let height = props.size.height();
+        let width = u16::try_from(props.size.width()).ok()?;
+        let height = u16::try_from(props.size.height()).ok()?;
         let (allocation_width, allocation_height) = props.allocation_size();
         let allocation = self.allocate(
             u16::try_from(allocation_width).ok()?,
@@ -270,7 +273,7 @@ mod tests {
     use alloc::vec::Vec;
     use vello_common::filter::{FilterData, FilterLayerPlacement};
     use vello_common::filter_effects::{Filter, FilterPrimitive};
-    use vello_common::geometry::{RectU16, SizeU16};
+    use vello_common::geometry::{RectU16, RectU32, SizeU16, SizeU32};
     use vello_common::kurbo::Affine;
     use vello_common::multi_atlas::{Atlas, AtlasId};
     use vello_common::record::RecordedLayerKind;
@@ -279,8 +282,8 @@ mod tests {
     #[test]
     fn partial_physical_bounds_reserve_and_clear_every_emitted_tile() {
         for bbox in [
-            RectU16::new(0, 0, 13, 7),
-            RectU16::new(65532, 65532, 65535, 65535),
+            RectU32::new(0, 0, 13, 7),
+            RectU32::new(131068, 196604, 131071, 196607),
         ] {
             for padding in [0, FILTER_ATLAS_PADDING] {
                 let props = RegionProps {
@@ -292,10 +295,10 @@ mod tests {
                 let allocation = atlas.allocate_region(target, props).unwrap();
                 let neighbor = atlas.allocate_region(target, props).unwrap();
                 let clear = allocation.clear_region().rect;
-                assert_eq!(allocation.region.rect.width(), bbox.width());
-                assert_eq!(allocation.region.rect.height(), bbox.height());
-                assert_eq!(clear.width(), bbox.width().next_multiple_of(4));
-                assert_eq!(clear.height(), bbox.height().next_multiple_of(4));
+                assert_eq!(u32::from(allocation.region.rect.width()), bbox.width());
+                assert_eq!(u32::from(allocation.region.rect.height()), bbox.height());
+                assert_eq!(u32::from(clear.width()), bbox.width().next_multiple_of(4));
+                assert_eq!(u32::from(clear.height()), bbox.height().next_multiple_of(4));
                 assert!(clear.intersect(neighbor.allocation_region()).is_empty());
                 let region = LayerTextureRegion {
                     texture: allocation.region,
@@ -320,7 +323,7 @@ mod tests {
                 assert!(!quads.is_empty());
                 for quad in quads {
                     assert_eq!(
-                        quad.intersect(clear),
+                        quad.intersect(clear.into()),
                         quad,
                         "emitted quad must be reserved and cleared"
                     );
@@ -349,17 +352,20 @@ mod tests {
     ) -> LayerAllocationRequest {
         LayerAllocationRequest {
             texture_parity,
-            region: RegionProps { size, padding },
+            region: RegionProps {
+                size: size.into(),
+                padding,
+            },
         }
     }
 
     #[test]
     fn layer_requests() {
-        let bbox = RectU16::new(4, 8, 20, 32);
+        let bbox = RectU32::new(4, 8, 20, 32);
         let regular_kind = RecordedLayerKind::Regular;
         let regular = LayerAllocationRequest::new(bbox, &regular_kind, TextureParity::Odd);
         assert_eq!(regular.texture_parity, TextureParity::Odd);
-        assert_eq!(regular.region.size, SizeU16::from_wh(16, 24));
+        assert_eq!(regular.region.size, SizeU32::from_wh(16, 24));
         assert_eq!(regular.region.padding, 0);
 
         let filter_kind = RecordedLayerKind::Filter {
@@ -371,16 +377,16 @@ mod tests {
         };
         let filter = LayerAllocationRequest::new(bbox, &filter_kind, TextureParity::Odd);
         assert_eq!(filter.texture_parity, TextureParity::Odd);
-        assert_eq!(filter.region.size, SizeU16::from_wh(16, 24));
+        assert_eq!(filter.region.size, SizeU32::from_wh(16, 24));
         assert_eq!(filter.region.padding, FILTER_ATLAS_PADDING);
 
         let temporary = LayerAllocationRequest::new(
-            RectU16::new(10, 20, 42, 68),
+            RectU32::new(10, 20, 42, 68),
             &filter_kind,
             TextureParity::Even,
         );
         assert_eq!(temporary.texture_parity, TextureParity::Even);
-        assert_eq!(temporary.region.size, SizeU16::from_wh(32, 48));
+        assert_eq!(temporary.region.size, SizeU32::from_wh(32, 48));
         assert_eq!(temporary.region.padding, FILTER_ATLAS_PADDING);
     }
 
@@ -453,7 +459,7 @@ mod tests {
         let mut atlas = Atlas::new(AtlasId::new(0), 10, 10);
         let target = LayerTextureId::new(TextureParity::Even, 0);
         let request = RegionProps {
-            size: SizeU16::new(6),
+            size: SizeU32::new(6),
             padding: 1,
         };
 
@@ -478,7 +484,7 @@ mod tests {
                 .allocate_region(
                     target,
                     RegionProps {
-                        size: SizeU16::from_wh(9, 8),
+                        size: SizeU32::from_wh(9, 8),
                         padding: 0,
                     },
                 )
@@ -489,7 +495,7 @@ mod tests {
                 .allocate_region(
                     target,
                     RegionProps {
-                        size: SizeU16::new(8),
+                        size: SizeU32::new(8),
                         padding: 1,
                     },
                 )

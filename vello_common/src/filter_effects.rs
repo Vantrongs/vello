@@ -650,8 +650,14 @@ impl FilterPrimitive {
 }
 
 fn blur_radius(std_deviation: f32) -> f64 {
-    // Gaussian blur expands uniformly by 3*sigma (covers 99.7% of distribution)
-    f64::from(std_deviation * 3.0)
+    // Keep ordinary f32 rounding, but do not lose a finite user-space radius
+    // before a small transform can bring it into the device coordinate domain.
+    let radius = std_deviation * 3.0;
+    if radius.is_finite() {
+        f64::from(radius)
+    } else {
+        f64::from(std_deviation) * 3.0
+    }
 }
 
 #[cfg(test)]
@@ -660,6 +666,27 @@ mod expansion_tests {
     use crate::color::palette::css::RED;
     use crate::filter_effects::EdgeMode;
     use crate::kurbo::Rect;
+
+    #[test]
+    fn finite_blur_radius_survives_before_a_small_device_transform() {
+        let filter = super::Filter::from_primitive(FilterPrimitive::GaussianBlur {
+            std_deviation: f32::MAX,
+            edge_mode: EdgeMode::None,
+        });
+        let bounds = filter.filter_expansion(&crate::kurbo::Affine::scale(1.0e-38));
+        let radius = f64::from(f32::MAX) * 3.0 * 1.0e-38;
+        for (actual, expected) in [
+            (bounds.x0, -radius),
+            (bounds.y0, -radius),
+            (bounds.x1, radius),
+            (bounds.y1, radius),
+        ] {
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "finite physical radius {radius} became {bounds:?}"
+            );
+        }
+    }
 
     #[test]
     fn offset_expands_in_direction_of_shift() {

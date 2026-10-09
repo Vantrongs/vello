@@ -8,7 +8,7 @@ use crate::schedule::round::BlendOp;
 use crate::target::TextureParity;
 use crate::util::{pack_opacity, pack_u16_pair};
 use bytemuck::{Pod, Zeroable};
-use vello_common::geometry::{RectU16, SizeU16};
+use vello_common::geometry::{RectU16, RectU32, SizeU16};
 use vello_common::peniko::{Compose, Mix};
 
 /// Per-instance data for one blend pass.
@@ -29,7 +29,7 @@ pub(crate) struct GpuBlendInstance {
     pub(crate) child_parent_origin: u32,
     /// Scene-space width and height of the sampled child layer, packed as `u16x2`.
     pub(crate) child_rect_size: u32,
-    /// Packed blend mode, opacity, parent/child texture indices, and alpha-presence flag.
+    /// Packed blend mode, opacity, texture indices, alpha-presence flag, and first alpha row.
     pub(crate) blend_config: u32,
 }
 
@@ -47,10 +47,12 @@ impl GpuBlendInstance {
             || BlendGeometry {
                 rect: parent_rect,
                 alpha_col_idx: None,
+                alpha_row: 0,
             },
             |strip| BlendGeometry {
                 rect: strip.rect,
                 alpha_col_idx: strip.alpha_col_idx,
+                alpha_row: strip.alpha_row,
             },
         );
 
@@ -68,17 +70,18 @@ impl GpuBlendInstance {
             ),
             child_parent_origin: pack_u16_pair(child_parent_rect.x0, child_parent_rect.y0),
             child_rect_size: pack_u16_pair(
-                blend.child_region.layer_bbox.width(),
-                blend.child_region.layer_bbox.height(),
+                blend.child_region.texture.rect.width(),
+                blend.child_region.texture.rect.height(),
             ),
-            blend_config: pack_blend_config(
-                blend.blend_mode.mix,
-                blend.blend_mode.compose,
-                blend.opacity,
-                blend.parent_region.texture.target.texture_parity,
-                blend.child_region.texture.target.texture_parity,
-                geometry.alpha_col_idx.is_some(),
-            ),
+            blend_config: (u32::from(geometry.alpha_row) << 27)
+                | pack_blend_config(
+                    blend.blend_mode.mix,
+                    blend.blend_mode.compose,
+                    blend.opacity,
+                    blend.parent_region.texture.target.texture_parity,
+                    blend.child_region.texture.target.texture_parity,
+                    geometry.alpha_col_idx.is_some(),
+                ),
         }
     }
 
@@ -102,13 +105,20 @@ pub(crate) struct BlendStrip {
     rect: RectU16,
     /// Alpha texture column index, or `None` for a plain fill segment.
     alpha_col_idx: Option<u32>,
+    /// First sampled row within the original four-row alpha strip.
+    alpha_row: u8,
 }
 
 impl BlendStrip {
-    pub(crate) fn from_fill_segment(rect: RectU16, alpha_col_idx: Option<u32>) -> Self {
+    pub(crate) fn from_fill_segment(
+        rect: RectU32,
+        alpha_col_idx: Option<u32>,
+        alpha_row: u8,
+    ) -> Self {
         Self {
-            rect,
+            rect: RectU16::try_from(rect).unwrap(),
             alpha_col_idx,
+            alpha_row,
         }
     }
 }
@@ -123,6 +133,8 @@ struct BlendGeometry {
     rect: RectU16,
     /// Alpha texture column used by clipped strip geometry, if present.
     alpha_col_idx: Option<u32>,
+    /// First sampled row within the original four-row alpha strip.
+    alpha_row: u8,
 }
 
 fn pack_blend_config(

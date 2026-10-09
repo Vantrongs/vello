@@ -91,8 +91,13 @@ pub fn render_strips_cull(c: &mut Criterion) {
 
         let shifted_lines = shift_lines_50_percent(&item.lines());
 
-        let mut tiler = Tiles::new(simd_level, item.width, item.height);
-        tiler.make_tiles_analytic_aa(simd_level, &shifted_lines, item.width, item.height);
+        let mut tiler = Tiles::new(simd_level, item.width.into(), item.height.into());
+        tiler.make_tiles_analytic_aa(
+            simd_level,
+            &shifted_lines,
+            item.width.into(),
+            item.height.into(),
+        );
         tiler.sort_tiles();
 
         g_cull.bench_function(item.name.clone().to_string(), |b| {
@@ -125,7 +130,7 @@ pub fn render_rect(c: &mut Criterion) {
 
     let level = Level::new();
 
-    for (name, size) in [("small", 20_u16), ("medium", 300), ("large", 1200)] {
+    for (name, size) in [("small", 20_u32), ("medium", 300), ("large", 1200)] {
         if name == "medium" && !crate::EXTENDED {
             continue;
         }

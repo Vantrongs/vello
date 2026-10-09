@@ -78,7 +78,7 @@ fn strip_single<S: Simd, N: FineKernel<S>>(
 
     b.iter(|| {
         fine.paint_fill(
-            TileAlignedSpan::try_from(Span::new(0, width)).unwrap(),
+            TileAlignedSpan::try_from(Span::new(0, u32::from(width))).unwrap(),
             &attrs,
             FineResources {
                 alpha_buffers: &[],
