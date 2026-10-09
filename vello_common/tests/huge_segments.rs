@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! A segment with huge coordinates costs time and memory bounded by the view, filled
-//! or stroked, thin or wide, dashed or not.
+//! or stroked, thin or wide, dashed or not, under any transform: one that compresses
+//! a direction (so the path is far larger than its device image), a nearly singular
+//! one, and a tiny scale that makes dashes far finer than a pixel.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -58,8 +60,9 @@ enum Draw {
     Stroke(Stroke),
 }
 
-/// Flattens `path` and returns its lines, asserting it stays under 64 MiB.
-fn run(name: &str, path: &BezPath, draw: &Draw) -> Vec<Line> {
+/// Flattens `path` under `affine` and returns its lines, asserting it stays under
+/// 64 MiB.
+fn run(name: &str, path: &BezPath, draw: &Draw, affine: Affine) -> Vec<Line> {
     let level = Level::try_detect().unwrap_or(Level::baseline());
     let mut lines = Vec::new();
     let (mut flatten_ctx, mut stroke_ctx) = (FlattenCtx::default(), StrokeCtx::default());
@@ -70,7 +73,7 @@ fn run(name: &str, path: &BezPath, draw: &Draw) -> Vec<Line> {
         Draw::Fill => fill(
             level,
             path.iter(),
-            Affine::IDENTITY,
+            affine,
             &mut lines,
             &mut flatten_ctx,
             VIEW,
@@ -79,7 +82,7 @@ fn run(name: &str, path: &BezPath, draw: &Draw) -> Vec<Line> {
             level,
             path.iter(),
             style,
-            Affine::IDENTITY,
+            affine,
             &mut lines,
             &mut flatten_ctx,
             &mut stroke_ctx,
@@ -155,9 +158,40 @@ fn dashed(s: Stroke) -> Stroke {
 }
 
 fn check(name: &str, path: BezPath, draw: Draw) {
+    check_under(name, path, draw, Affine::IDENTITY);
+}
+
+fn check_under(name: &str, path: BezPath, draw: Draw, affine: Affine) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let lines = run(name, &path, &draw);
+    let lines = run(name, &path, &draw, affine);
     assert!(reaches_view(&lines), "{name}: nothing in view");
+}
+
+/// Compresses x by 1e20: the review's cubic, 2e24 wide in path space, is 2e4 px wide
+/// on the device, through the view along y = 10.
+fn squash() -> Affine {
+    Affine::scale_non_uniform(1e-20, 1.0)
+}
+
+/// A nearly singular transform (determinant 1e-20): x compressed by 1e20 and sheared
+/// into y, rotated by 30°, with (10, 10) at (50, 50).
+fn nearly_singular() -> Affine {
+    let linear = Affine::rotate(30_f64.to_radians()) * Affine::new([1e-20, 0.0, 0.3, 1.0, 0.0, 0.0]);
+    let at = linear * vello_common::kurbo::Point::new(10.0, 10.0);
+    Affine::translate((50.0 - at.x, 50.0 - at.y)) * linear
+}
+
+/// A line 1e6 long, 100 px under a scale of 1e-4, across the view along y = 50.
+fn tiny_line() -> BezPath {
+    let mut p = BezPath::new();
+    p.move_to((0.0, 5e5));
+    p.line_to((1e6, 5e5));
+    p
+}
+
+/// Dashes of 0.01: 5e7 of them on `tiny_line`, 5e5 per device pixel.
+fn fine_dashes(s: Stroke) -> Stroke {
+    s.with_dashes(0.0, [0.01, 0.01])
 }
 
 #[test]
@@ -233,5 +267,142 @@ fn dashed_wide_line() {
         "dashed wide line",
         long_line(),
         Draw::Stroke(dashed(wide())),
+    );
+}
+
+/// The winding number of the closed polygons `lines` around `p`.
+fn winding(lines: &[Line], p: (f32, f32)) -> i32 {
+    let mut w = 0;
+    for l in lines {
+        let (a, b) = (l.p0, l.p1);
+        if (a.y <= p.1) != (b.y <= p.1) {
+            let x = a.x + (p.1 - a.y) / (b.y - a.y) * (b.x - a.x);
+            if x > p.0 {
+                w += if b.y > a.y { 1 } else { -1 };
+            }
+        }
+    }
+    w
+}
+
+/// Under `squash`, the review's cubic is the line y = 10 through the view: a stroke
+/// `half` wide each side covers it and nothing 2 px away.
+fn squashed_band(name: &str, style: Stroke, half: f32) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let lines = run(name, &collinear(), &Draw::Stroke(style), squash());
+    for x in 0..100 {
+        let x = x as f32 + 0.5;
+        assert_ne!(winding(&lines, (x, 10.0)), 0, "{name}: ({x}, 10) uncovered");
+        for y in [10.0 - half + 0.05, 10.0 + half - 0.05] {
+            assert_ne!(winding(&lines, (x, y)), 0, "{name}: ({x}, {y}) uncovered");
+        }
+        for y in [10.0 - half - 2.0, 10.0 + half + 2.0] {
+            assert_eq!(winding(&lines, (x, y)), 0, "{name}: ({x}, {y}) covered");
+        }
+    }
+}
+
+#[test]
+fn squashed_thin_collinear() {
+    squashed_band("squashed thin collinear", thin(), 0.5);
+}
+
+#[test]
+fn squashed_wide_collinear() {
+    squashed_band("squashed wide collinear", wide(), 1.5);
+}
+
+#[test]
+fn squashed_thin_bent() {
+    check_under("squashed thin bent", bent(), Draw::Stroke(thin()), squash());
+}
+
+#[test]
+fn squashed_filled_bent() {
+    check_under("squashed filled bent", bent(), Draw::Fill, squash());
+}
+
+#[test]
+fn squashed_thin_quad() {
+    check_under("squashed thin quad", quad(), Draw::Stroke(thin()), squash());
+}
+
+#[test]
+fn squashed_dashed_thin_collinear() {
+    check_under(
+        "squashed dashed thin collinear",
+        collinear(),
+        Draw::Stroke(dashed(thin())),
+        squash(),
+    );
+}
+
+#[test]
+fn squashed_dashed_wide_collinear() {
+    check_under(
+        "squashed dashed wide collinear",
+        collinear(),
+        Draw::Stroke(dashed(wide())),
+        squash(),
+    );
+}
+
+#[test]
+fn nearly_singular_thin() {
+    check_under(
+        "nearly singular thin",
+        bent(),
+        Draw::Stroke(Stroke::new(0.5)),
+        nearly_singular(),
+    );
+}
+
+#[test]
+fn nearly_singular_dashed_thin() {
+    check_under(
+        "nearly singular dashed thin",
+        bent(),
+        Draw::Stroke(dashed(thin())),
+        nearly_singular(),
+    );
+}
+
+#[test]
+fn nearly_singular_wide() {
+    check_under(
+        "nearly singular wide",
+        bent(),
+        Draw::Stroke(wide()),
+        nearly_singular(),
+    );
+}
+
+#[test]
+fn nearly_singular_filled() {
+    check_under(
+        "nearly singular filled",
+        bent(),
+        Draw::Fill,
+        nearly_singular(),
+    );
+}
+
+#[test]
+fn fine_dashes_thin() {
+    check_under(
+        "fine dashes thin",
+        tiny_line(),
+        Draw::Stroke(fine_dashes(Stroke::new(1e4))),
+        Affine::scale(1e-4),
+    );
+}
+
+#[test]
+fn fine_dashes_wide() {
+    check_under(
+        "fine dashes wide",
+        tiny_line(),
+        Draw::Stroke(fine_dashes(Stroke::new(3e4))),
+        Affine::scale(1e-4),
     );
 }

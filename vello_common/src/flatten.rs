@@ -3,8 +3,8 @@
 
 //! Flattening filled and stroked paths.
 
-use crate::cull::{Cull, SplitHuge, split_huge};
-use crate::flatten_simd::{Callback, LinePathEl, fill_cull_rect};
+use crate::cull::{Cull, SplitHuge};
+use crate::flatten_simd::{Callback, LinePathEl};
 use crate::geometry::RectU16;
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
@@ -210,8 +210,7 @@ pub fn fill_impl<S: Simd>(
         is_nan: false,
     };
 
-    let cull = Cull::new(affine, fill_cull_rect(cull_bbox));
-    let path = split_huge(path, cull);
+    // `flatten_simd::flatten` splits huge curves itself.
     crate::flatten_simd::flatten(simd, path, affine, &mut lb, flatten_ctx, cull_bbox);
 
     // A path that contains NaN is ill-defined, so ignore it.
@@ -239,7 +238,9 @@ pub fn stroke(
         line_buf.clear();
         return;
     }
-    let cull = Cull::new(affine, stroke_cull_rect(cull_bbox, style, scale));
+    // Thin strokes are flattened and dashes measured in path space, with a tolerance
+    // divided by `scale`.
+    let cull = Cull::in_path_space(affine, stroke_cull_rect(cull_bbox, style, scale), scale);
     if style.width * scale <= HAIRLINE_MAX_WIDTH {
         hairline(
             path,
@@ -257,11 +258,15 @@ pub fn stroke(
     // transform (rotated transforms included).
     let tolerance = TOL / scale.max(1.);
 
+    // Kurbo's stroker does a bounded amount of work per segment (offset curves
+    // subdivide at most `MAX_DEPTH` 8 times, kurbo 0.13.1 `offset.rs`) and `fill`
+    // flattens its outline in device space, splitting huge curves itself: an undashed
+    // stroke needs no splitting here.
     if style.dash_pattern.is_empty() {
-        expand_stroke(split_huge(path, cull), style, tolerance, stroke_ctx);
+        expand_stroke(path, style, tolerance, stroke_ctx);
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern);
+        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine);
         let solid = Stroke {
             dash_pattern: kurbo::Dashes::new(),
             ..style.clone()
@@ -371,10 +376,10 @@ fn hairline(
     };
     let tolerance = TOL / scale;
     if style.dash_pattern.is_empty() {
-        kurbo::flatten(split_huge(path, cull), tolerance, |el| sink.push(el));
+        crate::cull::flatten(path, tolerance, cull, |el| sink.push(el));
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern);
+        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine);
         kurbo::flatten(dashed, tolerance, |el| sink.push(el));
     }
     sink.end_subpath(false);
@@ -647,7 +652,7 @@ mod hairline_tests {
             &mut buf,
             &mut FlattenCtx::default(),
             cull,
-            Cull::new(affine, stroke_cull_rect(cull, style, scale)),
+            Cull::in_path_space(affine, stroke_cull_rect(cull, style, scale), scale),
         );
         buf
     }

@@ -1,26 +1,53 @@
 // Copyright 2023 the Kurbo Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Dashing as in `kurbo::dash` (kurbo 0.13.1 `stroke.rs`, `DashIterator`), copied so a
-//! piece of a huge segment outside the view (flagged by `cull::SplitHuge`) costs a
-//! constant: its whole dash periods are skipped in one step and its dashes are laid on
-//! its chord. Kurbo walks every dash, so a dashed segment with huge coordinates took
-//! time in proportion to its length. Every other segment is dashed exactly as kurbo
-//! does.
+//! Dashing as in `kurbo::dash` (kurbo 0.13.1 `stroke.rs`, `DashIterator`), copied so
+//! its work stays bounded by the view:
+//!
+//! - A piece of a segment outside the view (flagged by `cull::SplitHuge`) costs a
+//!   constant: its whole dash periods are skipped in one step and its dashes are laid
+//!   on its chord. Kurbo walks every dash, so a dashed segment with huge coordinates
+//!   took time in proportion to its length.
+//! - A segment along which the dash period averages under `1 / DENSE_PERIODS_PER_PX`
+//!   device pixels, or beyond the `PATH_PERIODS` a path may walk, is drawn solid, its
+//!   dash phase carried on as if dashed. Kurbo emits every dash, so a pattern far
+//!   finer than a pixel (a tiny scale, or a transform that compresses one direction)
+//!   emitted dashes in proportion to the inverse of their device size. `MuPDF` draws
+//!   such patterns solid too, below half a pixel per period at the transform's largest
+//!   stretch (1.28 `draw-path.c`, `do_flatten_stroke`).
+//!
+//! Every other segment is dashed exactly as kurbo does.
 
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
-use crate::kurbo::{CubicBez, Line, ParamCurve, ParamCurveArclen, PathEl, PathSeg, Point, QuadBez};
+use crate::kurbo::{
+    Affine, CubicBez, Line, ParamCurve, ParamCurveArclen, PathEl, PathSeg, Point, QuadBez,
+};
 use alloc::vec::Vec;
 
 const DASH_ACCURACY: f64 = 1e-6;
 
+/// Dash periods per device pixel, on average along a segment, beyond which the segment
+/// is drawn solid. Such dashes are under a sixteenth of a pixel: their coverage is a
+/// fine texture no output resolves, and drawing them all could take any amount of
+/// memory.
+const DENSE_PERIODS_PER_PX: f64 = 16.0;
+
+/// Dash periods one path may walk; segments beyond are drawn solid. Segments larger
+/// than the view are split and their hidden pieces skipped (`cull::SplitHuge`), so
+/// drawings stay far below this; it bounds the dashes of a path whose geometry is
+/// numerically noisy (coordinates near the limits of `f64` under a nearly singular
+/// transform), whose split pieces can each look long on the device. A dash and its
+/// gap take about 64 bytes as a thin outline and 300 as an expanded one.
+const PATH_PERIODS: f64 = (1 << 21) as f64;
+
 /// Dashes `inner` like `kurbo::dash`, skipping the dash periods of the segments
-/// flagged `true`.
+/// flagged `true`; `affine` maps the path to device space.
 pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
     inner: T,
     dash_offset: f64,
     dashes: &'a [f64],
+    affine: Affine,
 ) -> DashIterator<'a, T> {
     // Ensure that offset is positive and minimal by normalization using period
     let period = dashes.iter().sum();
@@ -65,6 +92,9 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
         needs_moveto: true,
         period,
         skipping: false,
+        dense: None,
+        affine,
+        periods_left: PATH_PERIODS,
     }
 }
 
@@ -93,6 +123,12 @@ pub(crate) struct DashIterator<'a, T> {
     period: f64,
     /// Whether `current_seg` is the chord of a skipped segment (`set_segment`).
     skipping: bool,
+    /// Whether `current_seg` is drawn solid (`set_segment`), and if so whether its
+    /// start is out yet.
+    dense: Option<bool>,
+    affine: Affine,
+    /// Dash periods the path may still walk (`PATH_PERIODS`).
+    periods_left: f64,
 }
 
 #[derive(PartialEq, Eq)]
@@ -205,24 +241,49 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
     /// Makes `seg` the current segment. One to `skip` (outside the view) is replaced
     /// by its chord with whole dash periods taken off its length: the dash state after
     /// it is the same, and its dashes, wherever they fall on the chord, paint nothing
-    /// in view.
+    /// in view. One whose dashes are too dense (see the module) keeps its length less
+    /// whole periods too, and is drawn solid.
     fn set_segment(&mut self, seg: PathSeg, skip: bool) {
         self.skipping = skip;
+        self.dense = None;
         if !skip {
-            self.seg_remaining = seg.arclen(DASH_ACCURACY);
+            let len = seg.arclen(DASH_ACCURACY);
             self.current_seg = seg;
+            let periods = len / self.period;
+            if self.period > 0.0
+                && (periods > self.periods_left
+                    || periods > DENSE_PERIODS_PER_PX * (self.device_length(&seg) + 1.0))
+            {
+                self.dense = Some(false);
+                self.seg_remaining = self.less_whole_periods(len);
+            } else {
+                self.periods_left -= periods;
+                self.seg_remaining = len;
+            }
             return;
         }
         // Relative accuracy: kurbo's absolute 1e-6 on a huge segment recurses to its
         // depth limit for nothing.
         let len = seg.arclen(DASH_ACCURACY.max(1e-9 * control_length(&seg)));
-        let beyond = len - self.dash_remaining;
-        self.seg_remaining = if self.period > 0.0 && beyond > self.period {
-            self.dash_remaining + beyond % self.period
-        } else {
-            len
-        };
+        self.seg_remaining = self.less_whole_periods(len);
         self.current_seg = PathSeg::Line(Line::new(seg.start(), seg.end()));
+    }
+
+    /// `len` less as many whole periods as leave it longer than the current dash, so
+    /// walking it gives the dash state walking `len` would.
+    fn less_whole_periods(&self, len: f64) -> f64 {
+        let (dash, period) = (self.dash_remaining, self.period);
+        if !(period > 0.0 && len - dash > period) {
+            return len;
+        }
+        // `len - dash` would round away the small remainder of a huge length: reduce
+        // `len` first, exactly (`%` is exact), then subtract.
+        dash + (len % period - dash).rem_euclid(period)
+    }
+
+    /// An upper bound on the device length of `seg`: its control polygon's.
+    fn device_length(&self, seg: &PathSeg) -> f64 {
+        control_length(&(self.affine * *seg))
     }
 
     /// Move arc length forward to next event.
@@ -235,6 +296,28 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             } else {
                 self.state = DashState::Working;
             }
+        } else if let Some(started) = self.dense {
+            if !started && !self.is_active {
+                // A dash starts with the segment.
+                self.dense = Some(true);
+                return Some(PathEl::MoveTo(self.current_seg.start()));
+            }
+            result = Some(crate::cull::seg_to_el(&self.current_seg));
+            // The dash state at its end, as walking it would leave it.
+            while self.dash_remaining < self.seg_remaining {
+                if self.is_active {
+                    self.state = DashState::Working;
+                }
+                self.is_active = !self.is_active;
+                self.seg_remaining -= self.dash_remaining;
+                self.dash_ix += 1;
+                if self.dash_ix == self.dashes.len() {
+                    self.dash_ix = 0;
+                }
+                self.dash_remaining = self.dashes[self.dash_ix];
+            }
+            self.dash_remaining -= self.seg_remaining;
+            self.get_input();
         } else if self.dash_remaining < self.seg_remaining {
             // next transition is a dash transition
             let seg = self.current_seg.subsegment(self.t..1.0);
@@ -309,7 +392,7 @@ mod tests {
 
     fn mine(path: &BezPath, offset: f64, dashes: &[f64], rect: [f64; 4]) -> Vec<PathEl> {
         let split = SplitHuge::new(path.iter(), Cull::new(Affine::IDENTITY, rect), true);
-        dash(split, offset, dashes).collect()
+        dash(split, offset, dashes, Affine::IDENTITY).collect()
     }
 
     fn kurbo(path: &BezPath, offset: f64, dashes: &[f64]) -> Vec<PathEl> {
@@ -333,16 +416,28 @@ mod tests {
         p.line_to((-4000.0, -5000.0));
         p.line_to((-4000.0, -4000.0));
         p.close_path();
+        let flat = |els: Vec<PathEl>| {
+            let mut out = Vec::new();
+            crate::kurbo::flatten(els, 0.01, |el| out.push(el));
+            out
+        };
         for dashes in [&[5.0, 3.0][..], &[4.0], &[0.01, 2.0, 3.0]] {
             for offset in [0.0, 2.5, -1.0] {
-                // A view that hides some segments, and one that holds them all.
-                for rect in [[0.0, 0.0, 20.0, 20.0], [-1e6, -1e6, 1e6, 1e6]] {
-                    assert_eq!(
-                        mine(&p, offset, dashes, rect),
-                        kurbo(&p, offset, dashes),
-                        "{dashes:?} {offset} {rect:?}"
-                    );
-                }
+                // A view that holds every segment.
+                let all = [-1e6, -1e6, 1e6, 1e6];
+                assert_eq!(
+                    mine(&p, offset, dashes, all),
+                    kurbo(&p, offset, dashes),
+                    "{dashes:?} {offset}"
+                );
+                // A view that holds part of the first line: the segments beyond are
+                // split and their hidden pieces skipped; the dashes in view are the
+                // same, up to rounding at their ends.
+                let (a, b) = (
+                    flat(mine(&p, offset, dashes, [0.0, 0.0, 20.0, 20.0])),
+                    flat(kurbo(&p, offset, dashes)),
+                );
+                same_dashes_in_view(&a, &b, Line::new((10.0, 10.0), (20.0, 10.0)), 1e-9);
             }
         }
     }
@@ -480,5 +575,66 @@ mod tests {
         let (lines, _) = dashes_near_view(&flat);
         let on = (0..100).filter(|&x| on_dash(&lines, Point::new(f64::from(x) + 0.5, 10.0)));
         assert!(on.count() >= 40);
+    }
+
+    /// The review's case: a hidden line 2^54 - 200 long before one through the view.
+    /// Its length is 4 modulo the period, so the visible line starts at phase 4;
+    /// `len - dash` before the modulo rounded that to 3.
+    #[test]
+    fn a_huge_skipped_length_keeps_its_remainder() {
+        let dashes = [3.0, 7.0];
+        let far = -(2_f64.powi(54));
+        let input = [
+            (PathEl::MoveTo(Point::new(far, 50.0)), false),
+            (PathEl::LineTo(Point::new(-200.0, 50.0)), true),
+            (PathEl::LineTo(Point::new(100.0, 50.0)), false),
+        ];
+        let a: Vec<_> = dash(input.into_iter(), 0.0, &dashes, Affine::IDENTITY).collect();
+        let mut short = BezPath::new();
+        short.move_to((-200.0, 50.0));
+        short.line_to((100.0, 50.0));
+        let b = kurbo(&short, 4.0, &dashes);
+        same_dashes_in_view(&a, &b, Line::new((-200.0, 50.0), (100.0, 50.0)), 1e-6);
+        // The same through `SplitHuge`, which skips the line in pieces.
+        let mut p = BezPath::new();
+        p.move_to((far, 50.0));
+        p.line_to((-200.0, 50.0));
+        p.line_to((100.0, 50.0));
+        let a = mine(&p, 0.0, &dashes, VIEW);
+        same_dashes_in_view(&a, &b, Line::new((-200.0, 50.0), (100.0, 50.0)), 1e-6);
+    }
+
+    /// A segment whose dashes are far below a pixel on the device is drawn whole, and
+    /// the next one starts at the phase walking it would leave.
+    #[test]
+    fn dense_dashes_are_drawn_solid_in_phase() {
+        let dashes = [3.0, 7.0];
+        // x is compressed 1000-fold: the first line, 1000.3 long in path space (100
+        // periods), is 1 px on the device; the second, vertical, is not compressed.
+        let affine = Affine::scale_non_uniform(1e-3, 1.0);
+        let mut p = BezPath::new();
+        p.move_to((-1000.3, 50.0));
+        p.line_to((0.0, 50.0));
+        p.line_to((0.0, 100.0));
+        let wide = Cull::new(affine, [-1e6, -1e6, 1e6, 1e6]);
+        let split = SplitHuge::new(p.iter(), wide, true);
+        let a: Vec<_> = dash(split, 1.5, &dashes, affine).collect();
+        // Starting inside a dash (offset 1.5 < 3), the first line is one stroke (out
+        // last: kurbo holds a subpath's first dash back to join a closing one).
+        let whole = [
+            PathEl::MoveTo(Point::new(-1000.3, 50.0)),
+            PathEl::LineTo(Point::new(0.0, 50.0)),
+        ];
+        assert!(a.windows(2).any(|w| w == whole), "{a:?}");
+        // The vertical line is dashed from phase (1.5 + 1000.3) mod 10 = 1.8, as kurbo
+        // dashes the whole path.
+        let b = kurbo(&p, 1.5, &dashes);
+        same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
+        // Starting in a gap (offset 4), the first line still is one stroke.
+        let split = SplitHuge::new(p.iter(), wide, true);
+        let a: Vec<_> = dash(split, 4.0, &dashes, affine).collect();
+        assert!(a.windows(2).any(|w| w == whole), "{a:?}");
+        let b = kurbo(&p, 4.0, &dashes);
+        same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
     }
 }
