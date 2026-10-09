@@ -513,3 +513,80 @@ fn curves_beyond_sixteen_quadratics() {
     let s = cubic([c.p0 + shift, c.p1 + shift, c.p2 + shift, c.p3 + shift].map(|p| (p.x, p.y)));
     matches_coverage("s curve", &s, Fill::NonZero, Affine::IDENTITY);
 }
+
+/// The reference uses only the analytic half-plane x < y, never interpolation
+/// between the enormous endpoints whose cancellation this test exercises.
+#[test]
+fn huge_diagonal_preserves_the_visible_half_plane() {
+    for m in [1e20, 1e100, 1e200, 1e300] {
+        let mut path = BezPath::new();
+        path.move_to((-m, -m));
+        path.line_to((m, m));
+        path.line_to((-m, m));
+        path.close_path();
+        for path in [&path, &path.reverse_subpaths()] {
+            for rule in RULES {
+                let alpha = render(path, rule, Affine::IDENTITY);
+                assert_eq!(alpha[10 * usize::from(SIZE) + 20], 0, "outside x < y");
+                assert_eq!(alpha[90 * usize::from(SIZE) + 20], 255, "inside x < y");
+                for y in 0..usize::from(SIZE) {
+                    for x in 0..usize::from(SIZE) {
+                        let expected = if x < y {
+                            255
+                        } else if x > y {
+                            0
+                        } else {
+                            128
+                        };
+                        assert!(
+                            i16::from(alpha[y * usize::from(SIZE) + x]).abs_diff(expected) <= 1,
+                            "{m:e} {rule:?}: pixel ({x}, {y}), expected {expected}, actual {}",
+                            alpha[y * usize::from(SIZE) + x]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compare to a small triangle which bypasses huge-segment clipping. Its visible
+/// half-plane is known from the slope and the exactly representable translation.
+#[test]
+fn huge_slanted_lines_match_small_geometry() {
+    let triangle = |m: f64, slope: f64| {
+        let mut path = BezPath::new();
+        path.move_to((-m, -slope * m));
+        path.line_to((m, slope * m));
+        path.line_to((-m * slope.signum(), m * slope.abs()));
+        path.close_path();
+        path
+    };
+    for m in [1e12, 1e20, 1e100, 1e200, 1e300] {
+        for slope in [-2.0, -0.5, 0.5, 2.0] {
+            // At 1e12 these integer translations are represented in the endpoints;
+            // beyond 2^53, an affine translation can itself disappear before clipping.
+            let affine = if m == 1e12 {
+                Affine::translate((13.0, 77.0))
+            } else {
+                Affine::IDENTITY
+            };
+            let huge = triangle(m, slope);
+            let small = triangle(200.0, slope);
+            for path in [&huge, &huge.reverse_subpaths()] {
+                for rule in RULES {
+                    let actual = render(path, rule, affine);
+                    let expected = render(&small, rule, affine);
+                    for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                        assert!(
+                            actual.abs_diff(*expected) <= 1,
+                            "m={m:e}, slope={slope}, {rule:?}, pixel ({}, {}): actual {actual}, expected {expected}",
+                            i % usize::from(SIZE),
+                            i / usize::from(SIZE)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

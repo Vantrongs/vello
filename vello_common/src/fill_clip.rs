@@ -173,7 +173,7 @@ fn clip_line(out: &mut Out<'_, impl Callback>, rect: [f64; 4], a: Point, b: Poin
     let mut n = 1;
     for (axis, v) in edges(rect) {
         if crosses(a, b, axis, v) {
-            cuts[n] = with(at_coord(a, b, axis, v), axis, v);
+            cuts[n] = at_coord(a, b, axis, v);
             n += 1;
         }
     }
@@ -193,16 +193,62 @@ fn clip_line(out: &mut Out<'_, impl Callback>, rect: [f64; 4], a: Point, b: Poin
     }
 }
 
-/// The point of the line `a b` whose coordinate `axis` is `v`, interpolated from the
-/// nearer end: the fraction from the farther one would round away a crossing near the
-/// end of a line 1e300 long.
+/// The point of `a b` on the boundary. Keep the endpoint distances and their
+/// products as expansions: rounding a parameter near 0.5 loses an entire visible
+/// crossing when the endpoints are huge, even if interpolation uses an FMA.
 fn at_coord(a: Point, b: Point, axis: usize, v: f64) -> Point {
     let (ca, cb) = (coord(a, axis), coord(b, axis));
-    if (v - ca).abs() <= (v - cb).abs() {
-        a + (v - ca) / (cb - ca) * (b - a)
+    // A power of two avoids rounding normal endpoint significands. Normalize
+    // before subtracting opposite-sign endpoints, which could otherwise overflow.
+    let exponent = ((ca.abs().max(cb.abs()).to_bits() >> 52) & 0x7ff) as i32 - 1023;
+    let shift = -exponent.max(-1022) - 2;
+    let scale = if shift >= -1022 {
+        f64::from_bits(((shift + 1023) as u64) << 52)
     } else {
-        b + (v - cb) / (ca - cb) * (a - b)
+        f64::from_bits(1 << (shift + 1074))
+    };
+    let (ca, cb, v_scaled) = (ca * scale, cb * scale, v * scale);
+    let (da, da_tail) = two_sum(v_scaled, -ca);
+    let (db, db_tail) = two_sum(cb, -v_scaled);
+    let (oa, ob) = (coord(a, 1 - axis), coord(b, 1 - axis));
+    // Halving the other axis bounds products and partial sums even at f64::MAX.
+    // The exact numerator is (v-ca)*ob + (cb-v)*oa. Its large terms must cancel
+    // before rounding away the small contribution from the boundary coordinate.
+    let mut expansion = [0.0; 8];
+    let mut len = 0;
+    for (distance, other) in [(da, ob), (da_tail, ob), (db, oa), (db_tail, oa)] {
+        let other = other * 0.5;
+        let product = distance * other;
+        for term in [distance.mul_add(other, -product), product] {
+            let mut sum = term;
+            let mut next_len = 0;
+            for i in 0..len {
+                let (next, tail) = two_sum(sum, expansion[i]);
+                if tail != 0.0 {
+                    expansion[next_len] = tail;
+                    next_len += 1;
+                }
+                sum = next;
+            }
+            expansion[next_len] = sum;
+            len = next_len + 1;
+        }
     }
+    let other = (expansion[..len].iter().sum::<f64>() / (cb - ca)) * 2.0;
+    // A boundary between the endpoints is a convex combination. Roundoff at
+    // f64::MAX must not turn that finite intersection into infinity.
+    with(
+        with(a, 1 - axis, other.clamp(oa.min(ob), oa.max(ob))),
+        axis,
+        v,
+    )
+}
+
+/// Error-free addition, apart from underflow of the roundoff term.
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let sum = a + b;
+    let b_virtual = sum - a;
+    (sum, (a - (sum - b_virtual)) + (b - b_virtual))
 }
 
 /// Draws a part of a line between cuts.
@@ -425,6 +471,54 @@ mod tests {
             simd, PathSeg::Cubic(c), [0.0, 0.0, 100.0, 100.0], &mut out, &mut ctx
         ));
         out.lines
+    }
+
+    #[test]
+    fn line_intersections_keep_boundary_precision_across_scales() {
+        for magnitude in [1e3, 1e20, 1e100, 1e200, 1e300, f64::MAX * 0.25] {
+            for slope in [-2.0, -0.5, 0.5, 1.0, 2.0] {
+                let a = Point::new(-magnitude, -magnitude * slope);
+                let b = Point::new(2.0 * magnitude, 2.0 * magnitude * slope);
+                for (a, b) in [(a, b), (b, a)] {
+                    // Signed boundary coordinates also exercise translated views.
+                    for v in [-100.0, -1.0, 0.0, 1.0, 100.0] {
+                        for axis in [0, 1] {
+                            let expected = if axis == 0 { v * slope } else { v / slope };
+                            let point = at_coord(a, b, axis, v);
+                            assert_eq!(coord(point, axis), v);
+                            assert!(
+                                (coord(point, 1 - axis) - expected).abs() <= 1e-12,
+                                "{a:?} {b:?}, axis {axis}, boundary {v}: {point:?}, expected {expected}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let m = f64::MAX;
+        assert_eq!(
+            at_coord(Point::new(-m, -m), Point::new(m, m), 0, 100.0),
+            Point::new(100.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn line_intersection_retains_a_cancelled_determinant() {
+        // Integer endpoints: the determinant is exactly 1 although its two
+        // products are about 2^104. This oracle comes from integer algebra.
+        let m = (1_u64 << 52) as f64;
+        for y_scale in [1.0, 1.0 / m, 2.0_f64.powi(800)] {
+            let a = Point::new(m, (m - 1.0) * y_scale);
+            let b = Point::new(1.0 - m, (2.0 - m) * y_scale);
+            let expected = y_scale / (2.0 * m - 1.0);
+            for (a, b) in [(a, b), (b, a)] {
+                let actual = at_coord(a, b, 0, 0.0).y;
+                assert!(
+                    (actual - expected).abs() <= expected * 1e-14,
+                    "{a:?} {b:?}: expected {expected}, actual {actual}"
+                );
+            }
+        }
     }
 
     #[test]
