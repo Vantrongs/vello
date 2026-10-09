@@ -750,6 +750,12 @@ impl Scene {
     }
 
     /// Pop the last pushed layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the filter's complete bounds, including its halo, exceed the
+    /// source coordinate domain. In that case the layer remains open and the
+    /// viewport and transform stacks are unchanged.
     pub fn pop_layer(&mut self) {
         if self.recorder.pop_layer() == PoppedLayer::Filter {
             self.viewport_state.pop_root_viewport();
@@ -950,6 +956,64 @@ mod tests {
             assert!(!scene.viewport_state.has_root_viewports());
             assert!(!scene.recorder.has_layers());
         }
+    }
+
+    #[test]
+    fn rejected_filter_halo_pop_preserves_scene_and_reset_restores_recording() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
+        use vello_common::peniko::color::palette::css::RED;
+        let mut scene = Scene::new(236, 16);
+        scene.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+            dx: -4294967040.0,
+            dy: 0.0,
+        }));
+        scene.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
+            std_deviation: 1.5,
+            edge_mode: EdgeMode::None,
+        }));
+        scene.set_paint(RED);
+        scene.fill_rect(&Rect::new(4294967272.0, 4.0, 4294967284.0, 12.0));
+        for record_after_failure in [false, true] {
+            if record_after_failure {
+                scene.fill_rect(&Rect::new(4294967272.0, 4.0, 4294967276.0, 8.0));
+            }
+            let before = alloc::format!("{scene:?}");
+            for _ in 0..2 {
+                let error = catch_unwind(AssertUnwindSafe(|| scene.pop_layer()))
+                    .expect_err("the full halo exceeds u32 source coordinates");
+                let message = error
+                    .downcast_ref::<alloc::string::String>()
+                    .map(alloc::string::String::as_str)
+                    .or_else(|| error.downcast_ref::<&str>().copied());
+                assert_eq!(message, Some("source rectangle overflow"));
+                assert_eq!(alloc::format!("{scene:?}"), before);
+            }
+        }
+        scene.reset();
+        let mut fresh = Scene::new(236, 16);
+        for target in [&mut scene, &mut fresh] {
+            target.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+                dx: 0.0,
+                dy: 0.0,
+            }));
+            target.set_paint(RED);
+            target.fill_rect(&Rect::new(0.0, 0.0, 4.0, 4.0));
+            target.pop_layer();
+            assert!(!target.recorder.has_layers());
+            assert!(!target.viewport_state.has_root_viewports());
+        }
+        assert_eq!(*scene.strip_storage.borrow(), *fresh.strip_storage.borrow());
+        assert_eq!(
+            alloc::format!("{:?}", scene.recorder),
+            alloc::format!("{:?}", fresh.recorder)
+        );
+        assert_eq!(
+            alloc::format!("{:?}", scene.root_transforms),
+            alloc::format!("{:?}", fresh.root_transforms)
+        );
+        assert_eq!(scene.encoded_paints.len(), fresh.encoded_paints.len());
     }
 
     #[test]

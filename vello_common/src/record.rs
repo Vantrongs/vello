@@ -325,7 +325,19 @@ impl<D> CommandRecorder<D> {
     }
 
     /// Pop the currently active layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics without closing the layer if its complete filtered bounds cannot
+    /// be represented in the source coordinate domain.
     pub fn pop_layer(&mut self) -> PoppedLayer {
+        let pending = self.layer_stack.last().unwrap();
+        let filter_placement = match &self.layers[pending.id as usize].kind {
+            RecordedLayerKind::Regular => None,
+            RecordedLayerKind::Filter { filter_data, .. } => {
+                Some(FilterLayerPlacement::new(pending.bbox, filter_data))
+            }
+        };
         let layer = self.layer_stack.pop().unwrap();
         let id = layer.id;
 
@@ -354,11 +366,8 @@ impl<D> CommandRecorder<D> {
 
                     (PoppedLayer::Regular, bbox)
                 }
-                RecordedLayerKind::Filter {
-                    filter_data: filter_plan,
-                    placement,
-                } => {
-                    *placement = FilterLayerPlacement::new(layer.bbox, filter_plan);
+                RecordedLayerKind::Filter { placement, .. } => {
+                    *placement = filter_placement.unwrap();
                     recorded_layer.bbox = placement.pixmap_bbox();
 
                     let filter_size = placement.pixmap_bbox().into();
