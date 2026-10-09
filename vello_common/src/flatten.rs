@@ -238,18 +238,6 @@ pub fn stroke(
         line_buf.clear();
         return;
     }
-    // A pattern with no gap a pixel resolves is stroked solid, as `MuPDF` does.
-    let solid;
-    let style =
-        if !style.dash_pattern.is_empty() && crate::dash::unresolved(&style.dash_pattern, scale) {
-            solid = Stroke {
-                dash_pattern: kurbo::Dashes::new(),
-                ..style.clone()
-            };
-            &solid
-        } else {
-            style
-        };
     // Thin strokes are flattened and dashes measured in path space, with a tolerance
     // divided by `scale`.
     let cull = Cull::in_path_space(affine, stroke_cull_rect(cull_bbox, style, scale), scale);
