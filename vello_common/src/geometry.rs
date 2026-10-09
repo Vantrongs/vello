@@ -4,6 +4,7 @@
 //! Geometry utilities.
 
 use crate::kurbo::Rect;
+use crate::tile::Tile;
 use bytemuck::{Pod, Zeroable};
 use core::ops::Add;
 
@@ -150,6 +151,38 @@ pub struct RectU16 {
 }
 
 impl RectU16 {
+    /// Return the outward-rounded bounds in tile units.
+    ///
+    /// The exclusive tile endpoint can be 16384 even though its pixel endpoint
+    /// (65536) is outside the physical `u16` coordinate domain.
+    #[inline(always)]
+    pub const fn to_tile_bounds(self) -> Self {
+        let x0 = self.x0 / Tile::WIDTH;
+        let y0 = self.y0 / Tile::HEIGHT;
+        if self.is_empty() {
+            return Self::new(x0, y0, x0, y0);
+        }
+        Self::new(
+            x0,
+            y0,
+            self.x1.div_ceil(Tile::WIDTH),
+            self.y1.div_ceil(Tile::HEIGHT),
+        )
+    }
+
+    /// Convert tile bounds to their intersection with the physical `u16`
+    /// coordinate domain. The last physical tile may be partial: no `u16`-sized
+    /// target contains the pixel at coordinate 65535.
+    #[inline(always)]
+    pub const fn from_tile_bounds(tiles: Self) -> Self {
+        Self::new(
+            tiles.x0.saturating_mul(Tile::WIDTH),
+            tiles.y0.saturating_mul(Tile::HEIGHT),
+            tiles.x1.saturating_mul(Tile::WIDTH),
+            tiles.y1.saturating_mul(Tile::HEIGHT),
+        )
+    }
+
     /// A rectangle with all coordinates set to zero.
     pub const ZERO: Self = Self {
         x0: 0,
@@ -291,6 +324,18 @@ const fn const_min(a: u16, b: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::RectU16;
+
+    #[test]
+    fn tile_bounds_preserve_last_physical_pixels() {
+        for edge in 65532..=u16::MAX {
+            let physical = RectU16::new(0, 0, edge, edge);
+            let tiles = physical.to_tile_bounds();
+            assert_eq!(u32::from(tiles.x1) * 4, u32::from(edge).next_multiple_of(4));
+            let cover = RectU16::from_tile_bounds(tiles);
+            assert_eq!(cover.intersect(physical), physical);
+            assert!(cover.contains(edge - 1, edge - 1));
+        }
+    }
 
     #[test]
     fn rect_u16_relative_to_origin() {

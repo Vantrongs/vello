@@ -633,6 +633,7 @@ impl Scene {
     /// # Panics
     ///
     /// Panics if `mask` is provided because mask layers are not yet supported.
+    /// Also panics if the filter's required source viewport exceeds `u16` dimensions.
     pub fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,
@@ -655,10 +656,10 @@ impl Scene {
                     let (shift_x, shift_y) = filter_data.source_shift();
                     Affine::translate((f64::from(shift_x), f64::from(shift_y)))
                 });
-        self.root_transforms.push_root(relative_root_transform);
         if let Some(filter_plan) = &filter_data {
             self.viewport_state.push_root_viewport(filter_plan);
         }
+        self.root_transforms.push_root(relative_root_transform);
 
         let clip_path = clip_path.map(|path| {
             let mut strip_storage = self.strip_storage.borrow_mut();
@@ -913,6 +914,38 @@ mod tests {
     #[cfg(feature = "text")]
     use vello_common::peniko::{Blob, FontData};
     use vello_common::record::Drawable;
+
+    #[test]
+    fn rejected_filter_extent_preserves_scene_state() {
+        extern crate std;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use vello_common::filter_effects::{Filter, FilterFunction};
+
+        for (width, height) in [(u16::MAX, 4), (4, u16::MAX)] {
+            let mut scene = Scene::new(width, height);
+            let error = catch_unwind(AssertUnwindSafe(|| {
+                scene
+                    .push_filter_layer(Filter::from_function(FilterFunction::Blur { radius: 1.5 }));
+            }))
+            .unwrap_err();
+            let message = error.downcast_ref::<&str>().copied().or_else(|| {
+                error
+                    .downcast_ref::<alloc::string::String>()
+                    .map(|s| s.as_str())
+            });
+            assert_eq!(
+                message,
+                Some("filter source viewport exceeds u16 coordinate domain")
+            );
+            assert!(!scene.viewport_state.has_root_viewports());
+            assert!(!scene.recorder.has_layers());
+            scene.fill_rect(&Rect::new(0.0, 0.0, 4.0, 4.0));
+            let RecordedDraw::Rect(draw) = &scene.recorder.draws[0] else {
+                panic!("expected a rectangle draw after rejected filter");
+            };
+            assert_eq!(draw.rect, Rect::new(0.0, 0.0, 4.0, 4.0));
+        }
+    }
 
     #[test]
     fn recorded_rect_bbox_rounds_fractional_outward() {

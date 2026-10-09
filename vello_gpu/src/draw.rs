@@ -539,29 +539,6 @@ impl DepthCounter {
     }
 }
 
-pub(crate) trait RectU16Ext {
-    fn to_tile_bounds(self) -> RectU16;
-}
-
-impl RectU16Ext for RectU16 {
-    fn to_tile_bounds(self) -> RectU16 {
-        debug_assert!(
-            self.x0.is_multiple_of(Tile::WIDTH)
-                && self.x1.is_multiple_of(Tile::WIDTH)
-                && self.y0.is_multiple_of(Tile::HEIGHT)
-                && self.y1.is_multiple_of(Tile::HEIGHT),
-            "draw bounding boxes must be tile-aligned"
-        );
-
-        Self::new(
-            self.x0 / Tile::WIDTH,
-            self.y0 / Tile::HEIGHT,
-            self.x1 / Tile::WIDTH,
-            self.y1 / Tile::HEIGHT,
-        )
-    }
-}
-
 trait StripAlphaFillSegmentExt {
     fn col_idx(self) -> u32;
 }

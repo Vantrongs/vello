@@ -195,7 +195,8 @@ pub fn extract_scales(transform: &Affine) -> (f32, f32) {
 
 /// Extension methods for rectangles.
 pub trait RectExt {
-    /// Snap the rect to whole tile coordinates.
+    /// Cover the rect with whole tiles. Integer rectangles are intersected with
+    /// the physical `u16` domain, so their last tile can remain partial.
     fn snap_to_tile_coordinates(self) -> Self;
 }
 
@@ -221,22 +222,7 @@ impl RectExt for Rect {
 impl RectExt for RectU16 {
     #[inline]
     fn snap_to_tile_coordinates(self) -> Self {
-        // This method will panic if we have a viewport of size u16::MAX and draw
-        // at the very edge, but better than returning a wrong result.
-
-        let x0 = (self.x0 / Tile::WIDTH).checked_mul(Tile::WIDTH).unwrap();
-        let y0 = (self.y0 / Tile::HEIGHT).checked_mul(Tile::HEIGHT).unwrap();
-
-        if self.is_empty() {
-            return Self::new(x0, y0, x0, y0);
-        }
-
-        Self::new(
-            x0,
-            y0,
-            self.x1.checked_next_multiple_of(Tile::WIDTH).unwrap(),
-            self.y1.checked_next_multiple_of(Tile::HEIGHT).unwrap(),
-        )
+        Self::from_tile_bounds(self.to_tile_bounds())
     }
 }
 
@@ -399,7 +385,8 @@ impl<T> IndexMut<usize> for RetainVec<T> {
     }
 }
 
-/// Calculate the bounding box of the strips.
+/// Calculate the strips' physical bounding box, intersected with the `u16`
+/// coordinate domain. Its exclusive edge can cut the final tile short.
 pub fn strip_bbox(strips: &[Strip]) -> Option<RectU16> {
     // Fill and alpha fill segments internally store their coordinates in tile units,
     // in order to avoid multiplications in every invocation of the closure we calculate
@@ -423,12 +410,7 @@ pub fn strip_bbox(strips: &[Strip]) -> Option<RectU16> {
     if tile_bbox.is_empty() {
         None
     } else {
-        Some(RectU16::new(
-            tile_bbox.x0.checked_mul(Tile::WIDTH).unwrap(),
-            tile_bbox.y0.checked_mul(Tile::HEIGHT).unwrap(),
-            tile_bbox.x1.checked_mul(Tile::WIDTH).unwrap(),
-            tile_bbox.y1.checked_mul(Tile::HEIGHT).unwrap(),
-        ))
+        Some(RectU16::from_tile_bounds(tile_bbox))
     }
 }
 

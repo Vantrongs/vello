@@ -22,8 +22,6 @@ impl Span {
     }
 
     /// Expands this span to the tiles covering it. Empty spans remain empty.
-    ///
-    /// Panics if the aligned end cannot be represented in pixel coordinates.
     pub fn tile_aligned(self) -> TileAlignedSpan {
         let start = self.tile_x();
         let count = if self.width == 0 {
@@ -78,56 +76,70 @@ impl Span {
 /// A horizontal pixel span aligned to tile coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
-pub struct TileAlignedSpan(Span);
+pub struct TileAlignedSpan {
+    start: u16,
+    end: u16,
+}
 
 impl TileAlignedSpan {
     /// Creates a tile-aligned span from a tile start and tile count.
     pub fn from_tiles(start: u16, count: u16) -> Self {
-        let x = start.checked_mul(Tile::WIDTH).unwrap();
-        let width = count.checked_mul(Tile::WIDTH).unwrap();
-        x.checked_add(width).unwrap();
-
-        Self(Span::new(x, width))
+        let end = start.checked_add(count).expect("tile span end overflow");
+        assert!(
+            end <= u16::MAX.div_ceil(Tile::WIDTH),
+            "tile span exceeds coordinate domain"
+        );
+        Self { start, end }
     }
 
-    /// Returns the underlying pixel span.
-    pub fn as_span(self) -> Span {
-        self.0
+    /// Intersects with physical pixels before narrowing the padded tile endpoint.
+    pub fn intersect_pixels(self, bounds: Span) -> Option<Span> {
+        let start = self.pixel_x().max(usize::from(bounds.pixel_x()));
+        let end = self.pixel_end().min(usize::from(bounds.pixel_end()));
+        (start < end).then(|| {
+            Span::new(
+                u16::try_from(start).unwrap(),
+                u16::try_from(end - start).unwrap(),
+            )
+        })
     }
 
     /// Returns the horizontal start position in pixels.
-    pub fn pixel_x(self) -> u16 {
-        self.0.pixel_x()
+    pub fn pixel_x(self) -> usize {
+        usize::from(self.start) * usize::from(Tile::WIDTH)
     }
 
-    /// Returns the horizontal width in pixels.
-    pub fn pixel_width(self) -> u16 {
-        self.0.pixel_width()
+    /// Returns the horizontal width in pixels, including scratch padding.
+    pub fn pixel_width(self) -> usize {
+        usize::from(self.end - self.start) * usize::from(Tile::WIDTH)
     }
 
-    /// Returns the exclusive horizontal end in pixels.
-    pub fn pixel_end(self) -> u16 {
-        self.0.pixel_end()
+    /// Returns the exclusive horizontal end in pixels, including scratch padding.
+    pub fn pixel_end(self) -> usize {
+        usize::from(self.end) * usize::from(Tile::WIDTH)
     }
 
     /// Returns the horizontal start in tile coordinates.
     pub fn tile_x(self) -> u16 {
-        self.pixel_x() / Tile::WIDTH
+        self.start
     }
 
     /// Returns the exclusive horizontal end in tile coordinates.
     pub fn tile_end(self) -> u16 {
-        self.pixel_end() / Tile::WIDTH
+        self.end
     }
 
     /// Extends this span to cover another tile-aligned span.
     pub fn extend(&mut self, other: Self) {
-        self.0.extend(other.0);
+        self.start = self.start.min(other.start);
+        self.end = self.end.max(other.end);
     }
 
     /// Intersects two tile-aligned spans.
     pub fn intersect(self, other: Self) -> Option<Self> {
-        self.0.intersect(other.0).map(Self)
+        let start = self.start.max(other.start);
+        let end = self.end.min(other.end);
+        (start < end).then_some(Self { start, end })
     }
 }
 
@@ -164,7 +176,11 @@ mod tests {
             (Span::new(tile, tile + 1), Span::new(tile, 2 * tile)),
             (Span::new(tile + 1, tile), Span::new(tile, 2 * tile)),
         ] {
-            assert_eq!(span.tile_aligned().as_span(), expected, "{span:?}");
+            assert_eq!(
+                span.tile_aligned().intersect_pixels(Span::new(0, u16::MAX)),
+                Some(expected),
+                "{span:?}"
+            );
         }
     }
 
@@ -184,8 +200,38 @@ mod tests {
             Span::new(0, max_aligned),
             Span::new(max_aligned, 0),
         ] {
-            assert_eq!(TileAlignedSpan::try_from(span).unwrap().as_span(), span);
+            let aligned = TileAlignedSpan::try_from(span).unwrap();
+            assert_eq!(aligned.pixel_x(), usize::from(span.pixel_x()));
+            assert_eq!(aligned.pixel_width(), usize::from(span.pixel_width()));
         }
+    }
+
+    #[test]
+    fn padded_terminal_tile_preserves_physical_pixels() {
+        assert_eq!(size_of::<TileAlignedSpan>(), 4);
+        for width in 65532..=u16::MAX {
+            let physical = Span::new(0, width);
+            let aligned = physical.tile_aligned();
+            let expected_end = usize::from(width).div_ceil(4) * 4;
+            assert_eq!(aligned.pixel_end(), expected_end);
+            assert_eq!(aligned.pixel_width(), expected_end);
+            assert_eq!(aligned.intersect_pixels(physical), Some(physical));
+        }
+        let tail = TileAlignedSpan::from_tiles(16383, 1);
+        assert_eq!(tail.pixel_end(), 65536);
+        assert_eq!(
+            tail.intersect_pixels(Span::new(0, u16::MAX)),
+            Some(Span::new(65532, 3))
+        );
+        let empty = TileAlignedSpan::from_tiles(16384, 0);
+        assert_eq!(empty.pixel_x(), 65536);
+        assert_eq!(empty.pixel_width(), 0);
+        assert_eq!(empty.intersect_pixels(Span::new(0, u16::MAX)), None);
+        assert_eq!(tail.intersect(empty), None);
+        let mut union = TileAlignedSpan::from_tiles(0, 1);
+        union.extend(tail);
+        assert_eq!(union, TileAlignedSpan::from_tiles(0, 16384));
+        assert_eq!(union.intersect(tail), Some(tail));
     }
 
     #[test]

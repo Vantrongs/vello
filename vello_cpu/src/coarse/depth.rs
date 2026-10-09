@@ -168,9 +168,9 @@ pub(crate) struct DepthBuffer {
 }
 
 impl DepthBuffer {
-    pub(crate) fn new(buffer_width: u16) -> Self {
+    pub(crate) fn new(buffer_width: usize) -> Self {
         Self {
-            data: vec![0; usize::from(buffer_width.div_ceil(DEPTH_BUCKET_WIDTH))],
+            data: vec![0; buffer_width.div_ceil(usize::from(DEPTH_BUCKET_WIDTH))],
         }
     }
 
@@ -228,8 +228,8 @@ impl DepthBuffer {
     /// Returns the depth-bucket index range touched by `span`.
     fn range(&self, span: TileAlignedSpan) -> (usize, usize) {
         (
-            usize::from(span.pixel_x() / DEPTH_BUCKET_WIDTH),
-            usize::from(span.pixel_end().div_ceil(DEPTH_BUCKET_WIDTH)).min(self.data.len()),
+            usize::from(span.tile_x() / DEPTH_BUCKET_TILE_WIDTH),
+            usize::from(span.tile_end().div_ceil(DEPTH_BUCKET_TILE_WIDTH)).min(self.data.len()),
         )
     }
 
@@ -302,7 +302,7 @@ mod tests {
     use core::ops::Range;
 
     fn buffer(bucket_count: usize) -> DepthBuffer {
-        DepthBuffer::new(bucket_count as u16 * DEPTH_BUCKET_WIDTH)
+        DepthBuffer::new(bucket_count * usize::from(DEPTH_BUCKET_WIDTH))
     }
 
     fn buckets(start: usize, end: usize) -> TileAlignedSpan {
@@ -311,8 +311,8 @@ mod tests {
 
     fn bucket_range(span: TileAlignedSpan) -> (usize, usize) {
         (
-            usize::from(span.pixel_x() / DEPTH_BUCKET_WIDTH),
-            usize::from(span.pixel_end() / DEPTH_BUCKET_WIDTH),
+            usize::from(span.tile_x() / DEPTH_BUCKET_TILE_WIDTH),
+            usize::from(span.tile_end() / DEPTH_BUCKET_TILE_WIDTH),
         )
     }
 
@@ -441,7 +441,10 @@ mod tests {
 
         assert_eq!(
             runs,
-            [(Tile::WIDTH * 2, DEPTH_BUCKET_WIDTH + Tile::WIDTH * 5)]
+            [(
+                usize::from(Tile::WIDTH * 2),
+                usize::from(DEPTH_BUCKET_WIDTH + Tile::WIDTH * 5)
+            )]
         );
     }
 
@@ -465,7 +468,7 @@ mod tests {
         let last_bucket_x = u16::MAX / DEPTH_BUCKET_WIDTH * DEPTH_BUCKET_WIDTH;
         let max_aligned_width = u16::MAX / Tile::WIDTH * Tile::WIDTH;
         for width in last_bucket_x..=max_aligned_width {
-            let mut buffer = DepthBuffer::new(width);
+            let mut buffer = DepthBuffer::new(usize::from(width));
             let span = crate::span::Span::new(0, width).tile_aligned();
             let mut runs = Vec::new();
             buffer.for_each_unset_run(span, |run| runs.push(run));
@@ -492,6 +495,21 @@ mod tests {
             buffer.for_each_unset_run(span, |run| runs.push(run));
             assert_eq!(runs, expected, "width = {width}");
         }
+    }
+
+    #[test]
+    fn padded_last_bucket_supports_opaque_writes_and_reads() {
+        let mut buffer = buffer(512);
+        let last = buckets(511, 512);
+        assert_eq!(last.pixel_end(), 65536);
+        assert_eq!(unset_runs(&buffer, last), [(511, 512)]);
+        write_buckets(&mut buffer, 511..512, 7);
+        assert!(unset_runs(&buffer, last).is_empty());
+        assert!(visible_runs(&buffer, last, 6).is_empty());
+        assert_eq!(visible_runs(&buffer, last, 7), [(511, 512)]);
+        let mut segments = Vec::new();
+        split_opaque_span(last, |segment| segments.push(segment));
+        assert_eq!(segments, [DepthSegment::Opaque(BucketRange::new(511, 512))]);
     }
 
     #[test]

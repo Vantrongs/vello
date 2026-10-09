@@ -69,15 +69,15 @@ impl Cursor {
         self.atlases.add_layer_atlas(request.texture_parity);
 
         let texture_size = self.atlases.texture_size();
-        let requested_size = request.allocation_size();
+        let (requested_width, requested_height) = request.allocation_size();
         let allocation = self
             .atlases
             .allocate_layer(&request)
             // If we successfully added a new texture but allocation still fails, it means the layer
             // itself is larger than the maximum texture size, so it cannot possibly fit.
             .ok_or(IntermediateTextureError::TooLarge {
-                width: u32::from(requested_size.width()),
-                height: u32::from(requested_size.height()),
+                width: requested_width,
+                height: requested_height,
                 max_width: texture_size.width(),
                 max_height: texture_size.height(),
             })?;
@@ -214,13 +214,31 @@ mod tests {
             cursor.allocate_layer(request(TextureParity::Even, SizeU16::from_wh(9, 8),)),
             Err(RenderError::IntermediateTexture(
                 IntermediateTextureError::TooLarge {
-                    width: 9,
+                    width: 12,
                     height: 8,
                     max_width: 8,
                     max_height: 8,
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn full_domain_tile_endpoint_reports_error_without_narrowing() {
+        let mut cursor = cursor();
+        for size in [SizeU16::from_wh(u16::MAX, 3), SizeU16::from_wh(3, u16::MAX)] {
+            let result = cursor.allocate_layer(request(TextureParity::Even, size));
+            let Err(RenderError::IntermediateTexture(IntermediateTextureError::TooLarge {
+                width,
+                height,
+                ..
+            })) = result
+            else {
+                panic!("expected an explicit oversized allocation error");
+            };
+            assert_eq!(width, u32::from(size.width()).next_multiple_of(4));
+            assert_eq!(height, u32::from(size.height()).next_multiple_of(4));
+        }
     }
 
     #[test]
