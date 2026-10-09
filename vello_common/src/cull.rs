@@ -221,13 +221,19 @@ impl<I: Iterator<Item = PathEl>> SplitHuge<I> {
             });
         }
         if !exceeds(b, self.cull.piece_extent()) {
-            if self.cull.too_large(&seg) && self.polyline_left > 1 {
-                let n = self.cull.polyline_lines(&seg).min(self.polyline_left);
-                self.polyline_left -= n;
-                self.polyline = Some((seg, 0, n));
-                return None;
+            if !self.cull.too_large(&seg) {
+                return Some((seg_to_el(&seg), false));
             }
-            return Some((seg_to_el(&seg), false));
+            // Once the segment's lines are spent, its further pieces are chords: a
+            // curve too large in path space would cost its consumer that size.
+            let n = self
+                .cull
+                .polyline_lines(&seg)
+                .min(self.polyline_left)
+                .max(1);
+            self.polyline_left = self.polyline_left.saturating_sub(n);
+            self.polyline = Some((seg, 0, n));
+            return None;
         }
         if depth >= MAX_DEPTH || self.splits >= MAX_SPLITS {
             return Some((PathEl::LineTo(seg.end()), false));
@@ -743,6 +749,58 @@ mod tests {
                     c.nearest(m, 1e-12).distance_sq.sqrt() <= TOL + 1e-3,
                     "{l:?}"
                 );
+            }
+        }
+    }
+
+    /// The reviews' cases: a miter limit that widens the stroke's cull rect so much
+    /// that the first piece in it spends the segment's polyline lines. Each piece
+    /// after that must still be no larger in path space than the consumer allows.
+    #[test]
+    fn spent_polyline_lines_leave_chords() {
+        // Half the width times the miter limit, as `stroke` widens the view.
+        let widened = |reach: f64| [-reach, -reach, 100.0 + reach, 100.0 + reach];
+        let mut squashed = BezPath::new();
+        squashed.move_to((1e21, 10.0));
+        squashed.curve_to((1e30, 10.0), (-1e30, 10.0), (2e21, 10.0));
+        let mut swung = BezPath::new();
+        swung.move_to((10.0, 10.0));
+        swung.curve_to((1e24, 0.0), (-1e24, 1e24), (20.0, 10.0));
+        let cases = [
+            (
+                squashed,
+                Affine::scale_non_uniform(1e-20, 1.0),
+                0.5 * 1.0 * 2e9,
+            ),
+            (swung, Affine::IDENTITY, 0.5 * 0.5 * 1.1e24),
+        ];
+        for (path, affine, reach) in cases {
+            let scale = crate::flatten::max_scale(affine);
+            let cull = Cull::in_path_space(affine, widened(reach + 1.0), scale);
+            for keep in [false, true] {
+                let mut last = Point::ZERO;
+                let mut lines = 0;
+                for (el, hidden) in SplitHuge::new(path.iter(), cull, keep) {
+                    let seg = match el {
+                        PathEl::MoveTo(p) => {
+                            last = p;
+                            continue;
+                        }
+                        PathEl::LineTo(p) => PathSeg::Line(KLine::new(last, p)),
+                        PathEl::QuadTo(p1, p2) => PathSeg::Quad(QuadBez::new(last, p1, p2)),
+                        PathEl::CurveTo(p1, p2, p3) => {
+                            PathSeg::Cubic(CubicBez::new(last, p1, p2, p3))
+                        }
+                        PathEl::ClosePath => continue,
+                    };
+                    assert!(
+                        hidden || !cull.too_large(&seg),
+                        "{affine:?} {keep}: {seg:?}"
+                    );
+                    lines += usize::from(matches!(seg, PathSeg::Line(_)));
+                    last = seg.end();
+                }
+                assert!(lines > 1000, "{affine:?} {keep}: {lines} lines");
             }
         }
     }
