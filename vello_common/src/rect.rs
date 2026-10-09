@@ -70,7 +70,18 @@ fn render_impl<S: Simd>(s: S, rect: Rect, strip_buf: &mut Vec<Strip>, alpha_buf:
         .expect("source rectangle exceeds tile coordinate domain");
     // Include one tile past the right edge so the right-edge tile column is
     // covered by the edge-row wide-strip loop.
-    let x_end = right_tile_x + Tile::WIDTH_U32;
+    let (right_tile_x, x_end) = if let Some(end) = right_tile_x.checked_add(Tile::WIDTH_U32) {
+        (right_tile_x, end)
+    } else {
+        // An aligned endpoint at the source-domain edge has no coverage in
+        // the following tile; retaining that empty tile would overflow its end.
+        assert_eq!(
+            rect_x1,
+            f64::from(right_tile_x),
+            "source rectangle exceeds tile coordinate domain"
+        );
+        (right_tile_x - Tile::WIDTH_U32, right_tile_x)
+    };
 
     if x_end <= left_tile_x || y1 <= y0 {
         return;
@@ -107,7 +118,7 @@ fn render_impl<S: Simd>(s: S, rect: Rect, strip_buf: &mut Vec<Strip>, alpha_buf:
             let right_alpha = combined_tile_alpha(s, &right_x_cov, &y_cov);
             let interior_alpha = combined_tile_alpha(s, &[1.0; Tile::WIDTH_U32 as usize], &y_cov);
             let mut col = left_tile_x;
-            while col + Tile::WIDTH_U32 <= x_end {
+            while col < x_end {
                 let combined = if col == left_tile_x {
                     left_alpha
                 } else if col == right_tile_x {

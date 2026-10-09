@@ -40,9 +40,15 @@ impl GpuBlendInstance {
         parent_texture_size: SizeU16,
     ) -> Self {
         let parent_rect = blend.parent_region.texture_rect(blend.blend_bbox);
-        let child_parent_rect = blend
-            .parent_region
-            .texture_rect(blend.child_region.layer_bbox);
+        let child_parent_rect = if blend.child_region.layer_bbox.is_empty() {
+            // The zero child size prevents sampling; its scene-space empty origin can be
+            // arbitrarily far from the parent and must never be mapped into the atlas.
+            parent_rect
+        } else {
+            blend
+                .parent_region
+                .texture_rect(blend.child_region.layer_bbox)
+        };
         let geometry = clip_strip.map_or_else(
             || BlendGeometry {
                 rect: parent_rect,

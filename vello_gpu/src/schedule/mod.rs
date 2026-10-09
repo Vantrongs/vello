@@ -546,7 +546,13 @@ impl<'a, 'p> Scheduler<'a, 'p> {
         };
 
         OpenLayer {
-            cmds: &layer.nodes,
+            // The recorded commands may belong to a filter whose entire result moved outside
+            // the source domain. Replaying them in the transparent fallback would resurrect it.
+            cmds: if layer.bbox.is_empty() {
+                &[]
+            } else {
+                &layer.nodes
+            },
             kind,
             texture_parity: self.layer_texture_parity(layer.depth),
             bbox,

@@ -130,7 +130,7 @@ impl StripGenerator {
             source_segments: Vec::new(),
             #[cfg(test)]
             source_window_replays: 0,
-            tiles: Tiles::new(level, width, height),
+            tiles: Tiles::new(level, 0, 0),
             flatten_ctx: FlattenCtx::default(),
             stroke_ctx: StrokeCtx::default(),
             temp_storage: StripStorage::default(),
@@ -208,6 +208,9 @@ impl StripGenerator {
             fill_rule,
             clip_path,
             origin,
+            bounds.map_or((self.width, self.height), |bounds| {
+                (bounds.width(), bounds.height())
+            }),
         );
     }
 
@@ -269,6 +272,9 @@ impl StripGenerator {
             Fill::NonZero,
             clip_path,
             origin,
+            bounds.map_or((self.width, self.height), |bounds| {
+                (bounds.width(), bounds.height())
+            }),
         );
     }
 
@@ -483,13 +489,20 @@ impl StripGenerator {
         fill_rule: Fill,
         clip_path: Option<PathDataRef<'_>>,
         origin: (u32, u32),
+        size: (u32, u32),
     ) {
-        self.tiles.make_tiles_analytic_aa(
-            self.level,
-            &self.line_buf,
-            self.width - origin.0,
-            self.height - origin.1,
-        );
+        if self.line_buf.is_empty() {
+            render_with_clip(
+                self.level,
+                &mut self.temp_storage,
+                strip_storage,
+                clip_path,
+                |_, _| {},
+            );
+            return;
+        }
+        self.tiles
+            .make_tiles_analytic_aa(self.level, &self.line_buf, size.0, size.1);
 
         self.tiles.sort_tiles();
 
@@ -588,7 +601,7 @@ impl StripGenerator {
         self.width = width;
         self.height = height;
         self.line_buf.clear();
-        self.tiles.reset(width, height);
+        self.tiles.reset(0, 0);
         self.temp_storage.clear();
     }
 }
@@ -842,6 +855,73 @@ mod wide_tests {
             }
         }
         0
+    }
+
+    #[test]
+    fn sparse_source_tiles_allocate_for_geometry_instead_of_viewport_height() {
+        let end = u32::MAX - 3;
+        let mut generator = StripGenerator::new(end, end, Level::baseline());
+        let bounded = |generator: &StripGenerator| {
+            assert!(generator.tiles.windings.partial.capacity() <= 8);
+            assert!(generator.tiles.windings.coarse.capacity() <= 8);
+            assert!(generator.tiles.windings.active.capacity() <= 4);
+        };
+        bounded(&generator);
+        for origin in [0.0, f64::from(end - 4)] {
+            generator.reset(end, end);
+            bounded(&generator);
+            let rect = Rect::new(origin, origin, origin + 4.0, origin + 4.0);
+            let mut storage = StripStorage::default();
+            generator.generate_filled_rect_fast(&rect, &mut storage, None);
+            assert!(!storage.strips.is_empty());
+            bounded(&generator);
+            generator.generate_filled_path(
+                rect.to_path(0.1),
+                Fill::NonZero,
+                Affine::IDENTITY,
+                None,
+                &mut storage,
+                None,
+            );
+            assert!(!storage.strips.is_empty());
+            bounded(&generator);
+            generator.generate_stroked_path(
+                rect.to_path(0.1),
+                &crate::kurbo::Stroke::new(1.0),
+                Affine::IDENTITY,
+                None,
+                &mut storage,
+                None,
+            );
+            assert!(!storage.strips.is_empty());
+            bounded(&generator);
+        }
+        let mut storage = StripStorage::default();
+        generator.generate_filled_path(
+            core::iter::empty(),
+            Fill::NonZero,
+            Affine::IDENTITY,
+            None,
+            &mut storage,
+            None,
+        );
+        assert!(storage.strips.is_empty());
+        bounded(&generator);
+        let mut invalid = crate::kurbo::BezPath::new();
+        invalid.move_to((0.0, 0.0));
+        invalid.line_to((f64::NAN, 2.0));
+        invalid.line_to((2.0, 2.0));
+        invalid.close_path();
+        generator.generate_filled_path(
+            invalid,
+            Fill::NonZero,
+            Affine::IDENTITY,
+            None,
+            &mut storage,
+            None,
+        );
+        assert!(storage.strips.is_empty());
+        bounded(&generator);
     }
 
     #[test]

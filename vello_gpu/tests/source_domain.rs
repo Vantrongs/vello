@@ -395,6 +395,7 @@ fn wide_image_and_gradient_coordinates_match_local_render() {
 #[test]
 fn large_offsets_keep_small_gradient_and_image_sources_tight() {
     let gpu = Gpu::new();
+    let mut mismatches = Vec::new();
     for (width, height) in [(16, 4), (4, 16)] {
         let (mut renderer, mut resources) = Renderer::new(
             &gpu.device,
@@ -474,7 +475,15 @@ fn large_offsets_keep_small_gradient_and_image_sources_tight() {
             let expected = gpu
                 .scene(&mut renderer, &mut resources, &reference)
                 .unwrap();
-            for magnitude in [70_000.0_f32, 70_001.0, 262_148.0, 16_777_220.0] {
+            for magnitude in [
+                65_532.0_f32,
+                65_535.0,
+                65_536.0,
+                70_000.0,
+                70_001.0,
+                262_148.0,
+                16_777_220.0,
+            ] {
                 for direction in [-1.0, 1.0] {
                     for nested in [false, true] {
                         let offset = magnitude * direction;
@@ -503,16 +512,18 @@ fn large_offsets_keep_small_gradient_and_image_sources_tight() {
                             scene.pop_layer();
                         }
                         scene.pop_layer();
-                        assert_eq!(
-                            gpu.scene(&mut renderer, &mut resources, &scene).unwrap(),
-                            expected,
-                            "size={width}x{height},offset=({dx},{dy}),paint={paint_kind},path={draw_path},nested={nested}"
-                        );
+                        let actual = gpu.scene(&mut renderer, &mut resources, &scene).unwrap();
+                        if actual != expected {
+                            let different =
+                                actual.iter().zip(&expected).filter(|(a, b)| a != b).count();
+                            mismatches.push(format!("size={width}x{height},offset=({dx},{dy}),paint={paint_kind},path={draw_path},nested={nested}: {different} differing channels"));
+                        }
                     }
                 }
             }
         }
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]
@@ -668,4 +679,109 @@ fn empty_destructive_children_use_the_filtered_sources_coordinate_space() {
             }
         }
     }
+}
+
+#[test]
+fn disjoint_offset_children_preserve_destructive_composition() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let gpu = Gpu::new();
+    let mut failures = Vec::new();
+    for (nested, compose) in [false, true].into_iter().flat_map(|nested| {
+        [Compose::Clear, Compose::Copy]
+            .into_iter()
+            .map(move |compose| (nested, compose))
+    }) {
+        for axis in 0..2 {
+            for sign in [-1.0_f32, 1.0] {
+                let case = format!("nested={nested},compose={compose:?},axis={axis},sign={sign}");
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let (mut renderer, mut resources) = Renderer::new(
+                        &gpu.device,
+                        &RenderTargetConfig {
+                            width: 4,
+                            height: 4,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                        },
+                    );
+                    let (base_x, base_y) = if !nested {
+                        (0.0, 0.0)
+                    } else if axis == 0 {
+                        (70_000.0, 0.0)
+                    } else {
+                        (0.0, 70_000.0)
+                    };
+                    let mut scene = Scene::new(4, 4);
+                    scene.set_paint(BLUE);
+                    scene.fill_rect(&Rect::new(0.0, 0.0, 4.0, 4.0));
+                    if nested {
+                        // Copy the offscreen parent back into the root after its child clears it.
+                        scene.push_layer(
+                            None,
+                            Some(BlendMode::new(Mix::Normal, Compose::Copy)),
+                            None,
+                            None,
+                            Some(Filter::from_primitive(FilterPrimitive::Offset {
+                                dx: -base_x,
+                                dy: -base_y,
+                            })),
+                        );
+                        let parent_clip = Rect::new(
+                            f64::from(base_x),
+                            f64::from(base_y),
+                            f64::from(base_x) + 4.0,
+                            f64::from(base_y) + 4.0,
+                        )
+                        .to_path(0.1);
+                        scene.push_layer(Some(&parent_clip), None, None, None, None);
+                        scene.set_paint(RED);
+                        scene.fill_rect(&Rect::new(
+                            f64::from(base_x),
+                            f64::from(base_y),
+                            f64::from(base_x) + 4.0,
+                            f64::from(base_y) + 4.0,
+                        ));
+                    }
+                    let (dx, dy) = if axis == 0 {
+                        (sign * 70_000.0, 0.0)
+                    } else {
+                        (0.0, sign * 70_000.0)
+                    };
+                    scene.push_layer(
+                        None,
+                        Some(BlendMode::new(Mix::Normal, compose)),
+                        None,
+                        None,
+                        Some(Filter::from_primitive(FilterPrimitive::Offset { dx, dy })),
+                    );
+                    scene.set_paint(RED);
+                    scene.fill_rect(&Rect::new(
+                        f64::from(base_x),
+                        f64::from(base_y),
+                        f64::from(base_x) + 4.0,
+                        f64::from(base_y) + 4.0,
+                    ));
+                    scene.pop_layer();
+                    if nested {
+                        scene.pop_layer();
+                        scene.pop_layer();
+                    }
+                    let pixels = gpu.scene(&mut renderer, &mut resources, &scene).unwrap();
+                    assert_eq!(pixels, vec![0; 4 * 4 * 4], "{case}");
+                }));
+                if let Err(error) = result {
+                    let message = error
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| {
+                            error
+                                .downcast_ref::<&str>()
+                                .map(|message| (*message).to_owned())
+                        })
+                        .unwrap_or_else(|| "non-string panic".to_owned());
+                    failures.push(format!("{case}: {message}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
