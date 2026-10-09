@@ -13,7 +13,7 @@ use std::time::Instant;
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{FlattenCtx, Line, fill, stroke};
 use vello_common::geometry::RectU16;
-use vello_common::kurbo::{Affine, BezPath, Stroke, StrokeCtx};
+use vello_common::kurbo::{Affine, BezPath, Join, Stroke, StrokeCtx};
 
 /// Counts the bytes in use and their peak, and refuses requests over `CAP`, so code
 /// that sizes a buffer by the coordinates aborts instead of exhausting the machine.
@@ -176,7 +176,8 @@ fn squash() -> Affine {
 /// A nearly singular transform (determinant 1e-20): x compressed by 1e20 and sheared
 /// into y, rotated by 30°, with (10, 10) at (50, 50).
 fn nearly_singular() -> Affine {
-    let linear = Affine::rotate(30_f64.to_radians()) * Affine::new([1e-20, 0.0, 0.3, 1.0, 0.0, 0.0]);
+    let linear =
+        Affine::rotate(30_f64.to_radians()) * Affine::new([1e-20, 0.0, 0.3, 1.0, 0.0, 0.0]);
     let at = linear * vello_common::kurbo::Point::new(10.0, 10.0);
     Affine::translate((50.0 - at.x, 50.0 - at.y)) * linear
 }
@@ -270,14 +271,15 @@ fn dashed_wide_line() {
     );
 }
 
-/// The winding number of the closed polygons `lines` around `p`.
+/// The winding number of the polygons `lines` around `p`, counted from the left:
+/// the fill drops lines right of the view, which change no winding in it.
 fn winding(lines: &[Line], p: (f32, f32)) -> i32 {
     let mut w = 0;
     for l in lines {
         let (a, b) = (l.p0, l.p1);
         if (a.y <= p.1) != (b.y <= p.1) {
             let x = a.x + (p.1 - a.y) / (b.y - a.y) * (b.x - a.x);
-            if x > p.0 {
+            if x < p.0 {
                 w += if b.y > a.y { 1 } else { -1 };
             }
         }
@@ -404,5 +406,133 @@ fn fine_dashes_wide() {
         tiny_line(),
         Draw::Stroke(fine_dashes(Stroke::new(3e4))),
         Affine::scale(1e-4),
+    );
+}
+
+/// A miter limit that widens the stroke's view so far that the first piece in it
+/// spends the segment's polyline lines; the pieces after it must not reach kurbo's
+/// flattener as curves of their path-space size.
+fn mitred(width: f64, limit: f64) -> Stroke {
+    Stroke::new(width)
+        .with_join(Join::Miter)
+        .with_miter_limit(limit)
+}
+
+/// The first review's case: under `squash`, the cubic (10, 10) C (1e10, 10)
+/// (-1e10, 10) (20, 10) on the device.
+fn squashed_far() -> BezPath {
+    let mut p = BezPath::new();
+    p.move_to((1e21, 10.0));
+    p.curve_to((1e30, 10.0), (-1e30, 10.0), (2e21, 10.0));
+    p
+}
+
+/// The second review's case, untransformed.
+fn swung() -> BezPath {
+    let mut p = BezPath::new();
+    p.move_to((10.0, 10.0));
+    p.curve_to((1e24, 0.0), (-1e24, 1e24), (20.0, 10.0));
+    p
+}
+
+#[test]
+fn spent_polyline_squashed() {
+    check_under(
+        "spent polyline squashed",
+        squashed_far(),
+        Draw::Stroke(mitred(1.0, 2e9)),
+        squash(),
+    );
+}
+
+#[test]
+fn spent_polyline_squashed_dashed() {
+    check_under(
+        "spent polyline squashed dashed",
+        squashed_far(),
+        Draw::Stroke(dashed(mitred(1.0, 2e9))),
+        squash(),
+    );
+}
+
+#[test]
+fn spent_polyline_swung() {
+    check(
+        "spent polyline swung",
+        swung(),
+        Draw::Stroke(mitred(0.5, 1.1e24)),
+    );
+}
+
+#[test]
+fn spent_polyline_swung_dashed() {
+    check(
+        "spent polyline swung dashed",
+        swung(),
+        Draw::Stroke(dashed(mitred(0.5, 1.1e24))),
+    );
+}
+
+/// A line 64 980 px long across the view along y = 50.
+fn long_device_line() -> BezPath {
+    let mut p = BezPath::new();
+    p.move_to((-32_440.0, 50.0));
+    p.line_to((32_540.0, 50.0));
+    p
+}
+
+/// 10 000 entries of 1e-5, a period of 0.1: on `long_device_line` only 649 800
+/// periods, but 6.5e9 dashes and gaps, as many as the two-entry `[1e-5, 1e-5]` has.
+fn many_entries(s: Stroke, entry: f64) -> Stroke {
+    s.with_dashes(0.0, vec![entry; 10_000])
+}
+
+/// A pattern of many tiny entries costs what the equivalent two-entry pattern does,
+/// and covers the same (where their subpaths break differs: the phase at a piece's
+/// end rounds differently).
+fn many_entries_as_two(name: &str, s: Stroke, half: f32) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let path = long_device_line();
+    let two = s.clone().with_dashes(0.0, [1e-5, 1e-5]);
+    let a = run(
+        name,
+        &path,
+        &Draw::Stroke(many_entries(s, 1e-5)),
+        Affine::IDENTITY,
+    );
+    let b = run(name, &path, &Draw::Stroke(two), Affine::IDENTITY);
+    assert!(reaches_view(&a), "{name}: nothing in view");
+    for x in 0..200 {
+        for y in [45.0, 50.05 - half, 50.0, 49.95 + half, 55.0] {
+            let p = (x as f32 * 0.5 + 0.25, y);
+            let covered = |l: &[Line]| winding(l, p) != 0;
+            assert_eq!(covered(&a), covered(&b), "{name}: {p:?}");
+            assert_eq!(
+                covered(&a),
+                (50.0 - half..=50.0 + half).contains(&y),
+                "{name}: {p:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn many_entries_thin() {
+    many_entries_as_two("many entries thin", thin(), 0.5);
+}
+
+#[test]
+fn many_entries_wide() {
+    many_entries_as_two("many entries wide", wide(), 1.5);
+}
+
+/// Entries of 1 px on the review's cubic: few in view, but each piece skipped on
+/// the way down from 1e24 walks up to a whole period, 10 000 entries.
+#[test]
+fn many_entries_on_hidden_pieces() {
+    check(
+        "many entries on hidden pieces",
+        collinear(),
+        Draw::Stroke(many_entries(wide(), 1.0)),
     );
 }
