@@ -25,6 +25,7 @@ struct ClipData {
     ///
     /// These bounds have already been intersected with the viewport.
     bbox: RectU16,
+    opaque_bbox: Option<RectU16>,
 }
 
 impl ClipData {
@@ -40,6 +41,7 @@ impl ClipData {
                     .get(self.alpha_start as usize..)
                     .unwrap_or(&[]),
                 bbox: self.bbox,
+                opaque_bbox: self.opaque_bbox,
             },
             shape: self.shape,
         }
@@ -133,12 +135,14 @@ impl ClipContext {
         let shape = generate(strip_generator, &mut self.temp_storage, existing_clip);
 
         let bbox = strip_bbox(&self.temp_storage.strips).unwrap_or(RectU16::ZERO);
+        let opaque_bbox = opaque_fill_bbox(&self.temp_storage.strips);
         self.storage.extend(&self.temp_storage);
         self.clip_stack.push(ClipData {
             alpha_start,
             strip_start,
             shape,
             bbox,
+            opaque_bbox,
         });
     }
 
@@ -367,6 +371,42 @@ pub struct PathDataRef<'a> {
     ///
     /// These bounds have already been intersected with the viewport.
     pub bbox: RectU16,
+    /// A rectangle guaranteed to have coverage 255 throughout the accumulated mask.
+    /// `None` provides no opacity guarantee; the geometric bounding box is insufficient.
+    pub opaque_bbox: Option<RectU16>,
+}
+
+/// Find a conservative opaque rectangle using only implicit fully filled gaps.
+/// Alpha strips, including apparently rectangular antialiased edges, give no proof.
+fn opaque_fill_bbox(strips: &[Strip]) -> Option<RectU16> {
+    let mut current = RectU16::ZERO;
+    let mut best = RectU16::ZERO;
+    let area = |r: RectU16| u32::from(r.x1 - r.x0) * u32::from(r.y1 - r.y0);
+    for pair in strips.windows(2) {
+        let (strip, next) = (&pair[0], &pair[1]);
+        if !next.fill_gap() || next.y != strip.y {
+            continue;
+        }
+        let x0 = strip.x + strip.width_to(next);
+        if x0 >= next.x {
+            continue;
+        }
+        let row = RectU16::new(x0, strip.y, next.x, strip.y.saturating_add(Tile::HEIGHT));
+        if current.y1 == row.y0 && current.x0.max(row.x0) < current.x1.min(row.x1) {
+            current = RectU16::new(
+                current.x0.max(row.x0),
+                current.y0,
+                current.x1.min(row.x1),
+                row.y1,
+            );
+        } else {
+            current = row;
+        }
+        if area(current) > area(best) {
+            best = current;
+        }
+    }
+    (!best.is_empty()).then_some(best)
 }
 
 /// The known geometric shape of an active clip.
@@ -833,13 +873,190 @@ mod tests {
         first_strip_at_or_after, intersect,
     };
     use crate::geometry::RectU16;
-    use crate::kurbo::{Affine, BezPath, Rect};
+    use crate::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
     use crate::peniko::Fill;
     use crate::strip::Strip;
     use crate::strip_generator::{StripGenerator, StripStorage};
     use crate::tile::Tile;
     use fearless_simd::Level;
     use std::vec;
+
+    // Decode sparse strips independently of clipping's RowIterator, including fractional AA.
+    fn coverage(strips: &[Strip], alphas: &[u8]) -> vec::Vec<u8> {
+        let mut pixels = vec![0; 100 * 100];
+        for pair in strips.windows(2) {
+            let (strip, next) = (pair[0], pair[1]);
+            if strip.is_sentinel() {
+                continue;
+            }
+            let end = strip.x + strip.width_to(&next);
+            for x in strip.x..end.min(100) {
+                for dy in 0..Tile::HEIGHT {
+                    let y = strip.y + dy;
+                    if y < 100 {
+                        pixels[y as usize * 100 + x as usize] = alphas[strip.alpha_idx() as usize
+                            + (x - strip.x) as usize * Tile::HEIGHT as usize
+                            + dy as usize];
+                    }
+                }
+            }
+            if next.fill_gap() && strip.y == next.y {
+                for x in end..next.x.min(100) {
+                    for y in strip.y..(strip.y + Tile::HEIGHT).min(100) {
+                        pixels[y as usize * 100 + x as usize] = 255;
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn opaque_clip_proof_preserves_accumulated_masks_and_draw_coverage() {
+        use crate::strip_generator::{CLIP_BYPASSES, GenerationMode};
+        let outer = Rect::new(3.25, 4.5, 95.75, 94.25).to_path(0.1);
+        let inner = Rect::new(5.5, 6.25, 90.5, 90.75).to_path(0.1);
+        let mut holed = outer.clone();
+        holed.extend(Rect::new(35.25, 30.5, 65.75, 70.25).to_path(0.1).iter());
+        let mut triangle = BezPath::new();
+        triangle.move_to((-20.0, 12.25));
+        triangle.line_to((90.75, 20.5));
+        triangle.line_to((75.25, 120.0));
+        triangle.close_path();
+        let mut bypasses = 0;
+        let mut intersections = 0;
+        for fill in [Fill::NonZero, Fill::EvenOdd] {
+            for threshold in [None, Some(128)] {
+                for clip_paths in [
+                    vec![outer.clone()],
+                    vec![outer.clone(), inner.clone()],
+                    vec![holed.clone(), inner.clone()],
+                    vec![triangle.clone()],
+                ] {
+                    let mut generator = StripGenerator::new(100, 100, Level::baseline());
+                    let mut actual_clip = ClipContext::new();
+                    let mut reference_clip = ClipContext::new();
+                    for path in &clip_paths {
+                        actual_clip.push_clip_path(
+                            path.iter(),
+                            &mut generator,
+                            fill,
+                            Affine::IDENTITY,
+                            threshold,
+                        );
+                        reference_clip.push_clip_path(
+                            path.iter(),
+                            &mut generator,
+                            fill,
+                            Affine::IDENTITY,
+                            threshold,
+                        );
+                        reference_clip.clip_stack.last_mut().unwrap().opaque_bbox = None;
+                        let actual = actual_clip.get().unwrap().path;
+                        let reference = reference_clip.get().unwrap().path;
+                        assert_eq!(
+                            coverage(actual.strips, actual.alphas),
+                            coverage(reference.strips, reference.alphas)
+                        );
+                        if let Some(opaque) = actual.opaque_bbox {
+                            let pixels = coverage(actual.strips, actual.alphas);
+                            for y in opaque.y0..opaque.y1 {
+                                for x in opaque.x0..opaque.x1 {
+                                    assert_eq!(
+                                        pixels[y as usize * 100 + x as usize],
+                                        255,
+                                        "opacity proof at ({x},{y})"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let mut actual = StripStorage::default();
+                    let mut expected = StripStorage::default();
+                    for rect in [
+                        Rect::new(16.25, 16.5, 28.75, 24.25),
+                        Rect::new(3.25, 4.5, 95.75, 94.25),
+                        Rect::new(40.25, 40.5, 60.75, 60.25),
+                        Rect::new(-10.5, -3.25, 50.75, 13.5),
+                        Rect::new(94.5, 90.25, 115.75, 110.5),
+                    ] {
+                        for stroke in [false, true] {
+                            // Keep existing alpha bytes and append strips to verify rebasing.
+                            let actual_start = actual.strips.len();
+                            let expected_start = expected.strips.len();
+                            let count = CLIP_BYPASSES.with(core::cell::Cell::get);
+                            if stroke {
+                                generator.generate_stroked_path(
+                                    rect.to_path(0.1),
+                                    &Stroke::new(1.75),
+                                    Affine::IDENTITY,
+                                    threshold,
+                                    &mut actual,
+                                    Some(actual_clip.get().unwrap().path),
+                                );
+                                generator.generate_stroked_path(
+                                    rect.to_path(0.1),
+                                    &Stroke::new(1.75),
+                                    Affine::IDENTITY,
+                                    threshold,
+                                    &mut expected,
+                                    Some(reference_clip.get().unwrap().path),
+                                );
+                            } else {
+                                generator.generate_filled_path(
+                                    rect.to_path(0.1),
+                                    fill,
+                                    Affine::IDENTITY,
+                                    threshold,
+                                    &mut actual,
+                                    Some(actual_clip.get().unwrap().path),
+                                );
+                                generator.generate_filled_path(
+                                    rect.to_path(0.1),
+                                    fill,
+                                    Affine::IDENTITY,
+                                    threshold,
+                                    &mut expected,
+                                    Some(reference_clip.get().unwrap().path),
+                                );
+                            }
+                            if CLIP_BYPASSES.with(core::cell::Cell::get) > count {
+                                bypasses += 1;
+                            } else {
+                                intersections += 1;
+                            }
+                            assert_eq!(
+                                coverage(&actual.strips[actual_start..], &actual.alphas),
+                                coverage(&expected.strips[expected_start..], &expected.alphas),
+                                "fill={fill:?} threshold={threshold:?} rect={rect:?} stroke={stroke}"
+                            );
+                            actual.set_generation_mode(GenerationMode::Append);
+                            expected.set_generation_mode(GenerationMode::Append);
+                        }
+                    }
+                    while actual_clip.get().is_some() {
+                        actual_clip.pop_clip();
+                        reference_clip.pop_clip();
+                        if let Some(clip) = actual_clip.get() {
+                            let reference = reference_clip.get().unwrap();
+                            assert_eq!(
+                                coverage(clip.path.strips, clip.path.alphas),
+                                coverage(reference.path.strips, reference.path.alphas)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            bypasses > 0,
+            "the exact-pixel comparison must exercise the shortcut"
+        );
+        assert!(
+            intersections > 0,
+            "fractional boundaries and holes must keep mask intersection"
+        );
+    }
 
     #[test]
     fn rectangular_clip_metadata_tracks_intersections_and_pops() {
@@ -1022,6 +1239,7 @@ mod tests {
             strips: &path_1.strips,
             alphas: &path_1.alphas,
             bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
+            opaque_bbox: None,
         };
 
         let mut idx = 0;
@@ -1154,6 +1372,7 @@ mod tests {
             strips: &path.strips,
             alphas: &path.alphas,
             bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
+            opaque_bbox: None,
         }
     }
 

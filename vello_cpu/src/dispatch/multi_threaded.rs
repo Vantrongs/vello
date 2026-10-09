@@ -269,6 +269,7 @@ impl MultiThreadedDispatcher {
             strips: c.path.strips.into(),
             alphas: c.path.alphas.into(),
             bbox: c.path.bbox,
+            opaque_bbox: c.path.opaque_bbox,
             shape: c.shape,
         });
         let task = RenderTask {
@@ -740,6 +741,7 @@ pub(crate) struct OwnedClip {
     ///
     /// These bounds have already been intersected with the viewport.
     bbox: RectU16,
+    opaque_bbox: Option<RectU16>,
     /// The known geometric shape of this clip.
     shape: ClipShape,
 }
