@@ -14,44 +14,51 @@
 //!
 //! The reach of a blur, and with it the source it reads, grows with its
 //! standard deviation. A blur decimates its source in steps of two before it
-//! convolves it, so a blur that decimates more than [`EXACT_DECIMATIONS`] times
-//! reads its source rendered that much coarser, and only its output is
-//! upscaled back to full resolution. Its work then stays bounded however wide
-//! the blur is. Blurs that decimate less read the source at full resolution
-//! and give exactly the result of filtering the whole source.
+//! convolves it, so a blur that decimates more than [`EXACT_DECIMATIONS`]
+//! times reads its source averaged over squares of pixels, so many steps
+//! coarser that this many decimations remain, and only its output is upscaled
+//! back to full resolution. Its memory then stays bounded however wide the
+//! blur is, while every pixel of the source still counts.
 
 use crate::filter::context::ScratchBuffer;
 use crate::filter::drop_shadow::source_over;
-use crate::filter::filter_reduced;
 use crate::filter::pixmap::FilterPixmap;
 use crate::filter::placed::{Bounds, Index, Pieces, PlacedPixmap, Regions, Shift, pixel_size};
+use crate::filter::{blur_reduced, upscale_reduced};
 use crate::kurbo::Affine;
 use alloc::vec::Vec;
 use vello_common::filter::{FilterData, PreparedFilter};
 use vello_common::geometry::PaddingU64;
 
-/// The number of decimations a blur performs on a source rendered at full
-/// resolution. A blur that decimates more reads its source rendered so much
-/// coarser that this many decimations remain.
+/// The number of decimations a blur performs on its source at full
+/// resolution. A blur that decimates more reads its source averaged over
+/// squares of pixels so large that this many decimations remain.
 pub(crate) const EXACT_DECIMATIONS: usize = 5;
 
 /// Return `filter` with its parameters in the grid of root target pixels
 /// `2^level` wide.
-pub(crate) fn filter_at(filter: &FilterData, level: u32) -> FilterData {
+fn filter_at(filter: &FilterData, level: u32) -> FilterData {
     FilterData::new(
         filter.filter.clone(),
         Affine::scale(1.0 / pixel_size(level)) * filter.transform,
     )
 }
 
-/// How a filter reads its source and writes its output in one pixel grid.
+/// How a filter reads its source and writes its output, in the root grid.
 #[derive(Clone, Debug)]
 pub(crate) struct Reach {
-    /// The filter, with its parameters in the pixel grid of the output.
     filter: FilterData,
     effect: Effect,
     /// By how many steps of two the source the filter reads is coarser than the output.
     reduction: u32,
+    /// The period of the pyramid of a blur that reads its source at full
+    /// resolution, in pixels: its decimations line up wherever the pixmaps it
+    /// runs on start a multiple of it apart.
+    period: i64,
+    /// How far around each pixel the output of such a blur depends on the
+    /// pixmap it runs on, by the taps of its decimations, convolution and
+    /// upscaling, which reach beyond the blur's padding.
+    cone: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,9 +82,9 @@ enum Effect {
     },
 }
 
-/// The offset of `filter` in the grid of root target pixels `2^level` wide, if it moves its source.
-fn offset_at(filter: &FilterData, level: u32) -> (Shift, Shift) {
-    filter_at(filter, level)
+/// The offset of `filter`, if it moves its source.
+fn offset_of(filter: &FilterData) -> (Shift, Shift) {
+    filter
         .displacement()
         .map_or_else(Default::default, |displacement| {
             let (dx, dy) = displacement.offset;
@@ -86,38 +93,36 @@ fn offset_at(filter: &FilterData, level: u32) -> (Shift, Shift) {
 }
 
 impl Reach {
-    /// Return how `filter`, whose parameters are in the root grid, reads and
-    /// writes in the grid of root target pixels `2^level` wide, with its output
-    /// moved further by the offset filters `shifts`. Unless `moves` is set, the
-    /// offset of `filter` itself is left out.
-    pub(crate) fn new(filter: &FilterData, level: u32, shifts: &[FilterData], moves: bool) -> Self {
-        let output = filter_at(filter, level);
-        let decimations = match PreparedFilter::new(&output.filter, &output.transform) {
-            PreparedFilter::GaussianBlur(blur) => blur.n_decimations,
-            PreparedFilter::DropShadow(shadow) => shadow.n_decimations,
-            PreparedFilter::Flood(_) | PreparedFilter::Offset(_) => 0,
+    /// Return how `filter` reads and writes, with its output moved further by
+    /// the offset filters `shifts`. Unless `moves` is set, the offset of
+    /// `filter` itself is left out.
+    pub(crate) fn new(filter: &FilterData, shifts: &[FilterData], moves: bool) -> Self {
+        let (decimations, radius) = match PreparedFilter::new(&filter.filter, &filter.transform) {
+            PreparedFilter::GaussianBlur(blur) => (blur.n_decimations, blur.kernel_size / 2),
+            PreparedFilter::DropShadow(shadow) => (shadow.n_decimations, shadow.kernel_size / 2),
+            PreparedFilter::Flood(_) | PreparedFilter::Offset(_) => (0, 0),
         };
         let reduction = u32::try_from(decimations.saturating_sub(EXACT_DECIMATIONS)).unwrap();
         // Paddings are taken in the grid they apply in, where they stay small
         // however wide the blur is.
         let source = if reduction == 0 {
-            output.clone()
+            filter.clone()
         } else {
-            filter_at(filter, level + reduction)
+            filter_at(filter, reduction)
         };
         // Offsets are summed before they are narrowed, so that opposite ones
         // cancel however far they reach.
         let shift = shifts
             .iter()
-            .map(|shift| offset_at(shift, level))
+            .map(offset_of)
             .fold(<(Shift, Shift)>::default(), |(x, y), (dx, dy)| {
                 (x.add(dx), y.add(dy))
             });
         let narrow = |(x, y): (Shift, Shift)| (x.saturated(), y.saturated());
-        let effect = match (output.displacement(), source.displacement()) {
+        let effect = match (filter.displacement(), source.displacement()) {
             (Some(displacement), Some(coarse)) => {
                 let own = if moves {
-                    offset_at(filter, level)
+                    offset_of(filter)
                 } else {
                     Default::default()
                 };
@@ -134,10 +139,15 @@ impl Reach {
                 offset: narrow(shift),
             },
         };
+        // Only blurs that read their source at full resolution use these,
+        // and those decimate at most `EXACT_DECIMATIONS` times.
+        let decimations = decimations.min(EXACT_DECIMATIONS);
         Self {
-            filter: output,
+            filter: filter.clone(),
             effect,
             reduction,
+            period: 1 << decimations,
+            cone: (u64::from(radius) + 4) << decimations,
         }
     }
 
@@ -218,12 +228,13 @@ impl Reach {
     }
 }
 
-/// How a filter layer reads its source and writes its output, in the pixel
-/// grid of the output.
+/// How a filter layer reads its source and writes its output.
 #[derive(Debug)]
 pub(crate) struct FilterPlan {
     reach: Reach,
     outputs: Vec<Output>,
+    /// The bounds of the outputs, indexed.
+    index: Index,
 }
 
 /// A region of the output with the source it reads.
@@ -237,8 +248,8 @@ struct Output {
 }
 
 /// Where the parts of one output region are computed, given where the source has content.
-#[derive(Debug)]
-struct Layout {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Layout {
     /// The pixmap the filter runs on, in the grid of the source it reads.
     filtered: Bounds,
     /// The filtered output, in the output's grid before it is moved.
@@ -249,10 +260,35 @@ struct Layout {
     extent: Bounds,
 }
 
+impl Layout {
+    /// Return the source to render for the layout at full resolution: the
+    /// kept source, and the pixmap the filter runs on unless it reads a
+    /// coarser source.
+    pub(crate) fn sources(&self, reduced: bool) -> Regions {
+        let mut sources = Regions::default();
+        sources.insert(self.kept);
+        if !reduced {
+            sources.insert(self.filtered);
+        }
+        sources
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.extent.is_empty()
+    }
+}
+
+/// A pixmap a blur that reads a coarser source has run on, see [`FilterPlan::blur`].
+#[derive(Debug)]
+pub(crate) struct Blurred {
+    pixmap: FilterPixmap,
+    bounds: Bounds,
+}
+
 impl FilterPlan {
     /// Plan the output of a filter that reads and writes as `reach` inside `outputs`.
     pub(crate) fn new(reach: Reach, outputs: &Regions) -> Self {
-        let outputs = outputs
+        let outputs: Vec<Output> = outputs
             .iter()
             .map(|bounds| {
                 let (kept, filtered) = reach.reads(bounds);
@@ -263,7 +299,11 @@ impl FilterPlan {
                 }
             })
             .collect();
-        Self { reach, outputs }
+        Self {
+            index: Index::new(outputs.iter().map(|output| output.bounds)),
+            reach,
+            outputs,
+        }
     }
 
     /// Return by how many steps of two the source the filter reads is coarser
@@ -309,18 +349,136 @@ impl FilterPlan {
             .iter()
             .map(|output| {
                 let layout = self.layout(output, kept.index(), filtered.index());
-                let mut pixmap = PlacedPixmap::new(layout.extent);
-                if !layout.filtered.is_empty() {
-                    let result = self.filter_source(&layout, filtered, scratch, apply);
-                    pixmap.copy_from(&result.translate(self.reach.offset()), layout.extent);
-                }
-                if !layout.kept.is_empty() {
-                    let kept = kept.crop(layout.kept).translate(self.reach.kept_offset());
-                    pixmap.combine(&kept, kept.bounds, source_over);
-                }
-                pixmap
+                let blurred = (self.reduction() > 0 && !layout.filtered.is_empty())
+                    .then(|| self.blur(&layout, filtered, scratch));
+                self.compose(&layout, kept, filtered, blurred.as_ref(), scratch, apply)
             })
             .collect()
+    }
+
+    /// Return the outputs whose regions overlap `area`, each with the part of
+    /// it there laid out, given the bounds of the source as in [`Self::render`].
+    ///
+    /// The part of an output region is computed exactly as the whole region
+    /// is: a filter that reads a coarser source runs on the same pixmap, and
+    /// any other runs on the part of that pixmap its output there depends on,
+    /// placed where its decimations line up with those of the whole.
+    pub(crate) fn parts(
+        &self,
+        area: Bounds,
+        kept: &Index,
+        filtered: &Index,
+    ) -> Vec<(usize, Layout)> {
+        let mut parts: Vec<(usize, Layout)> = self
+            .index
+            .touching(area)
+            .map(|(index, _)| (index, self.part(index, area, kept, filtered)))
+            .filter(|(_, layout)| !layout.is_empty())
+            .collect();
+        parts.sort_unstable_by_key(|&(index, _)| index);
+        parts
+    }
+
+    fn part(&self, index: usize, area: Bounds, kept: &Index, filtered: &Index) -> Layout {
+        let whole = self.layout(&self.outputs[index], kept, filtered);
+        let (dx, dy) = self.reach.offset();
+        let (kx, ky) = self.reach.kept_offset();
+        let result = whole.result.intersect(area.translate((-dx, -dy)));
+        let kept = whole.kept.intersect(area.translate((-kx, -ky)));
+        let pixmap = if result.is_empty() {
+            Bounds::EMPTY
+        } else if self.reduction() > 0 {
+            whole.filtered
+        } else {
+            let cone = result
+                .expand(PaddingU64::new(
+                    self.reach.cone,
+                    self.reach.cone,
+                    self.reach.cone,
+                    self.reach.cone,
+                ))
+                .intersect(whole.filtered);
+            let period = self.reach.period;
+            let align = |start: i64, value: i64| start + (value - start) / period * period;
+            Bounds::new(
+                align(whole.filtered.x0, cone.x0),
+                align(whole.filtered.y0, cone.y0),
+                cone.x1,
+                cone.y1,
+            )
+        };
+        Layout {
+            filtered: pixmap,
+            result,
+            kept,
+            extent: result.translate((dx, dy)).union(kept.translate((kx, ky))),
+        }
+    }
+
+    /// Run the filter, which reads a coarser source, on the pixmap of `layout`
+    /// with the source in `filtered`.
+    pub(crate) fn blur(
+        &self,
+        layout: &Layout,
+        filtered: &Pieces,
+        scratch: &mut ScratchBuffer,
+    ) -> Blurred {
+        let mut pixmap = filtered.crop(layout.filtered);
+        blur_reduced(
+            &self.prepared(),
+            &mut pixmap.pixmap,
+            self.reduction(),
+            scratch,
+        );
+        Blurred {
+            pixmap: pixmap.pixmap,
+            bounds: pixmap.bounds,
+        }
+    }
+
+    /// Compute the output of `layout` from the rendered source as in
+    /// [`Self::render`]; a filter that reads a coarser source takes it from
+    /// `blurred`, which [`Self::blur`] returned for the whole of its output region.
+    pub(crate) fn compose(
+        &self,
+        layout: &Layout,
+        kept: &Pieces,
+        filtered: &Pieces,
+        blurred: Option<&Blurred>,
+        scratch: &mut ScratchBuffer,
+        apply: &mut dyn FnMut(&mut FilterPixmap, PreparedFilter, &mut ScratchBuffer),
+    ) -> PlacedPixmap {
+        let mut pixmap = PlacedPixmap::new(layout.extent);
+        if !layout.filtered.is_empty() {
+            let result = if let Some(blurred) = blurred {
+                let origin = (blurred.bounds.x0, blurred.bounds.y0);
+                PlacedPixmap {
+                    pixmap: upscale_reduced(
+                        &self.prepared(),
+                        &blurred.pixmap,
+                        self.reduction(),
+                        origin,
+                        layout.result,
+                    ),
+                    bounds: layout.result,
+                }
+            } else {
+                let mut pixmap = filtered.crop(layout.filtered);
+                apply(&mut pixmap.pixmap, self.prepared(), scratch);
+                pixmap.crop(layout.result)
+            };
+            pixmap.copy_from(&result.translate(self.reach.offset()), layout.extent);
+        }
+        if !layout.kept.is_empty() {
+            let kept = kept.crop(layout.kept).translate(self.reach.kept_offset());
+            pixmap.combine(&kept, kept.bounds, source_over);
+        }
+        pixmap
+    }
+
+    fn prepared(&self) -> PreparedFilter {
+        let filter = &self.reach.filter;
+        PreparedFilter::new(&filter.filter, &filter.transform)
     }
 
     /// Return the pixmaps the filter runs on, given the bounds of the rendered
@@ -360,36 +518,6 @@ impl FilterPlan {
             extent: result
                 .translate((dx, dy))
                 .union(kept.translate(self.reach.kept_offset())),
-        }
-    }
-
-    /// Filter the source in `filtered` inside the pixmap of `layout` and return
-    /// the result.
-    fn filter_source(
-        &self,
-        layout: &Layout,
-        filtered: &Pieces,
-        scratch: &mut ScratchBuffer,
-        apply: &mut dyn FnMut(&mut FilterPixmap, PreparedFilter, &mut ScratchBuffer),
-    ) -> PlacedPixmap {
-        let mut pixmap = filtered.crop(layout.filtered);
-        let filter = &self.reach.filter;
-        let prepared = PreparedFilter::new(&filter.filter, &filter.transform);
-        if self.reduction() == 0 {
-            apply(&mut pixmap.pixmap, prepared, scratch);
-            return pixmap.crop(layout.result);
-        }
-        let origin = (pixmap.bounds.x0, pixmap.bounds.y0);
-        PlacedPixmap {
-            pixmap: filter_reduced(
-                prepared,
-                pixmap.pixmap,
-                self.reduction(),
-                origin,
-                layout.result,
-                scratch,
-            ),
-            bounds: layout.result,
         }
     }
 }

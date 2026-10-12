@@ -27,16 +27,16 @@
 use super::Dispatcher;
 use super::single_threaded::SingleThreadedDispatcher;
 use crate::RasterizerSettings;
-use crate::filter::averaged_image::averaged;
 use crate::filter::context::ScratchBuffer;
-use crate::filter::placed::{Bounds, Index, Pieces, PlacedPixmap, Regions, pixel_size};
-use crate::filter::plan::{FilterPlan, Reach};
+use crate::filter::placed::{Bounds, Index, Pieces, PlacedPixmap, Regions};
+use crate::filter::plan::{Blurred, FilterPlan, Reach};
 use crate::fine::FineKernel;
 use crate::kurbo::{Affine, BezPath, Join, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 use vello_common::clip::PushedClip;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd};
@@ -44,7 +44,7 @@ use vello_common::filter::FilterData;
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
-use vello_common::paint::{ImageResolver, ImageSource, Paint};
+use vello_common::paint::{ImageResolver, Paint};
 use vello_common::pixmap::PixmapMut;
 use vello_common::tile::Tile;
 
@@ -206,7 +206,7 @@ impl Recording {
             &mut layers,
         );
         fold_far_shifts(&self.commands, &mut layers);
-        FilterGraph::new(&self.commands, &layers, self.view, level)
+        FilterGraph::new(self.commands, layers, self.view, level)
     }
 }
 
@@ -649,19 +649,6 @@ impl Layer {
 }
 
 impl Command {
-    /// Return the index of the encoded paint the command paints with, if any.
-    fn paint(&self) -> Option<usize> {
-        match self {
-            Self::FillPath { paint, .. }
-            | Self::StrokePath { paint, .. }
-            | Self::FillRect { paint, .. } => match paint {
-                Paint::Indexed(paint) => Some(paint.index()),
-                Paint::Solid(_) => None,
-            },
-            Self::PushLayer(_) | Self::PopLayer | Self::PushClip(_) | Self::PopClip => None,
-        }
-    }
-
     /// Return a rectangle in root target coordinates that holds everything the
     /// command draws, or `None` if it draws nothing itself.
     fn bounds(&self) -> Option<Rect> {
@@ -720,53 +707,56 @@ fn matching_pop(commands: &[Command], push: usize) -> usize {
 /// replayed into windows.
 #[derive(Debug)]
 pub(crate) struct FilterGraph {
-    /// One node for each layer and pixel grid its output is needed in, children
-    /// after their parents. The first is the recorded layer in the root grid.
+    commands: Vec<Command>,
+    layers: Vec<GraphLayer>,
+    /// One node for each layer, children after their parents. The first is
+    /// the recorded layer.
     nodes: Vec<Node>,
+    simd_level: Level,
 }
 
-/// A filter layer with its output in one pixel grid.
+/// A filter layer with its output planned.
+///
+/// The output is needed where it is composited into the windows of its parent
+/// or into the view, which are replayed in advance, and where the source of a
+/// blur that reads a coarser source is decimated, which streams the source of
+/// its nested filter layers tile by tile, see [`Rendering::decimate`].
 #[derive(Debug)]
 struct Node {
+    /// The output that is composited into windows replayed in advance.
     plan: FilterPlan,
-    /// Windows of the source in the output's grid.
+    /// Windows of the source of `plan`.
     windows: Vec<Window>,
-    /// Windows of the source the filter reads, if that is coarser than the output.
-    coarse: Vec<Window>,
-    /// Where the output has content, in the output's grid.
+    /// Where the output of `plan` has content.
     extents: Index,
+    /// The output that is read where a coarser source is decimated.
+    streamed: FilterPlan,
+    /// Where the source of `streamed` can have content, and where the source
+    /// its filter reads can, in that source's grid.
+    content: Index,
+    filtered: Index,
+    /// Regions of the source the filter reads if that is coarser than the
+    /// output, each pixel the average of the source pixels it covers.
+    decimated: Vec<Bounds>,
+    /// Where the source of `decimated` can have content at full resolution.
+    decimated_content: Regions,
 }
 
 /// The planned regions of a node, before its windows are replayed.
 struct Planned {
-    layer: usize,
-    /// The pixel grid of the output: root target pixels `2^level` wide.
-    level: u32,
     plan: FilterPlan,
-    /// Regions of the source in the output's grid.
+    streamed: FilterPlan,
+    /// Regions of the source to replay into windows in advance.
     regions: Regions,
-    /// Regions of the source the filter reads, if that is coarser than the output.
-    coarse: Regions,
-}
-
-/// A layer whose output is needed in one pixel grid, while it is planned.
-struct Need {
-    layer: usize,
-    level: u32,
-    reach: Reach,
-    /// A rectangle that holds every region of the output that is needed.
-    hull: Bounds,
-    /// Where the source the output keeps has content, in the output's grid,
-    /// and where the source the filter reads has content, in its grid. The
-    /// two are the same when the filter reads its source in the output's grid.
+    /// Where the source the output keeps can have content.
     kept_content: Regions,
+    /// Where the source the filter reads can have content, in its grid.
     filtered_content: Regions,
-    /// Where the output can have content.
-    content: Regions,
+    decimated: Regions,
+    decimated_content: Regions,
 }
 
-/// Plan the output regions of every layer in every grid it is needed in. The
-/// first layer is needed inside `view` in the root grid.
+/// Plan the output regions of every layer. The first layer is needed inside `view`.
 ///
 /// A region of a source is rendered only where that source has content, so
 /// that the copies a drop shadow that keeps its source makes of every copy
@@ -774,48 +764,42 @@ struct Need {
 /// content is first found from the children up, inside the regions the
 /// parents can read at most, so that it too stays within what is visible.
 fn plan(layers: &[GraphLayer], view: Bounds) -> Vec<Planned> {
-    // From the parents down: the grids each layer is needed in, and how far.
-    let mut hulls: Vec<BTreeMap<u32, Bounds>> = layers.iter().map(|_| BTreeMap::new()).collect();
-    hulls[0].insert(0, view);
-    let mut needs = Vec::new();
-    let mut index = BTreeMap::new();
-    for (layer_index, layer) in layers.iter().enumerate() {
-        for (level, hull) in core::mem::take(&mut hulls[layer_index]) {
-            let reach = Reach::new(&layer.filter, level, &layer.shifts, layer.moves);
-            for (level, source) in source_levels(&reach, level, hull) {
-                for child in &layer.children {
-                    let child_hull = hulls[child.layer].entry(level).or_insert(Bounds::EMPTY);
-                    *child_hull = child_hull.union(source);
-                }
-            }
-            index.insert((layer_index, level), needs.len());
-            needs.push(Need {
-                layer: layer_index,
-                level,
-                reach,
-                hull,
-                kept_content: Regions::default(),
-                filtered_content: Regions::default(),
-                content: Regions::default(),
-            });
+    let count = layers.len();
+    // From the parents down: how far each layer is needed.
+    let mut hulls = vec![Bounds::EMPTY; count];
+    hulls[0] = view;
+    let mut reaches = Vec::with_capacity(count);
+    for (index, layer) in layers.iter().enumerate() {
+        let reach = Reach::new(&layer.filter, &layer.shifts, layer.moves);
+        let (kept, filtered) = reach.reads(hulls[index]);
+        let source = kept.union(filtered.refine(reach.reduction()));
+        for child in &layer.children {
+            hulls[child.layer] = hulls[child.layer].union(source);
         }
+        reaches.push(reach);
     }
     // From the children up: where each layer has content.
-    for node in (0..needs.len()).rev() {
-        let (level, hull) = (needs[node].level, needs[node].hull);
-        let layer = &layers[needs[node].layer];
-        let reach = &needs[node].reach;
+    let mut contents = vec![Regions::default(); count];
+    let mut kept_contents = vec![Regions::default(); count];
+    let mut filtered_contents = vec![Regions::default(); count];
+    let mut read_contents = vec![Regions::default(); count];
+    for index in (0..count).rev() {
+        let (reach, hull) = (&reaches[index], hulls[index]);
+        let reduction = reach.reduction();
         let (kept_area, filtered_area) = reach.reads(hull);
-        let content_in = |level, area: Bounds| source_content(layer, level, area, &needs, &index);
-        let (kept, filtered) = if reach.reduction() == 0 {
-            let content = content_in(level, kept_area.union(filtered_area));
+        let content_in = |area| source_content(&layers[index], area, &contents);
+        let (kept, read) = if reduction == 0 {
+            let content = content_in(kept_area.union(filtered_area));
             (content.clone(), content)
         } else {
             (
-                content_in(level, kept_area),
-                content_in(level + reach.reduction(), filtered_area),
+                content_in(kept_area),
+                content_in(filtered_area.refine(reduction)),
             )
         };
+        let mut filtered = Regions::default();
+        read.iter()
+            .for_each(|region| filtered.insert(region.coarsen(reduction)));
         let mut content = Regions::default();
         for region in filtered.iter() {
             content.insert(reach.writes(region).intersect(hull));
@@ -825,87 +809,75 @@ fn plan(layers: &[GraphLayer], view: Bounds) -> Vec<Planned> {
                 content.insert(region.translate(reach.kept_offset()));
             }
         }
-        let need = &mut needs[node];
-        need.kept_content = kept;
-        need.filtered_content = filtered;
-        need.content = content;
+        contents[index] = content;
+        kept_contents[index] = kept;
+        filtered_contents[index] = filtered;
+        read_contents[index] = read;
     }
     // From the parents down: the regions of each layer that are needed.
-    let mut outputs: Vec<Regions> = needs.iter().map(|_| Regions::default()).collect();
-    outputs[0].insert(view);
-    let mut planned = Vec::with_capacity(needs.len());
-    for (node, need) in needs.iter().enumerate() {
-        let plan = FilterPlan::new(need.reach.clone(), &core::mem::take(&mut outputs[node]));
-        let (kept, filtered) = plan.source_regions();
-        let reduction = plan.reduction();
-        let (fine, coarse) = if reduction == 0 {
-            let mut fine = kept;
-            filtered.iter().for_each(|region| fine.insert(region));
-            (fine, Regions::default())
+    let mut shown = vec![Regions::default(); count];
+    shown[0].insert(view);
+    let mut streamed = vec![Regions::default(); count];
+    let mut planned = Vec::with_capacity(count);
+    for (index, layer) in layers.iter().enumerate() {
+        let reduction = reaches[index].reduction();
+        let plan = FilterPlan::new(reaches[index].clone(), &core::mem::take(&mut shown[index]));
+        let stream = FilterPlan::new(
+            reaches[index].clone(),
+            &core::mem::take(&mut streamed[index]),
+        );
+        let (mut windows, filtered) = plan.source_regions();
+        let (mut streams, stream_filtered) = stream.source_regions();
+        let mut decimated = Regions::default();
+        if reduction == 0 {
+            filtered.iter().for_each(|region| windows.insert(region));
+            stream_filtered
+                .iter()
+                .for_each(|region| streams.insert(region));
         } else {
-            (kept, filtered)
-        };
-        let layer = &layers[need.layer];
-        for (level, sources) in [(need.level, &fine), (need.level + reduction, &coarse)] {
-            for child in &layer.children {
-                if let Some(&child_node) = index.get(&(child.layer, level)) {
-                    let clip = Bounds::covering(child.clip, 1.0 / pixel_size(level));
-                    for content in needs[child_node].content.iter() {
-                        let content = content.intersect(clip);
-                        for source in sources.touching(content) {
-                            outputs[child_node].insert(source.intersect(content));
-                        }
+            let mut coarse = filtered;
+            stream_filtered
+                .iter()
+                .for_each(|region| coarse.insert(region));
+            decimated = intersection(&coarse, &filtered_contents[index]);
+            decimated
+                .iter()
+                .for_each(|region| streams.insert(region.refine(reduction)));
+        }
+        for child in &layer.children {
+            let clip = Bounds::covering(child.clip, 1.0);
+            for content in contents[child.layer].iter() {
+                let content = content.intersect(clip);
+                for (sources, needed) in [(&windows, &mut shown), (&streams, &mut streamed)] {
+                    for source in sources.touching(content) {
+                        needed[child.layer].insert(source.intersect(content));
                     }
                 }
             }
         }
         planned.push(Planned {
-            layer: need.layer,
-            level: need.level,
             plan,
-            regions: intersection(&fine, &need.kept_content),
-            coarse: intersection(&coarse, &need.filtered_content),
+            streamed: stream,
+            regions: intersection(&windows, &kept_contents[index]),
+            kept_content: core::mem::take(&mut kept_contents[index]),
+            filtered_content: core::mem::take(&mut filtered_contents[index]),
+            decimated,
+            decimated_content: core::mem::take(&mut read_contents[index]),
         });
     }
     planned
 }
 
-/// Return the grids in which a layer that reads and writes as `reach` reads
-/// its source when its output is needed inside `hull` in the grid of `level`,
-/// with the bounds it reads there: the kept source in the output's grid and
-/// the source the filter reads in its own, one grid if they coincide.
-fn source_levels(reach: &Reach, level: u32, hull: Bounds) -> impl Iterator<Item = (u32, Bounds)> {
-    let (kept, filtered) = reach.reads(hull);
-    let reduction = reach.reduction();
-    let levels = if reduction == 0 {
-        [(level, kept.union(filtered)), (level, Bounds::EMPTY)]
-    } else {
-        [(level, kept), (level + reduction, filtered)]
-    };
-    levels.into_iter().filter(|(_, area)| !area.is_empty())
-}
-
-/// Return where the source of `layer` has content inside `area` in the grid of
-/// `level`: its own drawing and the outputs of the nodes of its children in
-/// that grid, inside their clips.
-fn source_content(
-    layer: &GraphLayer,
-    level: u32,
-    area: Bounds,
-    needs: &[Need],
-    index: &BTreeMap<(usize, u32), usize>,
-) -> Regions {
-    let scale = 1.0 / pixel_size(level);
+/// Return where the source of `layer` has content inside `area`: its own
+/// drawing and the content of its children, inside their clips.
+fn source_content(layer: &GraphLayer, area: Bounds, contents: &[Regions]) -> Regions {
     let mut content = Regions::default();
     if let Some(drawn) = layer.drawn {
-        content.insert(Bounds::covering(drawn, scale).intersect(area));
+        content.insert(Bounds::covering(drawn, 1.0).intersect(area));
     }
     for child in &layer.children {
-        let Some(&node) = index.get(&(child.layer, level)) else {
-            continue;
-        };
-        let clip = Bounds::covering(child.clip, scale).intersect(area);
-        for region in needs[node].content.iter() {
+        let clip = Bounds::covering(child.clip, 1.0).intersect(area);
+        for region in contents[child.layer].iter() {
             content.insert(region.intersect(clip));
         }
     }
@@ -924,44 +896,59 @@ fn intersection(regions: &Regions, content: &Regions) -> Regions {
 }
 
 impl FilterGraph {
-    fn new(commands: &[Command], layers: &[GraphLayer], view: Bounds, simd_level: Level) -> Self {
-        let planned = plan(layers, view);
-        let index: BTreeMap<(usize, u32), usize> = planned
-            .iter()
-            .enumerate()
-            .map(|(node, planned)| ((planned.layer, planned.level), node))
-            .collect();
+    fn new(
+        commands: Vec<Command>,
+        layers: Vec<GraphLayer>,
+        view: Bounds,
+        simd_level: Level,
+    ) -> Self {
+        let planned = plan(&layers, view);
         // Replay children first, so that a parent's windows know where the
         // children they composite have content.
-        let mut nodes: Vec<Option<Node>> = planned.iter().map(|_| None).collect();
-        for (node, planned) in planned.into_iter().enumerate().rev() {
+        let mut extents = vec![Index::default(); layers.len()];
+        let mut nodes = Vec::with_capacity(layers.len());
+        for (index, planned) in planned.into_iter().enumerate().rev() {
             let replay = Replay {
-                layer: &layers[planned.layer],
-                commands,
-                layers,
-                index: &index,
-                nodes: &nodes,
+                layer: &layers[index],
+                commands: &commands,
+                layers: &layers,
+                extents: &extents,
                 simd_level,
             };
-            let windows = replay.windows(&planned.regions, planned.level);
-            let coarse = replay.windows(&planned.coarse, planned.level + planned.plan.reduction());
-            let contents = |windows: &[Window]| Index::new(windows.iter().map(Window::content));
-            let kept = contents(&windows);
-            let filtered = if planned.plan.reduction() == 0 {
-                kept.clone()
+            let windows = replay.windows(&planned.regions);
+            let kept = Index::new(windows.iter().map(Window::content));
+            let reduced = planned.plan.reduction() > 0;
+            let filtered = if reduced {
+                Index::new(planned.decimated.iter())
             } else {
-                contents(&coarse)
+                kept.clone()
             };
-            let extents = planned.plan.extents(&kept, &filtered);
-            nodes[node] = Some(Node {
+            extents[index] = Index::new(planned.plan.extents(&kept, &filtered));
+            let content = Index::new(planned.kept_content.iter());
+            nodes.push(Node {
                 plan: planned.plan,
                 windows,
-                coarse,
-                extents: Index::new(extents),
+                extents: Index::default(),
+                streamed: planned.streamed,
+                filtered: if reduced {
+                    filtered
+                } else {
+                    Index::new(planned.filtered_content.iter())
+                },
+                content,
+                decimated: planned.decimated.iter().collect(),
+                decimated_content: planned.decimated_content,
             });
         }
+        nodes.reverse();
+        for (node, extents) in nodes.iter_mut().zip(extents) {
+            node.extents = extents;
+        }
         Self {
-            nodes: nodes.into_iter().map(Option::unwrap).collect(),
+            commands,
+            layers,
+            nodes,
+            simd_level,
         }
     }
 
@@ -988,29 +975,41 @@ impl FilterGraph {
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
     ) -> Pieces {
+        let mut rendering = Rendering::<S, F> {
+            graph: self,
+            simd,
+            encoded_paints,
+            image_resolver,
+            decimated: self.nodes.iter().map(|_| Pieces::default()).collect(),
+            blurred: BTreeMap::new(),
+            scratch: ScratchBuffer::new(),
+            kernel: PhantomData,
+        };
+        // Children first: decimating a source streams the filters nested in it.
+        for index in (0..self.nodes.len()).rev() {
+            if !self.nodes[index].decimated.is_empty() {
+                rendering.decimated[index] = rendering.decimate(index);
+            }
+        }
         let mut outputs: Vec<Pieces> = self.nodes.iter().map(|_| Pieces::default()).collect();
-        let mut scratch = ScratchBuffer::new();
         for (index, node) in self.nodes.iter().enumerate().rev() {
-            let render = |windows: &[Window]| {
-                Pieces::new(
-                    windows
-                        .iter()
-                        .filter_map(|window| {
-                            window.render::<S, F>(simd, encoded_paints, image_resolver, &outputs)
-                        })
-                        .collect(),
-                )
-            };
-            let kept = render(&node.windows);
+            let kept = Pieces::new(
+                node.windows
+                    .iter()
+                    .filter_map(|window| {
+                        window.render::<S, F>(simd, encoded_paints, image_resolver, &outputs)
+                    })
+                    .collect(),
+            );
             let filtered = if node.plan.reduction() == 0 {
-                None
+                &kept
             } else {
-                Some(render(&node.coarse))
+                &rendering.decimated[index]
             };
             outputs[index] = Pieces::new(node.plan.render(
                 &kept,
-                filtered.as_ref().unwrap_or(&kept),
-                &mut scratch,
+                filtered,
+                &mut rendering.scratch,
                 &mut |pixmap, filter, scratch| F::filter_layer(pixmap, filter, scratch),
             ));
         }
@@ -1018,38 +1017,212 @@ impl FilterGraph {
     }
 }
 
+/// The side of the tiles a source is rendered in at full resolution while it
+/// is decimated, in pixels, a power of two.
+const TILE: i64 = 1 << TILE_LEVELS;
+const TILE_LEVELS: u32 = 10;
+
+/// The state of rendering a filter graph.
+struct Rendering<'a, S: Simd, F> {
+    graph: &'a FilterGraph,
+    simd: S,
+    encoded_paints: &'a [EncodedPaint],
+    image_resolver: &'a dyn ImageResolver,
+    /// The decimated source of each node that reads one.
+    decimated: Vec<Pieces>,
+    /// The pixmaps that blurs reading a decimated source ran on, by node and
+    /// region of their streamed output.
+    blurred: BTreeMap<(usize, usize), Blurred>,
+    scratch: ScratchBuffer,
+    kernel: PhantomData<F>,
+}
+
+impl<S: Simd, F: FineKernel<S>> Rendering<'_, S, F> {
+    /// Return the source the filter of `node` reads in the regions
+    /// [`Node::decimated`], with each pixel the average of the pixels of the
+    /// full-resolution source it covers.
+    ///
+    /// The source is rendered at full resolution in tiles that line up with
+    /// the coarse pixels and only where it has content, so memory stays within
+    /// a tile and the coarse regions. The work is that of rendering the source
+    /// the visible output depends on at full resolution, which grows with the
+    /// square of the blur's width.
+    fn decimate(&mut self, node: usize) -> Pieces {
+        let graph = self.graph;
+        let graph_node = &graph.nodes[node];
+        let levels = graph_node.plan.reduction();
+        let content = &graph_node.decimated_content;
+        let mut pieces = Vec::with_capacity(graph_node.decimated.len());
+        for &region in &graph_node.decimated {
+            let mut coarse = PlacedPixmap::new(region);
+            if levels <= TILE_LEVELS {
+                // Each tile holds whole squares of the coarse pixels.
+                for tile in content_tiles(region.refine(levels), content) {
+                    let source = self.source(node, &Regions::of(tile));
+                    if !source.is_empty() {
+                        coarse.average(&Pieces::new(source).crop(tile), levels);
+                    }
+                }
+            } else {
+                for y in region.y0..region.y1 {
+                    for x in region.x0..region.x1 {
+                        let square = Bounds::new(x, y, x + 1, y + 1).refine(levels);
+                        let mut sums = [0_u128; 4];
+                        for tile in content_tiles(square, content) {
+                            for piece in self.source(node, &Regions::of(tile)) {
+                                piece.add_to(&mut sums);
+                            }
+                        }
+                        coarse.set_average(x, y, sums, levels);
+                    }
+                }
+            }
+            pieces.push(coarse);
+        }
+        Pieces::new(pieces)
+    }
+
+    /// Render the source of `node` inside `regions` at full resolution, with
+    /// the nested filter layers streamed.
+    fn source(&mut self, node: usize, regions: &Regions) -> Vec<PlacedPixmap> {
+        let graph = self.graph;
+        let layer = &graph.layers[node];
+        let mut nested: Vec<Pieces> = graph.nodes.iter().map(|_| Pieces::default()).collect();
+        let mut extents = vec![Index::default(); graph.nodes.len()];
+        for child in &layer.children {
+            let clip = Bounds::covering(child.clip, 1.0);
+            let mut pieces = Vec::new();
+            for region in regions.iter() {
+                let area = region.intersect(clip);
+                if !area.is_empty() {
+                    pieces.extend(self.stream(child.layer, area));
+                }
+            }
+            nested[child.layer] = Pieces::new(pieces);
+            extents[child.layer] = nested[child.layer].index().clone();
+        }
+        let replay = Replay {
+            layer,
+            commands: &graph.commands,
+            layers: &graph.layers,
+            extents: &extents,
+            simd_level: graph.simd_level,
+        };
+        replay
+            .windows(regions)
+            .iter()
+            .filter_map(|window| {
+                window.render::<S, F>(self.simd, self.encoded_paints, self.image_resolver, &nested)
+            })
+            .collect()
+    }
+
+    /// Return the output of `node` inside `area`, which lies in its streamed output.
+    fn stream(&mut self, node: usize, area: Bounds) -> Vec<PlacedPixmap> {
+        let graph = self.graph;
+        let graph_node = &graph.nodes[node];
+        let plan = &graph_node.streamed;
+        let reduced = plan.reduction() > 0;
+        let mut output = Vec::new();
+        for (region, layout) in plan.parts(area, &graph_node.content, &graph_node.filtered) {
+            let source = Pieces::new(self.source(node, &layout.sources(reduced)));
+            let Self {
+                decimated,
+                blurred,
+                scratch,
+                ..
+            } = self;
+            let (filtered, blurred) = if reduced {
+                let blurred = blurred
+                    .entry((node, region))
+                    .or_insert_with(|| plan.blur(&layout, &decimated[node], scratch));
+                (&decimated[node], Some(&*blurred))
+            } else {
+                (&source, None)
+            };
+            output.push(plan.compose(
+                &layout,
+                &source,
+                filtered,
+                blurred,
+                scratch,
+                &mut |pixmap, filter, scratch| F::filter_layer(pixmap, filter, scratch),
+            ));
+        }
+        output
+    }
+}
+
+/// Return the squares of [`TILE`] pixels on a grid anchored at the origin that
+/// overlap both `area` and `content`, cut to `area`, each once, row by row.
+fn content_tiles(area: Bounds, content: &Regions) -> impl Iterator<Item = Bounds> {
+    let members: Vec<Bounds> = content
+        .touching(area)
+        .map(|member| member.intersect(area))
+        .filter(|member| !member.is_empty())
+        .collect();
+    let spans = |members: &mut dyn Iterator<Item = (i64, i64)>| {
+        let mut spans: Vec<(i64, i64)> = members
+            .map(|(start, end)| (start.div_euclid(TILE), (end + TILE - 1).div_euclid(TILE)))
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    };
+    let rows = spans(&mut members.iter().map(|member| (member.y0, member.y1)));
+    rows.into_iter()
+        .flat_map(|(start, end)| start..end)
+        .flat_map(move |row| {
+            let (y0, y1) = (row * TILE, (row + 1) * TILE);
+            let columns = spans(
+                &mut members
+                    .iter()
+                    .filter(|member| member.y0 < y1 && y0 < member.y1)
+                    .map(|member| (member.x0, member.x1)),
+            );
+            columns
+                .into_iter()
+                .flat_map(|(start, end)| start..end)
+                .map(|column| {
+                    Bounds::new(column * TILE, y0, (column + 1) * TILE, y1).intersect(area)
+                })
+                .collect::<Vec<_>>()
+        })
+}
+
 /// What replaying the windows of one layer needs.
 struct Replay<'a> {
     layer: &'a GraphLayer,
     commands: &'a [Command],
     layers: &'a [GraphLayer],
-    /// The node of each layer and grid.
-    index: &'a BTreeMap<(usize, u32), usize>,
-    /// The nodes replayed so far, which include the children of this layer.
-    nodes: &'a [Option<Node>],
+    /// Where the outputs of the filter layers nested in it have content, by layer.
+    extents: &'a [Index],
     simd_level: Level,
 }
 
 impl Replay<'_> {
-    /// Replay the layer into windows covering `regions` in the grid of root
-    /// target pixels `2^level` wide.
-    fn windows(&self, regions: &Regions, level: u32) -> Vec<Window> {
-        let mut masks = Masks::new(level);
+    /// Replay the layer into windows covering `regions`.
+    fn windows(&self, regions: &Regions) -> Vec<Window> {
         regions
             .iter()
             .flat_map(window_grid)
-            .map(|window| self.window(window, level, &mut masks))
+            .map(|window| self.window(window))
             .collect()
     }
 
-    fn window(&self, window: Bounds, level: u32, masks: &mut Masks) -> Window {
+    fn window(&self, window: Bounds) -> Window {
         let origin = (window.x0, window.y0);
         let size = (
             u16::try_from(window.width()).unwrap(),
             u16::try_from(window.height()).unwrap(),
         );
-        let to_window = Affine::translate((-origin.0 as f64, -origin.1 as f64))
-            * Affine::scale(1.0 / pixel_size(level));
+        let to_window = Affine::translate((-origin.0 as f64, -origin.1 as f64));
         let dispatcher =
             SingleThreadedDispatcher::window(size.0, size.1, self.simd_level, origin, |target| {
                 for clip in &self.layer.clips {
@@ -1058,126 +1231,45 @@ impl Replay<'_> {
                 for step in &self.layer.steps {
                     match *step {
                         Step::Command(command) => {
-                            apply(target, &self.commands[command], to_window, masks);
+                            apply(target, &self.commands[command], to_window);
                         }
                         Step::Nested { layer, push } => {
                             let Command::PushLayer(pushed) = &self.commands[push] else {
                                 unreachable!("a nested layer starts with its push");
                             };
-                            let node = self.index[&(layer, level)];
-                            let extents = &self.nodes[node].as_ref().unwrap().extents;
                             inject(
                                 target,
                                 pushed,
                                 &self.layers[layer].filter,
-                                node,
-                                extents,
+                                layer,
+                                &self.extents[layer],
                                 window,
                                 to_window,
-                                masks,
                             );
                         }
                     }
                 }
             });
-        let mut paints: Vec<usize> = self
-            .layer
-            .steps
-            .iter()
-            .filter_map(|step| match step {
-                Step::Command(command) => self.commands[*command].paint(),
-                Step::Nested { .. } => None,
-            })
-            .collect();
-        paints.sort_unstable();
-        paints.dedup();
-        Window {
-            origin,
-            size,
-            level,
-            paints,
-            dispatcher,
-        }
+        Window { origin, dispatcher }
     }
-}
-
-/// Masks sampled in the grid of root target pixels `2^level` wide.
-struct Masks {
-    level: u32,
-    /// Masks of the root target with their copies in this grid.
-    reduced: Vec<(Mask, Mask)>,
-}
-
-impl Masks {
-    fn new(level: u32) -> Self {
-        Self {
-            level,
-            reduced: Vec::new(),
-        }
-    }
-
-    /// Return `mask` in this grid, where each pixel averages the pixels of the
-    /// root target mask it covers.
-    fn get(&mut self, mask: &Mask) -> Mask {
-        if self.level == 0 {
-            return mask.clone();
-        }
-        if let Some((_, reduced)) = self.reduced.iter().find(|(root, _)| root == mask) {
-            return reduced.clone();
-        }
-        let reduced = reduce_mask(mask, self.level);
-        self.reduced.push((mask.clone(), reduced.clone()));
-        reduced
-    }
-}
-
-/// Return `mask` with each pixel averaging a square of `2^levels` pixels of
-/// it; pixels outside the mask count as transparent, like when it is sampled.
-fn reduce_mask(mask: &Mask, levels: u32) -> Mask {
-    let coarse = |index: u16| usize::from(index).checked_shr(levels).unwrap_or(0);
-    let length = |length: u16| {
-        if length == 0 {
-            0
-        } else {
-            coarse(length - 1) + 1
-        }
-    };
-    let (width, height) = (length(mask.width()), length(mask.height()));
-    let mut sums = vec![0_u64; width * height];
-    for y in 0..mask.height() {
-        for x in 0..mask.width() {
-            sums[coarse(y) * width + coarse(x)] += u64::from(mask.sample(x, y));
-        }
-    }
-    // Divide by the `4^levels` pixels of each square, rounding to nearest.
-    let average = |sum: u64| match levels {
-        0 => sum,
-        _ => (sum.checked_shr(2 * levels - 1).unwrap_or(0) + 1) >> 1,
-    };
-    let data = sums.into_iter().map(|sum| average(sum) as u8).collect();
-    Mask::from_parts(data, width as u16, height as u16)
 }
 
 /// A window of a layer's source, replayed into its own dispatcher.
 #[derive(Debug)]
 struct Window {
-    /// The window's origin, in the grid of root target pixels `2^level` wide.
+    /// The window's origin in root target coordinates.
     origin: (i64, i64),
-    size: (u16, u16),
-    level: u32,
-    /// The indices of the encoded paints the window's commands paint with.
-    paints: Vec<usize>,
     dispatcher: SingleThreadedDispatcher,
 }
 
 impl Window {
-    /// Return the bounds of the window's content in its grid.
+    /// Return the bounds of the window content.
     fn content(&self) -> Bounds {
         self.dispatcher.window_content()
     }
 
     /// Render the window content, or return `None` if it is empty. `nested`
-    /// holds the outputs of the nodes of the graph rendered so far.
+    /// holds the outputs of the nested filter layers, by layer.
     fn render<S: Simd, F: FineKernel<S>>(
         &self,
         simd: S,
@@ -1185,64 +1277,24 @@ impl Window {
         image_resolver: &dyn ImageResolver,
         nested: &[Pieces],
     ) -> Option<PlacedPixmap> {
-        let mut encoded_paints = paints_at(encoded_paints, self.to_source());
-        // In the root grid, images are sampled like without filters.
-        if self.level > 0 {
-            for &index in &self.paints {
-                let EncodedPaint::Image(image) = &encoded_paints[index] else {
-                    continue;
-                };
-                let pixmap = match &image.source {
-                    ImageSource::Pixmap(pixmap) => Some(pixmap.clone()),
-                    ImageSource::OpaqueId { id, .. } => image_resolver.resolve(*id),
-                    ImageSource::ExternalTexture { .. } => None,
-                };
-                if let Some(averaged) =
-                    pixmap.and_then(|pixmap| averaged(image, &pixmap, self.size.0, self.size.1))
-                {
-                    encoded_paints[index] = EncodedPaint::Image(averaged);
-                }
-            }
-        }
+        let encoded_paints = paints_at(encoded_paints, self.origin);
         self.dispatcher
             .render_window::<S, F>(simd, &encoded_paints, image_resolver, nested)
     }
-
-    /// Return the transform from the window's pixels to root target coordinates.
-    fn to_source(&self) -> Affine {
-        Affine::scale(pixel_size(self.level))
-            * Affine::translate((self.origin.0 as f64, self.origin.1 as f64))
-    }
 }
 
-/// Return copies of `paints` for sampling at window pixels mapped to the
-/// paints' space by `to_source`, which scales by a power of two.
-fn paints_at(paints: &[EncodedPaint], to_source: Affine) -> Vec<EncodedPaint> {
-    let scale = to_source.as_coeffs()[0];
+/// Return copies of `paints` for sampling at the pixels of a window at `origin`.
+fn paints_at(paints: &[EncodedPaint], origin: (i64, i64)) -> Vec<EncodedPaint> {
+    let to_source = Affine::translate((origin.0 as f64, origin.1 as f64));
     paints
         .iter()
         .map(|paint| {
             let mut paint = paint.clone();
-            let (transform, x_advance, y_advance) = match &mut paint {
-                EncodedPaint::Gradient(gradient) => (
-                    &mut gradient.transform,
-                    &mut gradient.x_advance,
-                    &mut gradient.y_advance,
-                ),
-                EncodedPaint::Image(image) => (
-                    &mut image.transform,
-                    &mut image.x_advance,
-                    &mut image.y_advance,
-                ),
-                EncodedPaint::BlurredRoundedRect(rect) => (
-                    &mut rect.transform,
-                    &mut rect.x_advance,
-                    &mut rect.y_advance,
-                ),
-            };
-            *transform *= to_source;
-            *x_advance *= scale;
-            *y_advance *= scale;
+            match &mut paint {
+                EncodedPaint::Gradient(gradient) => gradient.transform *= to_source,
+                EncodedPaint::Image(image) => image.transform *= to_source,
+                EncodedPaint::BlurredRoundedRect(rect) => rect.transform *= to_source,
+            }
             paint
         })
         .collect()
@@ -1286,7 +1338,6 @@ fn inject(
     extents: &Index,
     window: Bounds,
     to_window: Affine,
-    masks: &mut Masks,
 ) {
     let dest = extents
         .touching(window)
@@ -1295,17 +1346,17 @@ fn inject(
         })
         .snap_to_tiles()
         .to_rect_u16((window.x0, window.y0));
-    let mask = layer.mask.as_ref().map(|mask| masks.get(mask));
-    target.push_rendered_filter_layer(layer, mask, to_window, filter.clone(), dest, node);
+    target.push_rendered_filter_layer(
+        layer,
+        layer.mask.clone(),
+        to_window,
+        filter.clone(),
+        dest,
+        node,
+    );
 }
 
-fn apply(
-    target: &mut SingleThreadedDispatcher,
-    command: &Command,
-    to_window: Affine,
-    masks: &mut Masks,
-) {
-    let mut mask = |mask: &Option<Mask>| mask.as_ref().map(|mask| masks.get(mask));
+fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Affine) {
     match command {
         Command::FillPath {
             path,
@@ -1314,7 +1365,7 @@ fn apply(
             paint,
             blend_mode,
             aliasing_threshold,
-            mask: path_mask,
+            mask,
         } => target.fill_path(
             path,
             *fill_rule,
@@ -1322,7 +1373,7 @@ fn apply(
             paint.clone(),
             *blend_mode,
             *aliasing_threshold,
-            mask(path_mask),
+            mask.clone(),
         ),
         Command::StrokePath {
             path,
@@ -1331,7 +1382,7 @@ fn apply(
             paint,
             blend_mode,
             aliasing_threshold,
-            mask: path_mask,
+            mask,
         } => target.stroke_path(
             path,
             stroke,
@@ -1339,18 +1390,18 @@ fn apply(
             paint.clone(),
             *blend_mode,
             *aliasing_threshold,
-            mask(path_mask),
+            mask.clone(),
         ),
         Command::FillRect {
             rect,
             paint,
             blend_mode,
-            mask: rect_mask,
+            mask,
         } => target.fill_rect_fast(
             &to_window.transform_rect_bbox(*rect),
             paint.clone(),
             *blend_mode,
-            mask(rect_mask),
+            mask.clone(),
         ),
         Command::PushLayer(layer) => target.push_layer(
             layer.clip_path.as_ref(),
@@ -1359,7 +1410,7 @@ fn apply(
             layer.blend_mode,
             layer.opacity,
             layer.aliasing_threshold,
-            mask(&layer.mask),
+            layer.mask.clone(),
             None,
         ),
         Command::PopLayer => target.pop_layer(),
@@ -1413,20 +1464,19 @@ mod tests {
     struct Work {
         nodes: usize,
         windows: usize,
-        /// The pixels of the windows the source is rasterized in.
+        /// The pixels of the windows replayed in advance.
         window_pixels: u128,
         strips: usize,
         /// The pixels of the pixmaps the filters run on.
         pixmap_pixels: u128,
+        /// The pixels of the decimated sources, and of the tiles of the
+        /// full-resolution sources they average.
+        decimated_pixels: u128,
+        tile_pixels: u128,
     }
 
     fn work(graph: &FilterGraph) -> Work {
-        let windows = || {
-            graph
-                .nodes
-                .iter()
-                .flat_map(|node| node.windows.iter().chain(&node.coarse))
-        };
+        let windows = || graph.nodes.iter().flat_map(|node| &node.windows);
         let pixmap_pixels = graph
             .nodes
             .iter()
@@ -1435,12 +1485,22 @@ mod tests {
                 let filtered = if node.plan.reduction() == 0 {
                     kept.clone()
                 } else {
-                    Index::new(node.coarse.iter().map(Window::content))
+                    Index::new(node.decimated.iter().copied())
                 };
                 node.plan.pixmaps(&kept, &filtered)
             })
             .map(Bounds::area)
             .sum();
+        let tiles = |node: &Node| {
+            let levels = node.plan.reduction();
+            node.decimated
+                .iter()
+                .flat_map(move |region| {
+                    content_tiles(region.refine(levels), &node.decimated_content)
+                })
+                .map(Bounds::area)
+                .sum::<u128>()
+        };
         Work {
             nodes: graph.nodes.len(),
             windows: windows().count(),
@@ -1454,6 +1514,13 @@ mod tests {
                 .map(|window| window.dispatcher.strip_count())
                 .sum(),
             pixmap_pixels,
+            decimated_pixels: graph
+                .nodes
+                .iter()
+                .flat_map(|node| &node.decimated)
+                .map(|region| region.area())
+                .sum(),
+            tile_pixels: graph.nodes.iter().map(tiles).sum(),
         }
     }
 
@@ -1560,9 +1627,21 @@ mod tests {
             };
             let reach = 4.0 * f64::from(std_deviation);
             let square = Rect::new(-reach, -reach, 12.0 + reach, 12.0 + reach);
-            let work = work(&graph(view, &[blur], &[square]));
+            let graph = graph(view, &[blur], &[square]);
+            let work = work(&graph);
             assert!(
-                work.window_pixels <= 1 << 20 && work.pixmap_pixels <= 1 << 20,
+                work.window_pixels <= 1 << 20
+                    && work.pixmap_pixels <= 1 << 20
+                    && work.decimated_pixels <= 1 << 20,
+                "sigma {std_deviation}: {work:?}"
+            );
+            // Each pixel of the source within the blur's reach is rendered
+            // once, in tiles.
+            let levels = 2 * graph.nodes[0].plan.reduction();
+            let side = 7.0 * f64::from(std_deviation);
+            assert!(
+                work.tile_pixels == work.decimated_pixels << levels
+                    && work.tile_pixels as f64 <= side * side,
                 "sigma {std_deviation}: {work:?}"
             );
         }

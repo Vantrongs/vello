@@ -6,6 +6,7 @@
 use crate::filter::pixmap::FilterPixmap;
 use crate::kurbo::Rect;
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 use vello_common::geometry::{PaddingU64, RectU16};
 use vello_common::peniko::color::PremulRgba8;
@@ -376,6 +377,13 @@ pub(crate) struct Regions {
 }
 
 impl Regions {
+    /// Return the regions with only `bounds`.
+    pub(crate) fn of(bounds: Bounds) -> Self {
+        let mut regions = Self::default();
+        regions.insert(bounds);
+        regions
+    }
+
     pub(crate) fn insert(&mut self, mut bounds: Bounds) {
         if bounds.is_empty() {
             return;
@@ -513,6 +521,48 @@ impl PlacedPixmap {
                 &source.pixmap.data()[from..from + width],
             );
         }
+    }
+
+    /// Set the pixels of this pixmap, whose grid is `levels` steps of two
+    /// coarser than that of `source`, that `source` covers to the average of
+    /// the pixels of `source` they cover, which lines up with them.
+    pub(crate) fn average(&mut self, source: &Self, levels: u32) {
+        let width = usize::try_from(source.bounds.width()).unwrap();
+        let coarse = source.bounds.coarsen(levels);
+        let mut sums = vec![[0_u32; 4]; width >> levels];
+        for (row, line) in source.pixmap.data().chunks_exact(width).enumerate() {
+            for (x, pixel) in line.iter().enumerate() {
+                let sum = &mut sums[x >> levels];
+                for (sum, value) in sum.iter_mut().zip([pixel.r, pixel.g, pixel.b, pixel.a]) {
+                    *sum += u32::from(value);
+                }
+            }
+            if (row + 1) % (1 << levels) == 0 {
+                let y = coarse.y0 + i64::try_from(row >> levels).unwrap();
+                for (x, sum) in (coarse.x0..).zip(&mut sums) {
+                    self.set_average(x, y, sum.map(u128::from), levels);
+                    *sum = [0; 4];
+                }
+            }
+        }
+    }
+
+    /// Add the channels of every pixel to `sums`.
+    pub(crate) fn add_to(&self, sums: &mut [u128; 4]) {
+        for pixel in self.pixmap.data() {
+            for (sum, value) in sums.iter_mut().zip([pixel.r, pixel.g, pixel.b, pixel.a]) {
+                *sum += u128::from(value);
+            }
+        }
+    }
+
+    /// Set the pixel at `x`, `y` to the average of the `4^levels` pixels whose
+    /// channels add up to `sums`, rounded to nearest with halves up.
+    pub(crate) fn set_average(&mut self, x: i64, y: i64, sums: [u128; 4], levels: u32) {
+        let [r, g, b, a] =
+            sums.map(|sum| ((sum.checked_shr(2 * levels - 1).unwrap_or(0) + 1) >> 1) as u8);
+        let index = self.index(x, y);
+        self.pixmap.data_mut()[index] = PremulRgba8 { r, g, b, a };
     }
 
     fn index(&self, x: i64, y: i64) -> usize {

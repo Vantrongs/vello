@@ -110,31 +110,21 @@ pub(crate) fn apply_blur(
     );
 }
 
-/// Blur `pixmap`, whose pixels each cover `2^levels` pixels of the output on
-/// both axes and which starts at `origin` in its grid, and return the output
-/// inside `crop`, in the grid of the output.
+/// Return the pixels inside `crop`, in the grid of the output, of a blur whose
+/// last `n_decimations - levels` decimations [`apply_blur`] ran on `blurred`.
+/// The pixels of `blurred` each cover `2^levels` pixels of the output on both
+/// axes, and it starts at `origin` in its grid.
 ///
-/// The pixmap stands for the source after its first `levels` decimations, so
-/// only the remaining decimations run on it. The upscaling back to the output
-/// computes on each level only the pixels that `crop` depends on, so memory
-/// and work follow the pixmap and the crop rather than the output's full extent.
-pub(crate) fn apply_reduced_blur(
-    mut pixmap: FilterPixmap,
-    scratch: &mut FilterPixmap,
-    n_decimations: usize,
-    kernel: &[f32],
+/// The upscaling back to the output computes on each level only the pixels
+/// that `crop` depends on, so memory and work follow the crop rather than the
+/// output's full extent.
+pub(crate) fn upscale_reduced_blur(
+    blurred: &FilterPixmap,
     edge_mode: EdgeMode,
     levels: u32,
     origin: (i64, i64),
     crop: Bounds,
 ) -> FilterPixmap {
-    apply_blur(
-        &mut pixmap,
-        scratch,
-        n_decimations - levels as usize,
-        kernel,
-        edge_mode,
-    );
     // The runs each level upscales into, from the output to the level below the pixmap.
     let mut runs = Vec::with_capacity(levels as usize);
     let mut x = Run::new(crop.x0, crop.width(), origin.0, levels);
@@ -144,8 +134,8 @@ pub(crate) fn apply_reduced_blur(
         x = x.source();
         y = y.source();
     }
-    let mut patch = patch_of(&pixmap, x, y, edge_mode);
-    let size = (pixmap.width(), pixmap.height());
+    let mut patch = patch_of(blurred, x, y, edge_mode);
+    let size = (blurred.width(), blurred.height());
     for (x, y) in runs.into_iter().rev() {
         patch = upscale_patch(&patch, x, y, edge_mode, size);
     }
@@ -1622,7 +1612,7 @@ mod tests {
     }
 
     fn blur_reduced(
-        reduced: FilterPixmap,
+        mut reduced: FilterPixmap,
         std_deviation: f32,
         edge_mode: EdgeMode,
         levels: u32,
@@ -1630,16 +1620,14 @@ mod tests {
     ) -> FilterPixmap {
         let (n_decimations, kernel, count) = plan_decimated_blur(std_deviation);
         let mut scratch = FilterPixmap::new(reduced.width(), reduced.height());
-        apply_reduced_blur(
-            reduced,
+        apply_blur(
+            &mut reduced,
             &mut scratch,
-            n_decimations,
+            n_decimations - levels as usize,
             &kernel[..usize::from(count)],
             edge_mode,
-            levels,
-            (0, 0),
-            crop,
-        )
+        );
+        upscale_reduced_blur(&reduced, edge_mode, levels, (0, 0), crop)
     }
 
     #[test]

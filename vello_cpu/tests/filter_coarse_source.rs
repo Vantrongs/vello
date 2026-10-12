@@ -5,9 +5,10 @@
 //! every pixel of that source.
 
 use std::sync::Arc;
+use vello_cpu::color::AlphaColor;
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_cpu::kurbo::{Affine, Rect};
-use vello_cpu::peniko::{Extend, ImageQuality, ImageSampler};
+use vello_cpu::kurbo::{Affine, Circle, Point, Rect, Shape, Stroke};
+use vello_cpu::peniko::{Color, Extend, Gradient, ImageQuality, ImageSampler};
 use vello_cpu::{
     Image, ImageSource, Level, Pixmap, RasterizerSettings, RenderContext, RenderMode,
     RenderSettings, Resources,
@@ -212,20 +213,38 @@ fn decimate(pixmap: &Pixmap, scale: u16) -> Pixmap {
 /// Return the largest difference between `draw` blurred by `std_deviation`
 /// and the same blur of an exact decimation of `draw` to the grid of
 /// `2^levels` pixels the blur reads its source in. `draw` paints only inside
-/// `-MARGIN..VIEW + MARGIN`.
-fn reduced_error(std_deviation: f32, levels: u32, mode: RenderMode, draw: &Draw) -> u8 {
+/// `-extent..VIEW + extent`.
+fn reduced_error(
+    std_deviation: f32,
+    levels: u32,
+    extent: u16,
+    mode: RenderMode,
+    draw: &Draw,
+) -> u8 {
     let scale = 1_u16 << levels;
-    let extent = MARGIN.div_ceil(scale) * scale;
+    // Moving the source by a multiple of the tiles of every grid a blur in it
+    // reads leaves where those blurs anchor their decimations.
+    let extent = extent.div_ceil(512) * 512;
     let size = VIEW + 2 * extent;
     let offset = f64::from(extent);
+    // Squares in the corners of the extent give the source and the decimated
+    // reference the same bounds, which anchor the decimations of their blurs.
+    let marked = |ctx: &mut RenderContext, base: Affine| {
+        draw(ctx, base);
+        ctx.set_transform(base);
+        ctx.set_paint(Color::from_rgb8(9, 9, 9));
+        let (low, high, side) = (-offset, f64::from(VIEW) + offset, f64::from(scale));
+        ctx.fill_rect(&Rect::new(low, low, low + side, low + side));
+        ctx.fill_rect(&Rect::new(high - side, high - side, high, high));
+    };
     let full = render(size, size, mode, |ctx| {
-        draw(ctx, Affine::translate((offset, offset)));
+        marked(ctx, Affine::translate((offset, offset)));
     });
     let decimated = decimate(&full, scale);
     let exact = paint(&decimated, sampler(ImageQuality::Low));
     let reduced = render(VIEW, VIEW, mode, |ctx| {
         ctx.push_filter_layer(blur(std_deviation));
-        draw(ctx, Affine::IDENTITY);
+        marked(ctx, Affine::IDENTITY);
         ctx.pop_layer();
     });
     let reference = render(VIEW, VIEW, mode, |ctx| {
@@ -240,11 +259,83 @@ fn reduced_error(std_deviation: f32, levels: u32, mode: RenderMode, draw: &Draw)
         ));
         ctx.pop_layer();
     });
+    assert!(
+        reduced.data().iter().any(|pixel| pixel.a != 0),
+        "the blur reaches the view"
+    );
     largest_difference(&reduced, &reference)
 }
 
+/// Concentric rings one pixel wide every `spacing` pixels out to `radius`,
+/// alternating between two colors.
+fn rings(spacing: f64, radius: f64) -> Draw {
+    Box::new(move |ctx, base| {
+        ctx.set_transform(base);
+        ctx.set_stroke(Stroke::new(1.0));
+        let center = f64::from(VIEW) / 2.0;
+        let rings = (1..).take_while(|&ring| f64::from(ring) * spacing <= radius);
+        for ring in rings {
+            ctx.set_paint(if ring % 2 == 0 {
+                Color::from_rgb8(230, 40, 20)
+            } else {
+                Color::from_rgb8(20, 60, 240)
+            });
+            let circle = Circle::new((center, center), f64::from(ring) * spacing);
+            ctx.stroke_path(&circle.to_path(0.1));
+        }
+    })
+}
+
+/// Lines `width` pixels wide every two pixels, rotated by `angle`, inside a
+/// square reaching `radius` from the center of the view.
+fn lines(width: f64, angle: f64, radius: f64) -> Draw {
+    Box::new(move |ctx, base| {
+        let center = f64::from(VIEW) / 2.0;
+        ctx.set_transform(base);
+        ctx.push_clip_layer(
+            &Rect::from_center_size((center, center), (2.0 * radius, 2.0 * radius)).to_path(0.1),
+        );
+        ctx.set_transform(base * Affine::rotate_about(angle, Point::new(center, center)));
+        ctx.set_paint(Color::BLACK);
+        let reach = 1.5 * radius;
+        let lines = (0..).map(|line| 2.0 * f64::from(line) - reach);
+        for x in lines.take_while(|&x| x < reach) {
+            let x = center + x;
+            ctx.fill_rect(&Rect::new(x, center - reach, x + width, center + reach));
+        }
+        ctx.pop_layer();
+    })
+}
+
+/// A rectangle reaching `radius` from the center of the view, filled with `gradient`.
+fn gradient(gradient: Gradient, radius: f64) -> Draw {
+    Box::new(move |ctx, base| {
+        let center = f64::from(VIEW) / 2.0;
+        ctx.set_transform(base);
+        ctx.set_paint(gradient.clone());
+        ctx.fill_rect(&Rect::from_center_size(
+            (center, center),
+            (2.0 * radius, 2.0 * radius),
+        ));
+    })
+}
+
+/// `draw` nested in `filters`, each in the one before.
+fn nested(filters: Vec<FilterPrimitive>, draw: Draw) -> Draw {
+    Box::new(move |ctx, base| {
+        ctx.set_transform(base);
+        for filter in &filters {
+            ctx.push_filter_layer(Filter::from_primitive(filter.clone()));
+        }
+        draw(ctx, base);
+        for _ in &filters {
+            ctx.pop_layer();
+        }
+    })
+}
+
 #[test]
-fn coarse_images_match_an_exact_decimation() {
+fn wide_blurs_match_a_blur_of_an_exact_decimation() {
     let columns = stripes(|x, _| x % 2 == 0);
     let checkers = stripes(|x, y| (x + y) % 2 == 0);
     let photo = photo();
@@ -254,46 +345,102 @@ fn coarse_images_match_an_exact_decimation() {
         y_extend: extend,
         ..sampler(ImageQuality::Medium)
     };
-    let cases: [(&str, Draw); 8] = [
-        (
-            "columns low",
-            draw_texture(&columns, sampler(ImageQuality::Low), Affine::IDENTITY),
-        ),
-        (
-            "columns medium",
-            draw_texture(&columns, sampler(ImageQuality::Medium), Affine::IDENTITY),
-        ),
-        (
-            "checkers high",
-            draw_texture(&checkers, sampler(ImageQuality::High), Affine::IDENTITY),
-        ),
-        (
-            "photo low",
-            draw_texture(&photo, sampler(ImageQuality::Low), Affine::IDENTITY),
-        ),
-        (
-            "photo medium",
-            draw_texture(&photo, sampler(ImageQuality::Medium), Affine::IDENTITY),
-        ),
-        (
-            "photo tilted",
-            draw_texture(&photo, sampler(ImageQuality::Medium), tilted),
-        ),
-        (
-            "checkers repeat",
-            draw_texture(&checkers, repeated(Extend::Repeat), Affine::scale(0.3)),
-        ),
-        (
-            "photo reflect",
-            draw_texture(&photo, repeated(Extend::Reflect), Affine::scale(0.3)),
-        ),
-    ];
+    let center = f64::from(VIEW) / 2.0;
+    let black_white = [Color::BLACK, Color::WHITE];
+    let inner_blur = |std_deviation| FilterPrimitive::GaussianBlur {
+        std_deviation,
+        edge_mode: EdgeMode::None,
+    };
     // The grid each blur reads its source in is `2^levels` pixels wide.
-    for (std_deviation, levels) in [(100.0, 1), (300.0, 3)] {
-        for (name, draw) in &cases {
+    for (std_deviation, levels) in [(100_u16, 1), (300, 3)] {
+        // The source covers all the blur reads, and with what the filters
+        // nested in it add, stays inside the extent.
+        let radius = 3.0 * f64::from(std_deviation) + 100.0;
+        let extent = 3 * std_deviation + 300;
+        let cases: Vec<(&str, Draw, bool)> = vec![
+            (
+                "columns low",
+                draw_texture(&columns, sampler(ImageQuality::Low), Affine::IDENTITY),
+                false,
+            ),
+            (
+                "checkers high",
+                draw_texture(&checkers, sampler(ImageQuality::High), Affine::IDENTITY),
+                false,
+            ),
+            (
+                "photo tilted",
+                draw_texture(&photo, sampler(ImageQuality::Medium), tilted),
+                false,
+            ),
+            (
+                "photo reflect",
+                draw_texture(&photo, repeated(Extend::Reflect), Affine::scale(0.3)),
+                false,
+            ),
+            ("abutting rings", rings(1.0, radius), false),
+            ("lines", lines(1.0, 0.0, radius), false),
+            ("tilted thin lines", lines(0.5, 0.3, radius), false),
+            (
+                "linear gradient repeating every 2 pixels",
+                gradient(
+                    Gradient::new_linear((center, center), (center + 2.0, center))
+                        .with_extend(Extend::Repeat)
+                        .with_stops(black_white),
+                    radius,
+                ),
+                false,
+            ),
+            (
+                "linear gradient reflected every 1.5 pixels",
+                gradient(
+                    Gradient::new_linear((center, center), (center + 1.5, center))
+                        .with_extend(Extend::Reflect)
+                        .with_stops(black_white),
+                    radius,
+                ),
+                false,
+            ),
+            (
+                "rings in a decimating blur",
+                nested(vec![inner_blur(20.0)], rings(1.0, radius - 100.0)),
+                true,
+            ),
+            (
+                "rings in a wide blur",
+                nested(vec![inner_blur(150.0)], rings(1.0, radius - 100.0)),
+                true,
+            ),
+            (
+                "lines in an offset and a drop shadow",
+                nested(
+                    vec![
+                        FilterPrimitive::Offset { dx: 13.0, dy: -7.0 },
+                        FilterPrimitive::DropShadow {
+                            dx: 37.0,
+                            dy: -11.0,
+                            std_deviation: 5.0,
+                            color: AlphaColor::from_rgba8(200, 30, 60, 200),
+                            edge_mode: EdgeMode::None,
+                        },
+                    ],
+                    lines(1.0, 0.3, radius - 100.0),
+                ),
+                true,
+            ),
+        ];
+        for (name, draw, nests_filters) in &cases {
             for mode in [RenderMode::OptimizeSpeed, RenderMode::OptimizeQuality] {
-                let error = reduced_error(std_deviation, levels, mode, draw);
-                assert!(error <= 1, "σ {std_deviation}, {name}, {mode:?}: {error}");
+                let error = reduced_error(f32::from(std_deviation), levels, extent, mode, draw);
+                // Rasterizing at higher precision rounds coverage differently
+                // where the source is placed differently, by up to 1 after
+                // the nested filters, which the reference shows too when it
+                // is moved by a multiple of every tile.
+                let tolerance = u8::from(*nests_filters && mode == RenderMode::OptimizeQuality);
+                assert!(
+                    error <= tolerance,
+                    "σ {std_deviation}, {name}, {mode:?}: {error}"
+                );
             }
         }
     }

@@ -8,7 +8,6 @@
 //! Filters are applied to rendered layer pixmaps and may use scratch storage for
 //! intermediate buffers.
 
-pub(crate) mod averaged_image;
 pub(crate) mod context;
 mod drop_shadow;
 mod flood;
@@ -113,37 +112,59 @@ pub(crate) fn filter_highp(
     }
 }
 
-/// Apply a blur or drop shadow to `pixmap`, whose pixels each cover
-/// `2^levels` pixels of the output on both axes and which starts at `origin`
-/// in its grid, and return the output inside `crop`, in the grid of the output.
+/// Run a blur or drop shadow on `pixmap`, which holds its source after the
+/// first `levels` decimations, see [`upscale_reduced`].
 ///
 /// Both kernels apply blurs and drop shadows at low precision, so this serves both.
-pub(crate) fn filter_reduced(
-    filter: PreparedFilter,
-    pixmap: FilterPixmap,
+pub(crate) fn blur_reduced(
+    filter: &PreparedFilter,
+    pixmap: &mut FilterPixmap,
     levels: u32,
-    origin: (i64, i64),
-    crop: Bounds,
     filter_scratch: &mut ScratchBuffer,
-) -> FilterPixmap {
+) {
     let scratch = filter_scratch.get_scratch_buffer(pixmap.width(), pixmap.height());
-    match filter {
-        PreparedFilter::GaussianBlur(blur) => gaussian_blur::apply_reduced_blur(
-            pixmap,
-            scratch,
+    let (n_decimations, kernel, edge_mode) = match filter {
+        PreparedFilter::GaussianBlur(blur) => (
             blur.n_decimations,
             &blur.kernel[..usize::from(blur.kernel_size)],
             blur.edge_mode,
-            levels,
-            origin,
-            crop,
         ),
+        PreparedFilter::DropShadow(shadow) => (
+            shadow.n_decimations,
+            &shadow.kernel[..usize::from(shadow.kernel_size)],
+            shadow.edge_mode,
+        ),
+        PreparedFilter::Flood(_) | PreparedFilter::Offset(_) => {
+            unreachable!("only blurs read a reduced source")
+        }
+    };
+    gaussian_blur::apply_blur(
+        pixmap,
+        scratch,
+        n_decimations - levels as usize,
+        kernel,
+        edge_mode,
+    );
+}
+
+/// Return the output inside `crop`, in the grid of the output, of a blur or
+/// drop shadow that [`blur_reduced`] ran on `blurred`, whose pixels each cover
+/// `2^levels` pixels of the output on both axes and which starts at `origin`
+/// in its grid.
+pub(crate) fn upscale_reduced(
+    filter: &PreparedFilter,
+    blurred: &FilterPixmap,
+    levels: u32,
+    origin: (i64, i64),
+    crop: Bounds,
+) -> FilterPixmap {
+    match filter {
+        PreparedFilter::GaussianBlur(blur) => {
+            gaussian_blur::upscale_reduced_blur(blurred, blur.edge_mode, levels, origin, crop)
+        }
         PreparedFilter::DropShadow(shadow) => {
-            let mut output = gaussian_blur::apply_reduced_blur(
-                pixmap,
-                scratch,
-                shadow.n_decimations,
-                &shadow.kernel[..usize::from(shadow.kernel_size)],
+            let mut output = gaussian_blur::upscale_reduced_blur(
+                blurred,
                 shadow.edge_mode,
                 levels,
                 origin,

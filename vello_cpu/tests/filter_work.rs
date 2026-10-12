@@ -246,11 +246,9 @@ fn offset_allocates_the_same_however_far_the_source_lies() {
     }
 }
 
-/// Render a blur of standard deviation `std_deviation` over a square that
-/// covers all it reaches of a 12 by 12 view.
-/// Blur a square that covers the view and reaches four standard deviations
-/// past it, drawn and blurred in a space scaled by `scale`.
-fn blurred_square(std_deviation: f32, scale: f64) -> Vec<u8> {
+/// Blur, in a 12 by 12 view, a square centered on it with sides `size` pixels
+/// long, drawn and blurred in a space scaled by `scale`.
+fn blurred_square(std_deviation: f32, size: f64, scale: f64) -> Vec<u8> {
     let mut context = context(12, 12);
     context.set_transform(Affine::scale(scale));
     context.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
@@ -258,21 +256,25 @@ fn blurred_square(std_deviation: f32, scale: f64) -> Vec<u8> {
         edge_mode: EdgeMode::None,
     }));
     context.set_paint(BLUE);
-    let (reach, size) = (4.0 * f64::from(std_deviation), 12.0 / scale);
-    context.fill_rect(&Rect::new(-reach, -reach, size + reach, size + reach));
+    let (center, half) = (6.0 / scale, size / 2.0 / scale);
+    context.fill_rect(&Rect::new(
+        center - half,
+        center - half,
+        center + half,
+        center + half,
+    ));
     context.pop_layer();
     render(context)
 }
 
 #[test]
-fn blur_allocates_a_bounded_amount_however_wide_it_is() {
-    // At larger scales, the largest standard deviations exceed `f32` in the
-    // target's space.
-    for scale in [1.0, 4.0, 1.0e30] {
-        for std_deviation in [4.0, 40.0, 400.0, 4_000.0, 20_000.0, 1.0e9, 1.0e30, f32::MAX] {
-            let (usage, pixels) = measure(|| blurred_square(std_deviation, scale));
-            // The blur reads three standard deviations around each pixel, which
-            // hold 99.7% of its weight.
+fn blur_of_a_square_covering_its_reach_is_opaque() {
+    for scale in [1.0, 4.0] {
+        for std_deviation in [4.0, 40.0, 400.0] {
+            // The blur reads three standard deviations around each pixel,
+            // which hold 99.7% of its weight; the square reaches four.
+            let size = 12.0 + 8.0 * f64::from(std_deviation) * scale;
+            let (usage, pixels) = measure(|| blurred_square(std_deviation, size, scale));
             for pixel in pixels.chunks_exact(4) {
                 assert!(
                     pixel[0] == 0 && pixel[1] == 0 && pixel[2] >= 253 && pixel[3] >= 253,
@@ -282,6 +284,35 @@ fn blur_allocates_a_bounded_amount_however_wide_it_is() {
             assert!(
                 usage.peak <= 32 << 20,
                 "sigma {std_deviation} at scale {scale}: {usage:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn blur_holds_the_same_memory_however_wide_it_is() {
+    // A blur reads every pixel of its source within its reach, which takes
+    // work growing with the square of its width until it holds the whole
+    // source, but holds no more than a tile of it at once. At larger scales,
+    // the largest standard deviations exceed `f32` in the target's space.
+    let (narrow, _) = measure(|| blurred_square(400.0, 2048.0, 1.0));
+    for scale in [1.0, 4.0, 1.0e30] {
+        for std_deviation in [400.0, 4_000.0, 1.0e9, 1.0e30, f32::MAX] {
+            let (usage, pixels) = measure(|| blurred_square(std_deviation, 2048.0, scale));
+            // The view lies at the center of the square, where its blur keeps
+            // the share of a Gaussian that lies within the square, less what
+            // decimating the source changes.
+            let share = erf(1024.0 / (f64::from(std_deviation) * scale * 2.0_f64.sqrt()));
+            let alpha = share * share * 255.0;
+            for pixel in pixels.as_chunks::<4>().0 {
+                assert!(
+                    (f64::from(pixel[3]) - alpha).abs() <= 2.0,
+                    "sigma {std_deviation} at scale {scale}: {pixel:?}, expected {alpha}"
+                );
+            }
+            assert!(
+                usage.peak <= narrow.peak + narrow.peak / 4,
+                "sigma {std_deviation} at scale {scale}: {usage:?}, at 400: {narrow:?}"
             );
         }
     }
@@ -435,4 +466,14 @@ fn opposite_shifts_past_any_coordinate_domain_cancel() {
             }
         }
     }
+}
+
+/// The error function, within 1.5e-7 (Abramowitz and Stegun, 7.1.26).
+fn erf(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    1.0 - poly * (-x * x).exp()
 }
