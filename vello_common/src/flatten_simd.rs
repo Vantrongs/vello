@@ -351,6 +351,8 @@ pub struct FlattenCtx {
     n_quads: usize,
     /// Reusable buffer for flattened cubic points.
     flattened_cubics: Vec<Point32>,
+    /// Reusable buffers for the two sides of a hairline outline (`flatten::stroke`).
+    pub(crate) hairline_sides: [Vec<Point>; 2],
 }
 
 #[inline(always)]
