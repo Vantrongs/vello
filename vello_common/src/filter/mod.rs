@@ -12,7 +12,7 @@ use crate::filter::flood::Flood;
 use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
 use crate::filter::offset::Offset;
 use crate::filter_effects::{Filter, FilterPrimitive};
-use crate::geometry::{PaddingU16, RectU16};
+use crate::geometry::{PaddingU16, RectU16, SizeU16};
 use crate::kurbo::{Affine, Rect, Vec2};
 use crate::math::snap_up;
 use crate::tile::Tile;
@@ -149,9 +149,8 @@ impl FilterLayerPlacement {
 
         // `bbox` is the tight bounding box across all strips in the filter
         // layer. We now need to expand it by the filter padding to know how
-        // large of a pixmap we actually need to allocate. Also, as mentioned
-        // in [`FilterLayerPlan::new`], we need to ensure the pixmap itself is
-        // also a multiple of the tile width / tile height.
+        // large of a pixmap we actually need to allocate. Cover it with tiles,
+        // retaining the partial final tile at the physical coordinate boundary.
         let pixmap_bbox = bbox
             .expand(filter_plan.filter_padding)
             .snap_to_tile_coordinates();
@@ -175,11 +174,8 @@ impl FilterLayerPlacement {
         let dest_bbox = pixmap_bbox.relative_to_origin((shift_x, shift_y));
 
         assert!(
-            dest_bbox.x0.is_multiple_of(Tile::WIDTH)
-                && dest_bbox.x1.is_multiple_of(Tile::WIDTH)
-                && dest_bbox.y0.is_multiple_of(Tile::HEIGHT)
-                && dest_bbox.y1.is_multiple_of(Tile::HEIGHT),
-            "filter destination bounds must be tile-aligned"
+            dest_bbox.x0.is_multiple_of(Tile::WIDTH) && dest_bbox.y0.is_multiple_of(Tile::HEIGHT),
+            "filter destination origin must be tile-aligned"
         );
 
         Self {
@@ -192,14 +188,16 @@ impl FilterLayerPlacement {
 
     /// Return the bounds of the pixmap allocated for the filter layer.
     ///
-    /// The bbox is guaranteed to be aligned to tile coordinates.
+    /// The origin is tile-aligned. The exclusive edge can cut the final tile
+    /// at the boundary of the physical coordinate domain.
     pub fn pixmap_bbox(self) -> RectU16 {
         self.pixmap_bbox
     }
 
     /// Return the bounds where the filter layer is composited into its parent.
     ///
-    /// The bbox is guaranteed to be aligned to tile coordinates.
+    /// The origin is tile-aligned. The exclusive edge can be partial after
+    /// clipping the allocation to the physical coordinate domain.
     pub fn dest_bbox(self) -> RectU16 {
         self.dest_bbox
     }
@@ -236,6 +234,24 @@ pub struct FilterData {
 }
 
 impl FilterData {
+    /// Return the viewport containing all source pixels needed by this filter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the expanded viewport exceeds the physical coordinate domain.
+    /// Truncating it would silently discard source pixels that affect the output.
+    pub fn source_viewport_size(&self, width: u16, height: u16) -> SizeU16 {
+        let expanded = |size: u16, before: u16, after: u16| {
+            size.checked_add(before)
+                .and_then(|size| size.checked_add(after))
+                .expect("filter source viewport exceeds u16 coordinate domain")
+        };
+        SizeU16::from_wh(
+            expanded(width, self.source_padding.left, self.source_padding.right),
+            expanded(height, self.source_padding.top, self.source_padding.bottom),
+        )
+    }
+
     /// Create precomputed data for a filter and transform.
     pub fn new(filter: Filter, transform: Affine) -> Self {
         fn snapped_padding(expansion: Rect) -> PaddingU16 {

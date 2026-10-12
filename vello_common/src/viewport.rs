@@ -92,19 +92,10 @@ impl ViewportState {
 
     /// Push a new root viewport.
     pub fn push_root_viewport(&mut self, filter_data: &FilterData) {
-        let padding = filter_data.source_padding;
-        let width = self
-            .strip_generator
-            .width()
-            .saturating_add(padding.left)
-            .saturating_add(padding.right);
-        let height = self
-            .strip_generator
-            .height()
-            .saturating_add(padding.top)
-            .saturating_add(padding.bottom);
+        let size = filter_data
+            .source_viewport_size(self.strip_generator.width(), self.strip_generator.height());
         // TODO: Use a pool of strip generators.
-        let filter_generator = StripGenerator::new(width, height, self.level);
+        let filter_generator = StripGenerator::new(size.width(), size.height(), self.level);
         let parent_generator = core::mem::replace(&mut self.strip_generator, filter_generator);
         self.strip_generator_stack.push(parent_generator);
 

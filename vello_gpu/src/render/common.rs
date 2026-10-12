@@ -19,6 +19,7 @@ use core::mem::size_of;
 use vello_common::color::{AlphaColor, Srgb};
 use vello_common::geometry::{RectU16, SizeU16};
 use vello_common::record::CommandRecorder;
+use vello_common::tile::Tile;
 
 // TODO: If we want to use native bilinear sampling for uploaded images,
 // we can pass 1 instead of 0 here.
@@ -171,6 +172,8 @@ impl LayersConfig {
         let max_size = self.max_texture_size;
 
         let checked_size = |width: u32, height: u32| {
+            let width = width.next_multiple_of(u32::from(Tile::WIDTH));
+            let height = height.next_multiple_of(u32::from(Tile::HEIGHT));
             if width > u32::from(max_size.width()) || height > u32::from(max_size.height()) {
                 return Err(IntermediateTextureError::TooLarge {
                     width,
@@ -332,10 +335,37 @@ mod tests {
         assert!(matches!(
             config.required_intermediate_texture_size(&recorder),
             Err(IntermediateTextureError::TooLarge {
-                width: 513,
-                height: 10,
+                width: 516,
+                height: 12,
                 max_width: 512,
                 max_height: 512,
+            })
+        ));
+    }
+
+    #[test]
+    fn required_intermediate_texture_size_rounds_physical_scene_in_wide_domain() {
+        let config = LayersConfig {
+            min_texture_size: SizeU16::new(1),
+            max_texture_size: SizeU16::new(u16::MAX),
+            ..Default::default()
+        };
+        let mut recorder = CommandRecorder::<RecordedDraw>::new(13, 7);
+        recorder.root_is_blend_target = true;
+        assert_eq!(
+            config
+                .required_intermediate_texture_size(&recorder)
+                .unwrap(),
+            SizeU16::from_wh(16, 8)
+        );
+        recorder.reset(u16::MAX, 1);
+        recorder.root_is_blend_target = true;
+        assert!(matches!(
+            config.required_intermediate_texture_size(&recorder),
+            Err(IntermediateTextureError::TooLarge {
+                width: 65536,
+                height: 4,
+                ..
             })
         ));
     }
@@ -363,8 +393,8 @@ mod tests {
                 max_width,
                 max_height,
             } => {
-                assert_eq!(width, u32::from(u16::MAX) + padding);
-                assert_eq!(height, 10 + padding);
+                assert_eq!(width, (u32::from(u16::MAX) + padding).next_multiple_of(4));
+                assert_eq!(height, (10 + padding).next_multiple_of(4));
                 assert_eq!(max_width, u16::MAX);
                 assert_eq!(max_height, u16::MAX);
             }

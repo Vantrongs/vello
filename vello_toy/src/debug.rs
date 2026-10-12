@@ -316,7 +316,7 @@ fn draw_alpha_fill_segment(
     height: u16,
 ) {
     let x0 = segment.x0();
-    let x1 = segment.x1().min(width);
+    let x1 = segment.x1().min(u32::from(width)) as u16;
     let y0 = segment.y();
     let y1 = y0.saturating_add(Tile::HEIGHT).min(height);
 
@@ -340,7 +340,7 @@ fn draw_alpha_fill_segment(
 
 fn draw_fill_segment(document: &mut Document, segment: StripFillSegment, width: u16, height: u16) {
     let x0 = segment.x0();
-    let x1 = segment.x1().min(width);
+    let x1 = segment.x1().min(u32::from(width)) as u16;
     let y0 = segment.y();
     let y1 = y0.saturating_add(Tile::HEIGHT).min(height);
     let rect = Rectangle::new()

@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use vello_common::geometry::{RectU16, SizeU16};
 use vello_common::multi_atlas::{AllocId, Atlas, AtlasId};
 use vello_common::record::RecordedLayerKind;
+use vello_common::tile::Tile;
 
 /// An allocation and the first round in which it can be used.
 #[derive(Debug, Clone, Copy)]
@@ -133,7 +134,7 @@ impl LayerAllocationRequest {
         }
     }
 
-    pub(super) fn allocation_size(self) -> SizeU16 {
+    pub(super) fn allocation_size(self) -> (u32, u32) {
         self.region.allocation_size()
     }
 }
@@ -149,12 +150,18 @@ struct RegionProps {
 
 impl RegionProps {
     /// Size of the atlas allocation needed to hold the region and its padding.
-    fn allocation_size(self) -> SizeU16 {
-        self.padding
-            .checked_mul(2)
-            .and_then(|padding| self.size.checked_add(padding))
-            .expect("layer allocation size exceeds the u16 atlas domain")
+    fn allocation_size(self) -> (u32, u32) {
+        let (width, height) = tile_covered_size(self.size);
+        let padding = u32::from(self.padding) * 2;
+        (width + padding, height + padding)
     }
+}
+
+fn tile_covered_size(size: SizeU16) -> (u32, u32) {
+    (
+        u32::from(size.width()).next_multiple_of(u32::from(Tile::WIDTH)),
+        u32::from(size.height()).next_multiple_of(u32::from(Tile::HEIGHT)),
+    )
 }
 
 /// Texture region and allocator metadata needed to release it.
@@ -178,16 +185,29 @@ impl AllocatedTextureRegion {
     }
 
     pub(super) fn clear_region(self) -> TextureRegion {
-        // The padding region isn't drawn into, so we also don't need to clear it.
-        self.region
+        // Strip quads cover whole tiles even when the physical sample bounds
+        // end inside a tile. Clear their entire footprint before atlas reuse.
+        // The separate filter halo is never drawn into and stays transparent.
+        let rect = self.region.rect;
+        let (width, height) = tile_covered_size(rect.into());
+        TextureRegion {
+            target: self.region.target,
+            rect: RectU16::new(
+                rect.x0,
+                rect.y0,
+                u16::try_from(u32::from(rect.x0) + width).unwrap(),
+                u16::try_from(u32::from(rect.y0) + height).unwrap(),
+            ),
+        }
     }
 
     fn allocation_region(self) -> RectU16 {
+        let raster = self.clear_region().rect;
         RectU16::new(
-            self.region.rect.x0 - self.padding,
-            self.region.rect.y0 - self.padding,
-            self.region.rect.x1 + self.padding,
-            self.region.rect.y1 + self.padding,
+            raster.x0 - self.padding,
+            raster.y0 - self.padding,
+            raster.x1 + self.padding,
+            raster.y1 + self.padding,
         )
     }
 }
@@ -211,8 +231,11 @@ impl AtlasExt for Atlas {
         let padding = props.padding;
         let width = props.size.width();
         let height = props.size.height();
-        let allocation_size = props.allocation_size();
-        let allocation = self.allocate(allocation_size.width(), allocation_size.height())?;
+        let (allocation_width, allocation_height) = props.allocation_size();
+        let allocation = self.allocate(
+            u16::try_from(allocation_width).ok()?,
+            u16::try_from(allocation_height).ok()?,
+        )?;
         let x = allocation.x + padding;
         let y = allocation.y + padding;
         let region = AllocatedTextureRegion::new(
@@ -243,13 +266,81 @@ impl AtlasExt for Atlas {
 #[cfg(test)]
 mod tests {
     use super::{AtlasExt, Atlases, FILTER_ATLAS_PADDING, LayerAllocationRequest, RegionProps};
-    use crate::target::{LayerTextureId, TextureParity};
+    use crate::target::{DrawTarget, LayerTextureId, LayerTextureRegion, TextureParity};
+    use alloc::vec::Vec;
     use vello_common::filter::{FilterData, FilterLayerPlacement};
     use vello_common::filter_effects::{Filter, FilterPrimitive};
     use vello_common::geometry::{RectU16, SizeU16};
     use vello_common::kurbo::Affine;
     use vello_common::multi_atlas::{Atlas, AtlasId};
     use vello_common::record::RecordedLayerKind;
+    use vello_common::strip::{Strip, visit_strip_fill_segments};
+
+    #[test]
+    fn partial_physical_bounds_reserve_and_clear_every_emitted_tile() {
+        for bbox in [
+            RectU16::new(0, 0, 13, 7),
+            RectU16::new(65532, 65532, 65535, 65535),
+        ] {
+            for padding in [0, FILTER_ATLAS_PADDING] {
+                let props = RegionProps {
+                    size: bbox.into(),
+                    padding,
+                };
+                let mut atlas = Atlas::new(AtlasId::new(0), 64, 64);
+                let target = LayerTextureId::new(TextureParity::Even, 0);
+                let allocation = atlas.allocate_region(target, props).unwrap();
+                let neighbor = atlas.allocate_region(target, props).unwrap();
+                let clear = allocation.clear_region().rect;
+                assert_eq!(allocation.region.rect.width(), bbox.width());
+                assert_eq!(allocation.region.rect.height(), bbox.height());
+                assert_eq!(clear.width(), bbox.width().next_multiple_of(4));
+                assert_eq!(clear.height(), bbox.height().next_multiple_of(4));
+                assert!(clear.intersect(neighbor.allocation_region()).is_empty());
+                let region = LayerTextureRegion {
+                    texture: allocation.region,
+                    layer_bbox: bbox,
+                };
+                let tile_bounds = bbox.to_tile_bounds();
+                let mut strips = Vec::new();
+                let mut alpha_idx = 0;
+                for row in tile_bounds.y0..tile_bounds.y1 {
+                    strips.push(Strip::new(bbox.x0, row * 4, alpha_idx, false));
+                    alpha_idx += u32::from(tile_bounds.width()) * 16;
+                }
+                strips.push(Strip::sentinel((tile_bounds.y1 - 1) * 4, alpha_idx));
+                let mut quads = Vec::new();
+                visit_strip_fill_segments(
+                    &strips,
+                    tile_bounds,
+                    &mut quads,
+                    |quads, segment| quads.push(segment.shift(region.geometry_shift())),
+                    |_, _| panic!("expected alpha strips"),
+                );
+                assert!(!quads.is_empty());
+                for quad in quads {
+                    assert_eq!(
+                        quad.intersect(clear),
+                        quad,
+                        "emitted quad must be reserved and cleared"
+                    );
+                }
+                assert_eq!(
+                    allocation.allocation_region().width(),
+                    clear.width() + padding * 2
+                );
+                assert_eq!(
+                    allocation.allocation_region().height(),
+                    clear.height() + padding * 2
+                );
+                atlas.deallocate_region(allocation);
+                assert_eq!(
+                    atlas.allocate_region(target, props).unwrap().region,
+                    allocation.region
+                );
+            }
+        }
+    }
 
     fn request(
         texture_parity: TextureParity,
@@ -359,7 +450,7 @@ mod tests {
 
     #[test]
     fn padded_reuse() {
-        let mut atlas = Atlas::new(AtlasId::new(0), 8, 8);
+        let mut atlas = Atlas::new(AtlasId::new(0), 10, 10);
         let target = LayerTextureId::new(TextureParity::Even, 0);
         let request = RegionProps {
             size: SizeU16::new(6),
@@ -368,8 +459,8 @@ mod tests {
 
         let allocation = atlas.allocate_region(target, request).unwrap();
         assert_eq!(allocation.region.rect, RectU16::new(1, 1, 7, 7));
-        assert_eq!(allocation.clear_region().rect, RectU16::new(1, 1, 7, 7));
-        assert_eq!(allocation.allocation_region(), RectU16::new(0, 0, 8, 8));
+        assert_eq!(allocation.clear_region().rect, RectU16::new(1, 1, 9, 9));
+        assert_eq!(allocation.allocation_region(), RectU16::new(0, 0, 10, 10));
         assert!(atlas.allocate_region(target, request).is_none());
 
         atlas.deallocate_region(allocation);
