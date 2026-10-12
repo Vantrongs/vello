@@ -158,6 +158,12 @@ impl From<u16> for Coord {
     }
 }
 
+impl From<u64> for Coord {
+    fn from(value: u64) -> Self {
+        Self(value.into())
+    }
+}
+
 impl From<usize> for Coord {
     fn from(value: usize) -> Self {
         Self(value.into())

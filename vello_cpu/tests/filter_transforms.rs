@@ -201,3 +201,55 @@ fn tiny_filter_scale_matches_its_effective_device_sigma() {
         );
     }
 }
+
+#[test]
+fn offset_rounds_its_device_shift_through_f32() {
+    // 0.5 · 0.99999999 is below one half in f64 but rounds to 0.5 in f32, which
+    // the filter then rounds away from zero.
+    let draw = |filter: Option<f64>, shift: f64, mode: RenderMode| {
+        let mut ctx = RenderContext::new_with(
+            16,
+            16,
+            RenderSettings {
+                level: Level::baseline(),
+                num_threads: 0,
+            },
+        );
+        if let Some(offset) = filter {
+            ctx.set_transform(Affine::scale_non_uniform(0.999_999_99, 1.0));
+            #[expect(clippy::cast_possible_truncation, reason = "the test offsets are f32")]
+            ctx.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+                dx: offset as f32,
+                dy: 0.0,
+            }));
+        }
+        ctx.set_transform(Affine::IDENTITY);
+        ctx.set_paint(RED);
+        ctx.fill_rect(&Rect::new(6.0 + shift, 6.0, 10.0 + shift, 10.0));
+        if filter.is_some() {
+            ctx.pop_layer();
+        }
+        ctx.flush();
+        let mut image = Pixmap::new(16, 16);
+        ctx.render_with(
+            &mut image,
+            &mut Resources::new(),
+            RasterizerSettings {
+                render_mode: mode,
+                ..Default::default()
+            },
+        );
+        image
+    };
+    for mode in modes() {
+        for offset in [0.5, -0.5] {
+            let actual = draw(Some(offset), 0.0, mode);
+            let expected = draw(None, offset * 2.0, mode);
+            assert_eq!(
+                actual.data_as_u8_slice(),
+                expected.data_as_u8_slice(),
+                "offset={offset}, mode={mode:?}"
+            );
+        }
+    }
+}
