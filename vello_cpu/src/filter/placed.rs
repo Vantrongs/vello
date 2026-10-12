@@ -14,100 +14,245 @@ use vello_common::peniko::color::PremulRgba8;
 use vello_common::peniko::kurbo::common::FloatFuncs as _;
 use vello_common::tile::Tile;
 
-/// The bound of the coordinates of [`Bounds`] in each pixel grid. Lengths and
-/// sums of two coordinates fit `i64`, and areas fit `u128`.
-///
-/// It reaches far past the precision of the `f64` geometry drawn into the
-/// grid, so nothing is placed beyond it.
-const LIMIT: i64 = 1 << 61;
-
 /// Return the width of the pixels of the grid `level` steps of two coarser
 /// than the root target's, in root target pixels.
 pub(crate) fn pixel_size(level: u32) -> f64 {
     (0..level).fold(1.0, |size, _| size * 2.0)
 }
 
-/// A whole number of pixels, `high * 2^64 + low` with `low` in `0..2^64`, so
-/// that the offsets of any number of filters, each up to `f32::MAX`, add up
-/// exactly and opposite ones cancel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Shift {
+/// A whole number of pixels, `high * 2^64 + low` with `low` in `0..2^64`.
+///
+/// Filters move their output by up to `f32::MAX` pixels, past `2^127`, so a
+/// copy that nested filters move away and back lies beyond `i128` before it
+/// returns. Coordinates hold every such copy exactly, so opposite moves cancel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Coord {
     high: i128,
-    low: i128,
+    low: u64,
 }
 
-impl Shift {
-    /// Return the whole number of pixels `value`.
-    pub(crate) fn of(value: f32) -> Self {
-        // An `f32` this large is a multiple of `2^64`, and `i128` holds the rest exactly.
-        if value.abs() >= (1_u128 << 126) as f32 {
+impl Coord {
+    pub(crate) const ZERO: Self = Self { high: 0, low: 0 };
+    const ONE: Self = Self { high: 0, low: 1 };
+    const MIN: Self = Self {
+        high: i128::MIN,
+        low: 0,
+    };
+    const MAX: Self = Self {
+        high: i128::MAX,
+        low: u64::MAX,
+    };
+    /// The bound of the coordinates of [`Bounds`] in each pixel grid, `2^189`.
+    /// Sums of two coordinates and of a coordinate and a filter's offset or
+    /// padding stay below [`Self::BEYOND`].
+    const LIMIT: Self = Self {
+        high: 1 << 125,
+        low: 0,
+    };
+    /// `2^190`, where results past the domain saturate.
+    const BEYOND: Self = Self {
+        high: 1 << 126,
+        low: 0,
+    };
+
+    const fn of_i128(value: i128) -> Self {
+        Self {
+            high: value >> 64,
+            low: value as u64,
+        }
+    }
+
+    /// Return the whole number `value`, saturated past the domain.
+    pub(crate) fn of_f64(value: f64) -> Self {
+        let exact = (1_u128 << 126) as f64;
+        if value.abs() < exact {
+            Self::of_i128(value as i128)
+        } else if value.abs() < exact * (1_u128 << 64) as f64 {
+            // Such a large `f64` is a multiple of `2^74`.
             Self {
-                high: (value / (1_u128 << 64) as f32) as i128,
+                high: (value / (1_u128 << 64) as f64) as i128,
+                low: 0,
+            }
+        } else if value > 0.0 {
+            Self::BEYOND
+        } else {
+            -Self::BEYOND
+        }
+    }
+
+    pub(crate) fn to_f64(self) -> f64 {
+        match self.high.checked_mul(1 << 64) {
+            Some(high) => (high | i128::from(self.low)) as f64,
+            // The low part lies below the precision of the result.
+            None => self.high as f64 * (1_u128 << 64) as f64,
+        }
+    }
+
+    /// Return the number if it fits `i64`.
+    pub(crate) fn to_i64(self) -> Option<i64> {
+        let value = self.high.checked_mul(1 << 64)? | i128::from(self.low);
+        i64::try_from(value).ok()
+    }
+
+    /// Return the number clamped to `±2^62`, which lies beyond any pixmap
+    /// placed in the `i64` domain while sums with its lengths still fit.
+    pub(crate) fn clamped_i64(self) -> i64 {
+        let bound = Self::of_i128(1 << 62);
+        self.clamp(-bound, bound).to_i64().unwrap()
+    }
+
+    /// Return the largest whole number at most `self / 2^levels`.
+    pub(crate) fn shr(self, levels: u32) -> Self {
+        match levels {
+            0 => self,
+            1..64 => Self {
+                high: self.high >> levels,
+                low: (self.low >> levels) | ((self.high as u64) << (64 - levels)),
+            },
+            _ => Self::of_i128(self.high >> (levels - 64).min(127)),
+        }
+    }
+
+    /// Return `self * 2^levels`, saturated past the domain.
+    pub(crate) fn shl(self, levels: u32) -> Self {
+        let bound = Self::BEYOND.shr(levels);
+        if self == Self::ZERO || levels == 0 {
+            self
+        } else if self >= bound {
+            Self::BEYOND
+        } else if self <= -bound {
+            -Self::BEYOND
+        } else if levels < 64 {
+            Self {
+                high: (self.high << levels) | i128::from(self.low >> (64 - levels)),
+                low: self.low << levels,
+            }
+        } else {
+            // The number is below `2^126`.
+            Self::of_i128(((self.high << 64) | i128::from(self.low)) << (levels - 64))
+        }
+    }
+
+    /// Return the number modulo `2^levels`, for `levels` up to 128.
+    pub(crate) fn low_bits(self, levels: u32) -> u128 {
+        let value = ((self.high as u128) << 64) | u128::from(self.low);
+        value
+            & u128::MAX
+                .checked_shr(128_u32.saturating_sub(levels))
+                .unwrap_or(0)
+    }
+
+    /// Return the number of significant bits of a number that is not negative.
+    fn bits(self) -> u32 {
+        if self.high > 0 {
+            192 - self.high.leading_zeros()
+        } else {
+            u64::BITS - self.low.leading_zeros()
+        }
+    }
+
+    /// Return the number of a length, saturated at `u128::MAX`.
+    fn length(self) -> u128 {
+        if self.high >= 1 << 64 {
+            u128::MAX
+        } else {
+            self.low_bits(128)
+        }
+    }
+}
+
+impl From<i64> for Coord {
+    fn from(value: i64) -> Self {
+        Self::of_i128(value.into())
+    }
+}
+
+impl From<i32> for Coord {
+    fn from(value: i32) -> Self {
+        Self::of_i128(value.into())
+    }
+}
+
+impl From<u64> for Coord {
+    fn from(value: u64) -> Self {
+        Self::of_i128(value.into())
+    }
+}
+
+impl core::ops::Add for Coord {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        let low = u128::from(self.low) + u128::from(other.low);
+        Self {
+            high: self.high.saturating_add(other.high) + (low >> 64) as i128,
+            low: low as u64,
+        }
+    }
+}
+
+impl core::ops::Neg for Coord {
+    type Output = Self;
+
+    fn neg(self) -> Self {
+        if self.low == 0 {
+            Self {
+                high: -self.high,
                 low: 0,
             }
         } else {
-            Self::normalized(0, value as i128)
+            Self {
+                high: -self.high - 1,
+                low: self.low.wrapping_neg(),
+            }
         }
-    }
-
-    fn normalized(high: i128, low: i128) -> Self {
-        Self {
-            high: high + (low >> 64),
-            low: low & i128::from(u64::MAX),
-        }
-    }
-
-    pub(crate) fn add(self, other: Self) -> Self {
-        Self::normalized(self.high + other.high, self.low + other.low)
-    }
-
-    /// Return the number, saturated at `±i64::MAX`, which lie beyond the
-    /// domain of every grid and can be negated.
-    pub(crate) fn saturated(self) -> i64 {
-        let value = self
-            .high
-            .checked_mul(1 << 64)
-            .and_then(|high| high.checked_add(self.low))
-            .unwrap_or(if self.high < 0 { i128::MIN } else { i128::MAX });
-        value.clamp((-i64::MAX).into(), i64::MAX.into()) as i64
     }
 }
 
-/// A rectangle in a pixel grid, with coordinates in `-LIMIT..=LIMIT`: whatever
-/// lies outside that domain is cut off. Empty rectangles are normalized to
-/// [`Bounds::EMPTY`], so their width and height are never negative.
+impl core::ops::Sub for Coord {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        self + -other
+    }
+}
+
+/// A point or offset in a pixel grid.
+pub(crate) type Position = (Coord, Coord);
+
+/// A rectangle in a pixel grid, with coordinates in `-2^189..=2^189`, see
+/// [`Coord`]: whatever lies outside that domain is cut off. Empty rectangles
+/// are normalized to [`Bounds::EMPTY`], so their width and height are never
+/// negative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bounds {
-    pub(crate) x0: i64,
-    pub(crate) y0: i64,
-    pub(crate) x1: i64,
-    pub(crate) y1: i64,
+    pub(crate) x0: Coord,
+    pub(crate) y0: Coord,
+    pub(crate) x1: Coord,
+    pub(crate) y1: Coord,
 }
 
 impl Bounds {
     pub(crate) const EMPTY: Self = Self {
-        x0: 0,
-        y0: 0,
-        x1: 0,
-        y1: 0,
+        x0: Coord::ZERO,
+        y0: Coord::ZERO,
+        x1: Coord::ZERO,
+        y1: Coord::ZERO,
     };
 
-    /// The whole domain of a grid.
-    pub(crate) const DOMAIN: Self = Self {
-        x0: -LIMIT,
-        y0: -LIMIT,
-        x1: LIMIT,
-        y1: LIMIT,
-    };
-
-    pub(crate) fn new(x0: i64, y0: i64, x1: i64, y1: i64) -> Self {
-        Self::clamped(x0.into(), y0.into(), x1.into(), y1.into())
-    }
-
-    /// Return the part of the rectangle inside the domain.
-    fn clamped(x0: i128, y0: i128, x1: i128, y1: i128) -> Self {
-        let clamp = |value: i128| value.clamp(-i128::from(LIMIT), i128::from(LIMIT)) as i64;
-        let (x0, y0, x1, y1) = (clamp(x0), clamp(y0), clamp(x1), clamp(y1));
+    pub(crate) fn new(
+        x0: impl Into<Coord>,
+        y0: impl Into<Coord>,
+        x1: impl Into<Coord>,
+        y1: impl Into<Coord>,
+    ) -> Self {
+        let clamp = |value: Coord| value.clamp(-Coord::LIMIT, Coord::LIMIT);
+        let (x0, y0, x1, y1) = (
+            clamp(x0.into()),
+            clamp(y0.into()),
+            clamp(x1.into()),
+            clamp(y1.into()),
+        );
         if x0 >= x1 || y0 >= y1 {
             return Self::EMPTY;
         }
@@ -123,14 +268,13 @@ impl Bounds {
             && rect.x1.is_finite()
             && rect.y1.is_finite())
         {
-            return Self::DOMAIN;
+            return Self::new(-Coord::LIMIT, -Coord::LIMIT, Coord::LIMIT, Coord::LIMIT);
         }
-        // Converting saturates, which the domain then clamps.
         Self::new(
-            rect.x0.floor() as i64,
-            rect.y0.floor() as i64,
-            rect.x1.ceil() as i64,
-            rect.y1.ceil() as i64,
+            Coord::of_f64(rect.x0.floor()),
+            Coord::of_f64(rect.y0.floor()),
+            Coord::of_f64(rect.x1.ceil()),
+            Coord::of_f64(rect.y1.ceil()),
         )
     }
 
@@ -140,12 +284,13 @@ impl Bounds {
     }
 
     /// Return the bounds of `rect`, which is relative to `origin`.
-    pub(crate) fn of_rect(rect: RectU16, origin: (i64, i64)) -> Self {
+    pub(crate) fn of_rect(rect: RectU16, origin: Position) -> Self {
+        let place = |value: u16, origin: Coord| origin + i64::from(value).into();
         Self::new(
-            i64::from(rect.x0) + origin.0,
-            i64::from(rect.y0) + origin.1,
-            i64::from(rect.x1) + origin.0,
-            i64::from(rect.y1) + origin.1,
+            place(rect.x0, origin.0),
+            place(rect.y0, origin.1),
+            place(rect.x1, origin.0),
+            place(rect.y1, origin.1),
         )
     }
 
@@ -153,40 +298,50 @@ impl Bounds {
         self == Self::EMPTY
     }
 
-    pub(crate) fn width(self) -> i64 {
+    pub(crate) fn origin(self) -> Position {
+        (self.x0, self.y0)
+    }
+
+    pub(crate) fn width(self) -> Coord {
         self.x1 - self.x0
     }
 
-    pub(crate) fn height(self) -> i64 {
+    pub(crate) fn height(self) -> Coord {
         self.y1 - self.y0
     }
 
-    pub(crate) fn area(self) -> u128 {
-        self.width() as u128 * self.height() as u128
+    /// Return the width and height of bounds that fit `u32`, as a pixmap's are.
+    pub(crate) fn size(self) -> (u32, u32) {
+        let size = |length: Coord| {
+            length
+                .to_i64()
+                .and_then(|length| u32::try_from(length).ok())
+                .expect("filter pixmaps fit the u32 domain")
+        };
+        (size(self.width()), size(self.height()))
     }
 
-    pub(crate) fn translate(self, (dx, dy): (i64, i64)) -> Self {
+    /// Return the area, saturated at `u128::MAX`.
+    pub(crate) fn area(self) -> u128 {
+        self.width().length().saturating_mul(self.height().length())
+    }
+
+    pub(crate) fn translate(self, (dx, dy): Position) -> Self {
         if self.is_empty() {
             return self;
         }
-        let (dx, dy) = (i128::from(dx), i128::from(dy));
-        Self::clamped(
-            i128::from(self.x0) + dx,
-            i128::from(self.y0) + dy,
-            i128::from(self.x1) + dx,
-            i128::from(self.y1) + dy,
-        )
+        Self::new(self.x0 + dx, self.y0 + dy, self.x1 + dx, self.y1 + dy)
     }
 
     pub(crate) fn expand(self, padding: PaddingU64) -> Self {
         if self.is_empty() {
             return self;
         }
-        Self::clamped(
-            i128::from(self.x0) - i128::from(padding.left),
-            i128::from(self.y0) - i128::from(padding.top),
-            i128::from(self.x1) + i128::from(padding.right),
-            i128::from(self.y1) + i128::from(padding.bottom),
+        Self::new(
+            self.x0 - padding.left.into(),
+            self.y0 - padding.top.into(),
+            self.x1 + padding.right.into(),
+            self.y1 + padding.bottom.into(),
         )
     }
 
@@ -216,53 +371,61 @@ impl Bounds {
     }
 
     pub(crate) fn snap_to_tiles(self) -> Self {
-        if self.is_empty() {
-            return self;
+        const {
+            assert!(
+                Tile::WIDTH.is_power_of_two() && Tile::HEIGHT.is_power_of_two(),
+                "tiles are snapped to by shifting"
+            );
         }
-        let (width, height) = (i64::from(Tile::WIDTH), i64::from(Tile::HEIGHT));
-        Self::new(
-            self.x0.div_euclid(width) * width,
-            self.y0.div_euclid(height) * height,
-            (self.x1 + width - 1).div_euclid(width) * width,
-            (self.y1 + height - 1).div_euclid(height) * height,
-        )
+        let (width, height) = (Tile::WIDTH.trailing_zeros(), Tile::HEIGHT.trailing_zeros());
+        let x = self.coarsen_axes(width, 0).refine_axes(width, 0);
+        x.coarsen_axes(0, height).refine_axes(0, height)
     }
 
     /// Return the bounds of the pixels `levels` times coarser by a factor of
     /// two that cover these bounds, on a grid aligned with this one at zero.
     pub(crate) fn coarsen(self, levels: u32) -> Self {
+        self.coarsen_axes(levels, levels)
+    }
+
+    fn coarsen_axes(self, x: u32, y: u32) -> Self {
         if self.is_empty() {
             return self;
         }
-        // Past 64 levels, every coordinate of the domain falls into the
-        // coarse pixels next to zero.
-        let step = 1_i128 << levels.min(64);
-        let start = |value: i64| i128::from(value).div_euclid(step);
-        let end = |value: i64| (i128::from(value) + step - 1).div_euclid(step);
-        Self::clamped(start(self.x0), start(self.y0), end(self.x1), end(self.y1))
+        let end = |value: Coord, levels: u32| -(-value).shr(levels);
+        Self::new(
+            self.x0.shr(x),
+            self.y0.shr(y),
+            end(self.x1, x),
+            end(self.y1, y),
+        )
     }
 
     /// Return the bounds of these pixels on a grid `levels` times finer by a
     /// factor of two, as far as that grid's domain reaches.
     pub(crate) fn refine(self, levels: u32) -> Self {
-        // Past 64 levels, every coordinate but zero leaves the domain.
-        let scale = |value: i64| i128::from(value) << levels.min(64);
-        Self::clamped(
-            scale(self.x0),
-            scale(self.y0),
-            scale(self.x1),
-            scale(self.y1),
+        self.refine_axes(levels, levels)
+    }
+
+    fn refine_axes(self, x: u32, y: u32) -> Self {
+        Self::new(
+            self.x0.shl(x),
+            self.y0.shl(y),
+            self.x1.shl(x),
+            self.y1.shl(y),
         )
     }
 
     /// Convert bounds relative to `origin` into a `u16` rectangle, clipping the
     /// exclusive edge to the `u16` domain.
-    pub(crate) fn to_rect_u16(self, origin: (i64, i64)) -> RectU16 {
+    pub(crate) fn to_rect_u16(self, origin: Position) -> RectU16 {
         if self.is_empty() {
             return RectU16::ZERO;
         }
         let local = self.translate((-origin.0, -origin.1));
-        let narrow = |value: i64| u16::try_from(value.min(i64::from(u16::MAX))).unwrap();
+        let narrow = |value: Coord| {
+            u16::try_from(value.min(i64::from(u16::MAX).into()).to_i64().unwrap()).unwrap()
+        };
         RectU16::new(
             narrow(local.x0),
             narrow(local.y0),
@@ -282,9 +445,9 @@ impl Bounds {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Index {
     /// Each member by class, cell row, cell column and id.
-    members: BTreeMap<(u32, i64, i64, usize), Bounds>,
+    members: BTreeMap<(u32, Coord, Coord, usize), Bounds>,
     /// The classes that may hold members, as bits.
-    classes: u64,
+    classes: [u64; 3],
 }
 
 impl Index {
@@ -297,10 +460,10 @@ impl Index {
         index
     }
 
-    fn key(id: usize, bounds: Bounds) -> (u32, i64, i64, usize) {
-        let side = bounds.width().max(bounds.height()).max(1).unsigned_abs();
-        let class = u64::BITS - (side - 1).leading_zeros();
-        (class, bounds.y0 >> class, bounds.x0 >> class, id)
+    fn key(id: usize, bounds: Bounds) -> (u32, Coord, Coord, usize) {
+        let side = bounds.width().max(bounds.height());
+        let class = (side - Coord::ONE).bits();
+        (class, bounds.y0.shr(class), bounds.x0.shr(class), id)
     }
 
     /// Add `bounds` with `id`, unless they are empty.
@@ -309,7 +472,7 @@ impl Index {
             return;
         }
         let key = Self::key(id, bounds);
-        self.classes |= 1 << key.0;
+        self.classes[key.0 as usize / 64] |= 1 << (key.0 % 64);
         self.members.insert(key, bounds);
     }
 
@@ -326,27 +489,29 @@ impl Index {
     /// Return the ids and bounds of the members that overlap `query` or share
     /// an edge with it, in no particular order.
     pub(crate) fn touching(&self, query: Bounds) -> impl Iterator<Item = (usize, Bounds)> + '_ {
-        let classes = (0..u64::BITS).filter(|class| self.classes & (1 << class) != 0);
+        let classes = (0..192)
+            .filter(|&class: &u32| self.classes[class as usize / 64] & (1 << (class % 64)) != 0);
         let candidates = classes.flat_map(move |class| {
-            let cell = |value: i64| value >> class;
-            let first = |value: i64| ((i128::from(value) - (1_i128 << class)) >> class) as i64;
+            let first = |value: Coord| (value - Coord::ONE.shl(class)).shr(class);
             let (columns, rows) = (
-                first(query.x0)..=cell(query.x1),
-                first(query.y0)..=cell(query.y1),
+                first(query.x0)..=query.x1.shr(class),
+                first(query.y0)..=query.y1.shr(class),
             );
             // A tall query scans the members of its rows; a short one only
             // the cells it can touch.
-            let short = rows.end() - rows.start() < 4;
+            let short = *rows.end() - *rows.start() < 4.into();
             let bands = if short {
-                (*rows.start()..=*rows.end())
-                    .map(|row| {
-                        (class, row, *columns.start(), 0)..=(class, row, *columns.end(), usize::MAX)
-                    })
-                    .collect::<Vec<_>>()
+                core::iter::successors(Some(*rows.start()), |&row| {
+                    (row < *rows.end()).then(|| row + Coord::ONE)
+                })
+                .map(|row| {
+                    (class, row, *columns.start(), 0)..=(class, row, *columns.end(), usize::MAX)
+                })
+                .collect::<Vec<_>>()
             } else {
                 alloc::vec![
-                    (class, *rows.start(), i64::MIN, 0)
-                        ..=(class, *rows.end(), i64::MAX, usize::MAX)
+                    (class, *rows.start(), Coord::MIN, 0)
+                        ..=(class, *rows.end(), Coord::MAX, usize::MAX)
                 ]
             };
             bands.into_iter().flat_map(move |band| {
@@ -393,7 +558,9 @@ impl Regions {
         while let Some(index) = self
             .index
             .touching(bounds)
-            .filter(|(_, region)| region.union(bounds).area() <= region.area() + bounds.area())
+            .filter(|(_, region)| {
+                region.union(bounds).area() <= region.area().saturating_add(bounds.area())
+            })
             .map(|(index, _)| index)
             .min()
         {
@@ -474,14 +641,14 @@ pub(crate) struct PlacedPixmap {
 impl PlacedPixmap {
     /// Create a transparent pixmap covering `bounds`.
     pub(crate) fn new(bounds: Bounds) -> Self {
-        let size = |length: i64| u32::try_from(length).expect("filter pixmaps fit the u32 domain");
+        let (width, height) = bounds.size();
         Self {
-            pixmap: FilterPixmap::new(size(bounds.width()), size(bounds.height())),
+            pixmap: FilterPixmap::new(width, height),
             bounds,
         }
     }
 
-    pub(crate) fn translate(self, offset: (i64, i64)) -> Self {
+    pub(crate) fn translate(self, offset: Position) -> Self {
         Self {
             bounds: self.bounds.translate(offset),
             ..self
@@ -512,10 +679,11 @@ impl PlacedPixmap {
         mut op: impl FnMut(&mut [PremulRgba8], &[PremulRgba8]),
     ) {
         let area = area.intersect(self.bounds).intersect(source.bounds);
-        let width = usize::try_from(area.width()).unwrap();
-        for y in area.y0..area.y1 {
-            let from = source.index(area.x0, y);
-            let to = self.index(area.x0, y);
+        let (width, height) = area.size();
+        let width = usize::try_from(width).unwrap();
+        for row in 0..height {
+            let from = source.index(area.origin(), row);
+            let to = self.index(area.origin(), row);
             op(
                 &mut self.pixmap.data_mut()[to..to + width],
                 &source.pixmap.data()[from..from + width],
@@ -527,8 +695,9 @@ impl PlacedPixmap {
     /// coarser than that of `source`, that `source` covers to the average of
     /// the pixels of `source` they cover, which lines up with them.
     pub(crate) fn average(&mut self, source: &Self, levels: u32) {
-        let width = usize::try_from(source.bounds.width()).unwrap();
-        let coarse = source.bounds.coarsen(levels);
+        let width = usize::try_from(source.bounds.size().0).unwrap();
+        let start = self.index(source.bounds.coarsen(levels).origin(), 0);
+        let stride = usize::try_from(self.bounds.size().0).unwrap();
         let mut sums = vec![[0_u32; 4]; width >> levels];
         for (row, line) in source.pixmap.data().chunks_exact(width).enumerate() {
             for (x, pixel) in line.iter().enumerate() {
@@ -538,9 +707,9 @@ impl PlacedPixmap {
                 }
             }
             if (row + 1) % (1 << levels) == 0 {
-                let y = coarse.y0 + i64::try_from(row >> levels).unwrap();
-                for (x, sum) in (coarse.x0..).zip(&mut sums) {
-                    self.set_average(x, y, sum.map(u128::from), levels);
+                let start = start + (row >> levels) * stride;
+                for (index, sum) in (start..).zip(&mut sums) {
+                    self.set_average(index, sum.map(u128::from), levels);
                     *sum = [0; 4];
                 }
             }
@@ -556,24 +725,28 @@ impl PlacedPixmap {
         }
     }
 
-    /// Set the pixel at `x`, `y` to the average of the `4^levels` pixels whose
+    /// Set the pixel at `index` to the average of the `4^levels` pixels whose
     /// channels add up to `sums`, rounded to nearest with halves up.
-    pub(crate) fn set_average(&mut self, x: i64, y: i64, sums: [u128; 4], levels: u32) {
+    pub(crate) fn set_average(&mut self, index: usize, sums: [u128; 4], levels: u32) {
         let [r, g, b, a] =
             sums.map(|sum| ((sum.checked_shr(2 * levels - 1).unwrap_or(0) + 1) >> 1) as u8);
-        let index = self.index(x, y);
         self.pixmap.data_mut()[index] = PremulRgba8 { r, g, b, a };
     }
 
-    fn index(&self, x: i64, y: i64) -> usize {
-        let bounds = self.bounds;
-        usize::try_from((y - bounds.y0) * bounds.width() + x - bounds.x0).unwrap()
+    /// Return the index of the pixel `row` rows below `position`.
+    fn index(&self, (x, y): Position, row: u32) -> usize {
+        let offset = |value: Coord, start: Coord| {
+            usize::try_from((value - start).to_i64().unwrap()).unwrap()
+        };
+        let width = usize::try_from(self.bounds.size().0).unwrap();
+        (offset(y, self.bounds.y0) + usize::try_from(row).unwrap()) * width
+            + offset(x, self.bounds.x0)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Bounds, Regions, Shift};
+    use super::{Bounds, Coord, Regions};
     use alloc::vec::Vec;
 
     /// Merge like [`Regions::insert`], comparing with every member.
@@ -581,31 +754,82 @@ mod tests {
         if bounds.is_empty() {
             return;
         }
-        while let Some(index) = regions
-            .iter()
-            .position(|region| region.union(bounds).area() <= region.area() + bounds.area())
-        {
+        while let Some(index) = regions.iter().position(|region| {
+            region.union(bounds).area() <= region.area().saturating_add(bounds.area())
+        }) {
             bounds = bounds.union(regions.swap_remove(index));
         }
         regions.push(bounds);
     }
 
     #[test]
-    fn shifts_add_up_exactly() {
+    fn offsets_add_up_exactly() {
         let sum = |values: &[f32]| {
-            values
-                .iter()
-                .fold(Shift::default(), |sum, &value| sum.add(Shift::of(value)))
-                .saturated()
+            values.iter().fold(Coord::ZERO, |sum, &value| {
+                sum + Coord::of_f64(f64::from(value))
+            })
         };
         let big = 2.0_f32.powi(127);
-        assert_eq!(sum(&[f32::MAX, 1.0, -f32::MAX]), 1);
-        assert_eq!(sum(&[-f32::MAX, -3.0, f32::MAX, f32::MAX, -f32::MAX]), -3);
-        assert_eq!(sum(&[big, -f32::MAX, big, -(2.0_f32.powi(104))]), 0);
-        assert_eq!(sum(&[f32::MAX, f32::MAX]), i64::MAX);
-        assert_eq!(sum(&[-f32::MAX, -f32::MAX, -f32::MAX]), -i64::MAX);
-        assert_eq!(sum(&[-1.5e9, 2.5e9]), 1_000_000_000);
-        assert_eq!(sum(&[9.0e18, 9.0e18, -9.0e18]), 9_000_000_202_358_128_640);
+        assert_eq!(sum(&[f32::MAX, 1.0, -f32::MAX]), Coord::from(1));
+        assert_eq!(
+            sum(&[-f32::MAX, -3.0, f32::MAX, f32::MAX, -f32::MAX]),
+            Coord::from(-3)
+        );
+        assert_eq!(
+            sum(&[big, -f32::MAX, big, -(2.0_f32.powi(104))]),
+            Coord::ZERO
+        );
+        assert_eq!(
+            sum(&[f32::MAX, f32::MAX]) - sum(&[f32::MAX]),
+            sum(&[f32::MAX])
+        );
+        assert!(sum(&[f32::MAX, f32::MAX, f32::MAX]) > sum(&[f32::MAX, f32::MAX]));
+        assert_eq!(sum(&[-1.5e9, 2.5e9]), Coord::from(1_000_000_000));
+        assert_eq!(
+            sum(&[9.0e18, 9.0e18, -9.0e18]).to_f64(),
+            9_000_000_202_358_128_640.0
+        );
+    }
+
+    #[test]
+    fn coordinates_compute_like_wide_integers() {
+        let mut state = 0x2545_f491_u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..10_000 {
+            // Values of every magnitude below `2^100`, which `i128` holds
+            // with their products by `2^20` and sums.
+            let bits = random() % 100;
+            let value = (i128::from(random()) << 64 | i128::from(random())) >> (127 - bits);
+            let other = (i128::from(random()) << 64 | i128::from(random())) >> (127 - bits);
+            let coord = Coord::of_i128;
+            let levels = u32::try_from(random() % 140).unwrap();
+            assert_eq!(coord(value) + coord(other), coord(value + other));
+            assert_eq!(coord(value) - coord(other), coord(value - other));
+            assert_eq!(coord(value) < coord(other), value < other);
+            assert_eq!(coord(value).shr(levels), coord(value >> levels.min(127)));
+            if levels <= 20 {
+                assert_eq!(coord(value).shl(levels), coord(value << levels));
+            }
+            if levels <= 126 {
+                let modulo = value.rem_euclid(1 << levels) as u128;
+                assert_eq!(coord(value).low_bits(levels), modulo);
+            }
+            assert_eq!(coord(value).to_i64(), i64::try_from(value).ok());
+            assert_eq!(coord(value).to_f64(), value as f64);
+        }
+        let far = Coord::of_f64(f64::from(f32::MAX));
+        assert_eq!(far.shl(62).shr(62), far);
+        assert_eq!(far.shl(63), Coord::BEYOND);
+        assert_eq!((-far).shl(63), -Coord::BEYOND);
+        assert_eq!(far.shr(200), Coord::ZERO);
+        assert_eq!((-far).shr(200), Coord::from(-1));
+        assert_eq!(Coord::of_f64(f64::MAX), Coord::BEYOND);
+        assert_eq!(Coord::of_f64(-1.0e60), -Coord::BEYOND);
     }
 
     #[test]

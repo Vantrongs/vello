@@ -21,7 +21,7 @@
 use super::FilterEffect;
 use crate::filter::context::ScratchBuffer;
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::Bounds;
+use crate::filter::placed::{Bounds, Coord, Position};
 use alloc::vec::Vec;
 use vello_common::filter::gaussian_blur::{DecimationSizer, GaussianBlur};
 use vello_common::filter_effects::EdgeMode;
@@ -122,13 +122,14 @@ pub(crate) fn upscale_reduced_blur(
     blurred: &FilterPixmap,
     edge_mode: EdgeMode,
     levels: u32,
-    origin: (i64, i64),
+    origin: Position,
     crop: Bounds,
 ) -> FilterPixmap {
     // The runs each level upscales into, from the output to the level below the pixmap.
     let mut runs = Vec::with_capacity(levels as usize);
-    let mut x = Run::new(crop.x0, crop.width(), origin.0, levels);
-    let mut y = Run::new(crop.y0, crop.height(), origin.1, levels);
+    let (width, height) = crop.size();
+    let mut x = Run::new(crop.x0, width, origin.0, levels);
+    let mut y = Run::new(crop.y0, height, origin.1, levels);
     for _ in 0..levels {
         runs.push((x, y));
         x = x.source();
@@ -159,13 +160,12 @@ struct Run {
 impl Run {
     /// Return the run of `len` pixels from `start` in a grid `shift` levels
     /// finer than a pixmap that starts at `origin` in its own grid.
-    fn new(start: i64, len: i64, origin: i64, shift: u32) -> Self {
-        let step = 1_i128 << shift;
+    fn new(start: Coord, len: u32, origin: Coord, shift: u32) -> Self {
         Self {
-            coarse: (i128::from(start).div_euclid(step) - i128::from(origin)) as i64,
-            sub: i128::from(start).rem_euclid(step) as u128,
+            coarse: (start.shr(shift) - origin).clamped_i64(),
+            sub: start.low_bits(shift),
             shift,
-            len: u32::try_from(len).unwrap(),
+            len,
         }
     }
 
@@ -1589,9 +1589,12 @@ mod tests {
 
     fn crop_of(pixmap: &FilterPixmap, crop: Bounds) -> Vec<PremulRgba8> {
         let mut pixels = Vec::new();
-        for y in crop.y0..crop.y1 {
-            for x in crop.x0..crop.x1 {
-                pixels.push(pixmap.sample(x as u32, y as u32));
+        let (x0, y0) = (crop.x0.to_i64().unwrap(), crop.y0.to_i64().unwrap());
+        let (width, height) = crop.size();
+        for y in 0..height {
+            for x in 0..width {
+                let at = |start: i64, offset: u32| u32::try_from(start).unwrap() + offset;
+                pixels.push(pixmap.sample(at(x0, x), at(y0, y)));
             }
         }
         pixels
@@ -1627,7 +1630,13 @@ mod tests {
             &kernel[..usize::from(count)],
             edge_mode,
         );
-        upscale_reduced_blur(&reduced, edge_mode, levels, (0, 0), crop)
+        upscale_reduced_blur(
+            &reduced,
+            edge_mode,
+            levels,
+            (Coord::ZERO, Coord::ZERO),
+            crop,
+        )
     }
 
     #[test]
@@ -1664,10 +1673,7 @@ mod tests {
                     for crop in crops {
                         let reduced = top_left(&decimated, w, h);
                         let result = blur_reduced(reduced, std_deviation, edge_mode, levels, crop);
-                        assert_eq!(
-                            (i64::from(result.width()), i64::from(result.height())),
-                            (crop.width(), crop.height())
-                        );
+                        assert_eq!((result.width(), result.height()), crop.size());
                         assert!(
                             result.data() == crop_of(&whole, crop),
                             "{edge_mode:?} sigma {std_deviation} levels {levels} {crop:?}"

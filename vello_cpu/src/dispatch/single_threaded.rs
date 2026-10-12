@@ -8,7 +8,7 @@ use crate::dispatch::Dispatcher;
 use crate::dispatch::filter_graph::{Clip, FilterGraph, Layer, Recording, content_filter};
 use crate::filter::context::FilterContext;
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::{Bounds, Pieces, PlacedPixmap};
+use crate::filter::placed::{Bounds, Coord, Pieces, PlacedPixmap, Position};
 use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_region};
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
@@ -49,7 +49,7 @@ pub(crate) struct SingleThreadedDispatcher {
     /// Where the target starts in the pixel grid it belongs to: the root target
     /// for the root dispatcher, the grid of its window for a window. Masks and
     /// the outputs of nested filters are placed in that grid.
-    grid_origin: (i64, i64),
+    grid_origin: Position,
     /// SIMD level for fearless SIMD dispatch.
     level: Level,
 }
@@ -80,7 +80,7 @@ impl SingleThreadedDispatcher {
             recorder: CommandRecorder::new(width, height),
             strip_storage: StripStorage::new(GenerationMode::Append),
             filter_sources: Vec::new(),
-            grid_origin: (0, 0),
+            grid_origin: (Coord::ZERO, Coord::ZERO),
             level,
         }
     }
@@ -93,7 +93,7 @@ impl SingleThreadedDispatcher {
         width: u16,
         height: u16,
         level: Level,
-        origin: (i64, i64),
+        origin: Position,
         draw: impl FnOnce(&mut Self),
     ) -> Self {
         let mut window = Self {
@@ -271,7 +271,10 @@ impl SingleThreadedDispatcher {
             &filters,
             target,
             params,
-            self.grid_origin,
+            (
+                self.grid_origin.0.clamped_i64(),
+                self.grid_origin.1.clamped_i64(),
+            ),
             target_init,
             self.recorder.root_is_blend_target,
             encoded_paints,
@@ -457,9 +460,11 @@ impl SingleThreadedDispatcher {
             scene_size: (width, height),
             target_offset: (0, 0),
         };
+        // Masks cover the root target, so clamping keeps every far pixel outside them.
+        let offset = |value: u16, origin: Coord| (origin + i64::from(value).into()).clamped_i64();
         let mask_offset = (
-            i64::from(area.x0) + self.grid_origin.0,
-            i64::from(area.y0) + self.grid_origin.1,
+            offset(area.x0, self.grid_origin.0),
+            offset(area.y0, self.grid_origin.1),
         );
 
         self.bucket_and_rasterize::<S, F>(

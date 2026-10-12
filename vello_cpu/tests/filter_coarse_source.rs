@@ -352,7 +352,14 @@ fn wide_blurs_match_a_blur_of_an_exact_decimation() {
         edge_mode: EdgeMode::None,
     };
     // The grid each blur reads its source in is `2^levels` pixels wide.
-    for (std_deviation, levels) in [(100_u16, 1), (300, 3)] {
+    // Unoptimized builds take minutes for the wider blur, whose source is
+    // nine times as large, so only optimized builds check it.
+    let deviations: &[(u16, u32)] = if cfg!(debug_assertions) {
+        &[(100, 1)]
+    } else {
+        &[(100, 1), (300, 3)]
+    };
+    for &(std_deviation, levels) in deviations {
         // The source covers all the blur reads, and with what the filters
         // nested in it add, stays inside the extent.
         let radius = 3.0 * f64::from(std_deviation) + 100.0;

@@ -452,6 +452,23 @@ fn opposite_shifts_past_any_coordinate_domain_cancel() {
                         vec![shadow(4.0, std_deviation, false)],
                     ),
                 ];
+                // The outer shadow reads the inner one's shadow, not its source.
+                let shadow_of_shadow = (
+                    vec![
+                        shadow(far, std_deviation, false),
+                        shadow(-far, std_deviation, true),
+                    ],
+                    vec![
+                        shadow(0.0, std_deviation, false),
+                        shadow(0.0, std_deviation, false),
+                    ],
+                );
+                // The outer blur reads the inner one's output at full
+                // resolution throughout its reach, which takes work growing
+                // with the square of both deviations.
+                let cases = cases
+                    .into_iter()
+                    .chain((f64::from(std_deviation) * scale <= 8.0).then_some(shadow_of_shadow));
                 for (filters, reference) in cases {
                     let expected = nested_in(&reference, scale);
                     assert!(
@@ -464,6 +481,60 @@ fn opposite_shifts_past_any_coordinate_domain_cancel() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// Render, in a 64 by 64 view under an offset by `-far`, a red shadow of a
+/// square and a smaller green square, each moved `far` by a nested filter and
+/// composited with each other there, with a square `drawn` in the view itself.
+fn far_copies(far: f32, std_deviation: f32, drawn: bool) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+        dx: -far,
+        dy: far,
+    }));
+    if drawn {
+        context.set_paint(BLUE);
+        context.fill_rect(&Rect::new(0.0, 0.0, 64.0, 64.0));
+    }
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::DropShadowOnly {
+        dx: far,
+        dy: -far,
+        std_deviation,
+        color: AlphaColor::from_rgba8(255, 0, 0, 255),
+        edge_mode: EdgeMode::None,
+    }));
+    context.set_paint(BLUE);
+    context.fill_rect(&Rect::new(16.0, 16.0, 48.0, 48.0));
+    context.pop_layer();
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+        dx: far,
+        dy: -far,
+    }));
+    context.set_paint(AlphaColor::from_rgba8(0, 255, 0, 255));
+    context.fill_rect(&Rect::new(24.0, 24.0, 40.0, 40.0));
+    context.pop_layer();
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn far_copies_composite_with_each_other_before_moving_back() {
+    for std_deviation in [0.0, 2.0] {
+        let expected = far_copies(0.0, std_deviation, false);
+        assert!(
+            expected
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[1] == 255)
+        );
+        for far in [3.2e9, 1.0e19, f32::MAX] {
+            assert!(
+                far_copies(far, std_deviation, true) == expected,
+                "{far}, {std_deviation}"
+            );
         }
     }
 }

@@ -17,7 +17,7 @@ pub(crate) mod placed;
 pub(crate) mod plan;
 
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::Bounds;
+use crate::filter::placed::{Bounds, Position};
 use context::ScratchBuffer;
 use vello_common::filter::PreparedFilter;
 
@@ -155,7 +155,7 @@ pub(crate) fn upscale_reduced(
     filter: &PreparedFilter,
     blurred: &FilterPixmap,
     levels: u32,
-    origin: (i64, i64),
+    origin: Position,
     crop: Bounds,
 ) -> FilterPixmap {
     match filter {
