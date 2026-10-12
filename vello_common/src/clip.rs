@@ -167,6 +167,24 @@ enum RawClip {
     Rect(Rect),
 }
 
+/// An active clip as it was pushed, in root target coordinates.
+#[derive(Debug, Clone, Copy)]
+pub enum PushedClip<'a> {
+    /// A clip path.
+    Path {
+        /// The path elements.
+        elements: &'a [PathEl],
+        /// The fill rule.
+        fill_rule: Fill,
+        /// The transform from path to root target coordinates.
+        transform: Affine,
+        /// The aliasing threshold.
+        aliasing_threshold: Option<u8>,
+    },
+    /// A clip rectangle.
+    Rect(Rect),
+}
+
 /// A frame containing clipping-relevant state for the root layer or a filter layer.
 #[derive(Debug)]
 struct ClipFrame {
@@ -232,6 +250,24 @@ impl ClipState {
     /// Return the current clip path and its known shape.
     pub fn get(&self) -> Option<ClipRef<'_>> {
         self.context.get()
+    }
+
+    /// Return the active clips from the oldest to the most recent.
+    pub fn clips(&self) -> impl Iterator<Item = PushedClip<'_>> {
+        self.raw_clips.iter().map(|raw_clip| match raw_clip {
+            RawClip::Path {
+                elements,
+                fill_rule,
+                transform,
+                aliasing_threshold,
+            } => PushedClip::Path {
+                elements: &self.path_elements[elements.clone()],
+                fill_rule: *fill_rule,
+                transform: *transform,
+                aliasing_threshold: *aliasing_threshold,
+            },
+            RawClip::Rect(rect) => PushedClip::Rect(*rect),
+        })
     }
 
     /// Push a new root viewport.

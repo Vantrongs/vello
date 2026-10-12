@@ -500,7 +500,9 @@ impl RenderContext {
     /// # Panics
     ///
     /// Panics if `filter` is provided when this context uses multi-threaded rendering.
-    /// Also panics if the filter's required source viewport exceeds `u16` dimensions.
+    /// Also panics, without changing the context, if the filter is invalid (see
+    /// [`FilterData::new`]) or if the source its visible output depends on leaves
+    /// the `u32` coordinate domain.
     pub fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,

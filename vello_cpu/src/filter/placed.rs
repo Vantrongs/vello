@@ -168,6 +168,14 @@ impl PlacedPixmap {
         }
     }
 
+    /// Return a copy of the pixels inside `area`, transparent where this pixmap
+    /// does not cover it.
+    pub(crate) fn crop(&self, area: Bounds) -> Self {
+        let mut crop = Self::new(area);
+        crop.copy_from(self, area);
+        crop
+    }
+
     /// Copy the pixels of `source` inside `area`.
     pub(crate) fn copy_from(&mut self, source: &Self, area: Bounds) {
         self.combine(source, area, |target, source| {

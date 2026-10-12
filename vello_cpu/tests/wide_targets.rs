@@ -319,7 +319,9 @@ fn filtered_tail(length: u16, transpose: bool, render_mode: RenderMode, radius: 
 fn filtered_frame_edge_matches_small_translated_reference() {
     for render_mode in modes() {
         // Radius 1.5 needs eight source pixels on each side after tile alignment.
-        for length in [65_516, 65_517, 65_518, 65_519] {
+        for length in [
+            65_516, 65_517, 65_518, 65_519, 65_520, 65_528, 65_532, 65_535,
+        ] {
             for transpose in [false, true] {
                 // A whole-tile translation preserves the filter's sampling phase.
                 let short = 16 + length % 4;
@@ -364,57 +366,6 @@ fn filter_without_padding_reaches_last_frame_pixel() {
                 check_pixels(&image, &label, |x, y| {
                     if (if transpose { y } else { x }) >= usize::from(length - 3) {
                         RED_PIXEL
-                    } else {
-                        CLEAR
-                    }
-                });
-            }
-        }
-    }
-}
-
-#[test]
-fn filter_rejects_unrepresentable_source_before_mutating_context() {
-    for render_mode in modes() {
-        for length in [65_520, 65_528, 65_531, 65_532, 65_533, 65_534, 65_535] {
-            for transpose in [false, true] {
-                let (width, height) = if transpose { (4, length) } else { (length, 4) };
-                let mut ctx = context(width, height, 0, Level::baseline());
-                // Retain an existing layer across rejection, then draw through it.
-                ctx.push_opacity_layer(0.5);
-                let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    ctx.push_filter_layer(Filter::from_function(FilterFunction::Blur {
-                        radius: 1.5,
-                    }));
-                }))
-                .expect_err("oversized filter source must be rejected");
-                let message = error
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| error.downcast_ref::<&str>().copied());
-                assert_eq!(
-                    message,
-                    Some("filter source viewport exceeds u16 coordinate domain")
-                );
-                ctx.set_paint(RED);
-                ctx.fill_rect(&rect(length - 3, length, 4, transpose));
-                ctx.pop_layer();
-                ctx.flush();
-                let mut image = Pixmap::new(width, height);
-                ctx.render_with(
-                    &mut image,
-                    &mut Resources::new(),
-                    RasterizerSettings {
-                        render_mode,
-                        ..Default::default()
-                    },
-                );
-                let label = format!(
-                    "after rejected filter length={length} transpose={transpose} {render_mode:?}"
-                );
-                check_pixels(&image, &label, |x, y| {
-                    if (if transpose { y } else { x }) >= usize::from(length - 3) {
-                        [128, 0, 0, 128]
                     } else {
                         CLEAR
                     }

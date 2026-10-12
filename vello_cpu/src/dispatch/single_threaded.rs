@@ -5,6 +5,9 @@ use crate::RasterizerSettings;
 use crate::coarse::CommandBucketer;
 use crate::coarse::depth::DepthBuffer;
 use crate::dispatch::Dispatcher;
+use crate::dispatch::windowed_filter::{
+    Clip, Command, Layer, Recording, WindowedFilter, content_filter,
+};
 use crate::filter::context::FilterContext;
 use crate::filter::displaced::DisplacedPlan;
 use crate::filter::pixmap::FilterPixmap;
@@ -14,6 +17,7 @@ use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
 use crate::record::RecordedFill;
 use crate::region::Regions;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use vello_common::TargetInit;
@@ -32,19 +36,6 @@ use vello_common::strip_generator::{GenerationMode, StripStorage};
 use vello_common::util::strip_bbox;
 use vello_common::viewport::ViewportState;
 
-/// How a filter layer is rendered from its commands, which are drawn in a source
-/// viewport translated by `source_shift` from root target coordinates.
-#[derive(Debug)]
-enum FilterSource {
-    /// Into one pixmap around its content, which is filtered as a whole.
-    Drawn { source_shift: (i64, i64) },
-    /// From the parts its visible output reads, see [`DisplacedPlan`].
-    Displaced {
-        source_shift: (i64, i64),
-        plan: DisplacedPlan,
-    },
-}
-
 /// Single-threaded implementation of the rendering dispatcher.
 #[derive(Debug)]
 pub(crate) struct SingleThreadedDispatcher {
@@ -58,10 +49,39 @@ pub(crate) struct SingleThreadedDispatcher {
     strip_storage: StripStorage,
     /// How each filter layer is rendered, in the order of `recorder.filter_layers`.
     filter_sources: Vec<FilterSource>,
-    /// Indices into `filter_sources` of the open filter layers, innermost last.
+    /// Indices into `filter_sources` of the open filter layers drawn in this
+    /// dispatcher, innermost last.
     open_filters: Vec<usize>,
+    /// The filter layer whose source does not fit the `u16` domain and whose
+    /// commands are therefore recorded instead of drawn.
+    recording: Option<Box<Recording>>,
+    /// Translation from root target pixels to the pixels masks are sampled in.
+    mask_origin: (i64, i64),
     /// SIMD level for fearless SIMD dispatch.
     level: Level,
+}
+
+/// How a filter layer is rendered.
+///
+/// `Drawn` and `Displaced` layers are rendered from their own commands, drawn
+/// in a source viewport translated by `source_shift` from root target coordinates.
+#[derive(Debug)]
+enum FilterSource {
+    /// Into one pixmap around its content, which is filtered as a whole.
+    Drawn { source_shift: (i64, i64) },
+    /// From the parts its visible output reads, see [`DisplacedPlan`].
+    Displaced {
+        source_shift: (i64, i64),
+        plan: DisplacedPlan,
+    },
+    /// In windows, see [`WindowedFilter`].
+    Windowed(Box<WindowedFilter>),
+    /// By the enclosing windowed filter, as its nested output `output`; the
+    /// root target of this dispatcher starts at `origin` in the output's space.
+    Injected { output: usize, origin: (i64, i64) },
+    /// Not filtered: the layer holds the content of a window and is returned
+    /// by [`SingleThreadedDispatcher::render_window`].
+    WindowContent,
 }
 
 impl SingleThreadedDispatcher {
@@ -79,8 +99,117 @@ impl SingleThreadedDispatcher {
             strip_storage: StripStorage::new(GenerationMode::Append),
             filter_sources: Vec::new(),
             open_filters: Vec::new(),
+            recording: None,
+            mask_origin: (0, 0),
             level,
         }
+    }
+
+    /// Create a dispatcher for a window of a windowed filter's source space
+    /// and let `draw` replay the window's commands into it.
+    ///
+    /// Masks are sampled at window pixels moved by `mask_origin`. Everything
+    /// drawn goes into one filter layer that holds the window content.
+    pub(crate) fn window(
+        width: u16,
+        height: u16,
+        level: Level,
+        mask_origin: (i64, i64),
+        draw: impl FnOnce(&mut Self),
+    ) -> Self {
+        let mut window = Self {
+            mask_origin,
+            ..Self::new(width, height, level)
+        };
+        let content = content_filter();
+        window.push_source_viewport(&content, |_| FilterSource::WindowContent);
+        window.recorder.push_layer(
+            LayerProps {
+                blend_mode: BlendMode::default(),
+                opacity: 1.0,
+                mask: None,
+                clip_path: None,
+            },
+            Some(content),
+        );
+        draw(&mut window);
+        window.pop_layer();
+        window
+    }
+
+    /// Return the bounds of the window content in the source space, where the window starts at `origin`.
+    pub(crate) fn window_content(&self, origin: (i64, i64)) -> Bounds {
+        Bounds::of_rect(self.window_content_placement().pixmap_bbox(), origin)
+    }
+
+    fn window_content_placement(&self) -> FilterLayerPlacement {
+        let RecordedLayerKind::Filter { placement, .. } =
+            &self.recorder.layers[self.recorder.filter_layers[0] as usize].kind
+        else {
+            unreachable!("a window starts with its content layer");
+        };
+        *placement
+    }
+
+    /// Render the window content, or return `None` if it is empty. The bounds
+    /// of the returned pixmap are relative to the window.
+    pub(crate) fn render_window<S: Simd, F: FineKernel<S>>(
+        &self,
+        simd: S,
+        encoded_paints: &[EncodedPaint],
+        image_resolver: &dyn ImageResolver,
+        nested: &[PlacedPixmap],
+    ) -> Option<(FilterPixmap, RectU16)> {
+        let bbox = self.window_content_placement().pixmap_bbox();
+        if bbox.is_empty() {
+            return None;
+        }
+        let filters =
+            self.rasterize_filter_layers::<S, F>(simd, encoded_paints, image_resolver, nested);
+        let pixmap = self.rasterize_layer::<S, F>(
+            simd,
+            self.recorder.filter_layers[0],
+            bbox,
+            (0, 0),
+            &filters,
+            encoded_paints,
+            image_resolver,
+        );
+        Some((pixmap, bbox))
+    }
+
+    /// Push and pop a nested filter layer whose output is rendered by the
+    /// enclosing windowed filter and composited at `dest`.
+    pub(crate) fn push_rendered_filter_layer(
+        &mut self,
+        layer: &Layer,
+        to_window: Affine,
+        filter: FilterData,
+        dest: RectU16,
+        output: usize,
+        origin: (i64, i64),
+    ) {
+        let clip_path = layer.clip_path.as_ref().map(|path| {
+            self.layer_clip(
+                path,
+                layer.fill_rule,
+                to_window * layer.clip_transform,
+                layer.aliasing_threshold,
+            )
+        });
+        self.recorder.push_layer(
+            LayerProps {
+                blend_mode: layer.blend_mode,
+                opacity: layer.opacity,
+                mask: layer.mask.clone(),
+                clip_path,
+            },
+            Some(filter),
+        );
+        self.recorder
+            .pop_rendered_filter_layer(FilterLayerPlacement::rendered_at(dest));
+        self.filter_sources
+            .push(FilterSource::Injected { output, origin });
     }
 
     /// Rasterizes the scene using f32 precision (high quality).
@@ -133,7 +262,8 @@ impl SingleThreadedDispatcher {
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
     ) {
-        let filters = self.rasterize_filter_layers::<S, F>(simd, encoded_paints, image_resolver);
+        let filters =
+            self.rasterize_filter_layers::<S, F>(simd, encoded_paints, image_resolver, &[]);
         let target_init = settings.target_init.map(PremulColor::from_alpha_color);
         let params = FineRenderParams {
             scene_size: (scene_width, scene_height),
@@ -147,7 +277,7 @@ impl SingleThreadedDispatcher {
             &filters,
             target,
             params,
-            (0, 0),
+            self.mask_origin,
             target_init,
             self.recorder.root_is_blend_target,
             encoded_paints,
@@ -276,11 +406,14 @@ impl SingleThreadedDispatcher {
             })
     }
 
+    /// Render and filter every filter layer. `nested` holds the outputs that an
+    /// enclosing windowed filter rendered for the layers injected into a window.
     fn rasterize_filter_layers<S: Simd, F: FineKernel<S>>(
         &self,
         simd: S,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
+        nested: &[PlacedPixmap],
     ) -> FilterContext {
         // TODO: Reuse across frames so that pixmaps can be reused.
         let mut filter_ctx = FilterContext::new(self.recorder.layers.len());
@@ -306,6 +439,7 @@ impl SingleThreadedDispatcher {
                 continue;
             }
             let filter = PreparedFilter::new(&filter_data.filter, &filter_data.transform);
+            let dest = Bounds::of_rect(placement.dest_bbox(), (0, 0));
 
             let pixmap = match source {
                 FilterSource::Drawn { source_shift } => {
@@ -336,6 +470,16 @@ impl SingleThreadedDispatcher {
                     })
                     .pixmap
                 }
+                FilterSource::Windowed(filter) => {
+                    filter
+                        .render::<S, F>(simd, encoded_paints, image_resolver)
+                        .crop(dest)
+                        .pixmap
+                }
+                FilterSource::Injected { output, origin } => {
+                    nested[*output].crop(dest.translate(*origin)).pixmap
+                }
+                FilterSource::WindowContent => continue,
             };
 
             // Save the filtered pixmap to disk for debugging.
@@ -369,8 +513,8 @@ impl SingleThreadedDispatcher {
             target_offset: (0, 0),
         };
         let mask_offset = (
-            i64::from(area.x0) - source_shift.0,
-            i64::from(area.y0) - source_shift.1,
+            i64::from(area.x0) - source_shift.0 + self.mask_origin.0,
+            i64::from(area.y0) - source_shift.1 + self.mask_origin.1,
         );
 
         self.bucket_and_rasterize::<S, F>(
@@ -432,6 +576,41 @@ impl SingleThreadedDispatcher {
         let dest = plan.output().to_rect_u16((view.x0, view.y0));
         Some((plan, FilterLayerPlacement::rendered_at(dest)))
     }
+
+    /// Push the source viewport of a filter layer drawn in this dispatcher.
+    /// `source` receives the translation from root target coordinates to it.
+    fn push_source_viewport(
+        &mut self,
+        filter: &FilterData,
+        source: impl FnOnce((i64, i64)) -> FilterSource,
+    ) {
+        self.viewport.push_root_viewport(filter);
+        self.open_filters.push(self.filter_sources.len());
+        self.filter_sources
+            .push(source(self.viewport.source_shift()));
+    }
+
+    /// Start recording a filter layer whose source does not fit the `u16` domain.
+    fn start_recording(&self, filter: &FilterData) -> Recording {
+        Recording::new(
+            filter.clone(),
+            Bounds::of_viewport(self.viewport.width(), self.viewport.height()),
+            self.viewport.source_shift(),
+            self.viewport.clips().map(Clip::from_pushed).collect(),
+        )
+    }
+
+    /// Replay a finished recording into windows and composite the visible part of its output.
+    fn finish_recording(&mut self, recording: Recording) {
+        let filter = recording.finish(self.level);
+        let view = Bounds::of_viewport(self.viewport.width(), self.viewport.height());
+        self.recorder
+            .pop_rendered_filter_layer(FilterLayerPlacement::rendered_at(
+                filter.placement_in(view),
+            ));
+        self.filter_sources
+            .push(FilterSource::Windowed(Box::new(filter)));
+    }
 }
 
 impl Dispatcher for SingleThreadedDispatcher {
@@ -449,6 +628,18 @@ impl Dispatcher for SingleThreadedDispatcher {
         aliasing_threshold: Option<u8>,
         mask: Option<Mask>,
     ) {
+        if let Some(recording) = &mut self.recording {
+            recording.record(Command::FillPath {
+                path: path.clone(),
+                fill_rule,
+                transform,
+                paint,
+                blend_mode,
+                aliasing_threshold,
+                mask,
+            });
+            return;
+        }
         let strip_start = self.strip_storage.strips.len();
         let strip_storage = &mut self.strip_storage;
         self.viewport
@@ -475,6 +666,18 @@ impl Dispatcher for SingleThreadedDispatcher {
         aliasing_threshold: Option<u8>,
         mask: Option<Mask>,
     ) {
+        if let Some(recording) = &mut self.recording {
+            recording.record(Command::StrokePath {
+                path: path.clone(),
+                stroke: stroke.clone(),
+                transform,
+                paint,
+                blend_mode,
+                aliasing_threshold,
+                mask,
+            });
+            return;
+        }
         let strip_start = self.strip_storage.strips.len();
         let strip_storage = &mut self.strip_storage;
         self.viewport
@@ -498,6 +701,15 @@ impl Dispatcher for SingleThreadedDispatcher {
         blend_mode: BlendMode,
         mask: Option<Mask>,
     ) {
+        if let Some(recording) = &mut self.recording {
+            recording.record(Command::FillRect {
+                rect: *rect,
+                paint,
+                blend_mode,
+                mask,
+            });
+            return;
+        }
         let strip_start = self.strip_storage.strips.len();
         let strip_storage = &mut self.strip_storage;
         self.viewport
@@ -518,17 +730,41 @@ impl Dispatcher for SingleThreadedDispatcher {
         mask: Option<Mask>,
         filter_data: Option<FilterData>,
     ) {
+        if let Some(recording) = &mut self.recording {
+            recording.push_layer(Layer {
+                clip_path: clip_path.cloned(),
+                fill_rule,
+                clip_transform,
+                blend_mode,
+                opacity,
+                aliasing_threshold,
+                mask,
+                filter: filter_data,
+            });
+            return;
+        }
+
+        let fits = |filter: &FilterData| {
+            filter
+                .source_viewport_size(self.viewport.width(), self.viewport.height())
+                .is_some()
+        };
+        let recording = filter_data
+            .as_ref()
+            .filter(|filter| !fits(filter))
+            .map(|filter| self.start_recording(filter));
         // The clip applies where the filtered layer is composited, in the parent viewport.
         let clip_path = clip_path.map(|clip_path| {
             self.layer_clip(clip_path, fill_rule, clip_transform, aliasing_threshold)
         });
-        if let Some(filter_data) = &filter_data {
-            self.viewport.push_root_viewport(filter_data);
-            self.open_filters.push(self.filter_sources.len());
-            self.filter_sources.push(FilterSource::Drawn {
-                source_shift: self.viewport.source_shift(),
+        if let Some(filter_data) = &filter_data
+            && recording.is_none()
+        {
+            self.push_source_viewport(filter_data, |source_shift| FilterSource::Drawn {
+                source_shift,
             });
         }
+        self.recording = recording.map(Box::new);
 
         self.recorder.push_layer(
             LayerProps {
@@ -542,6 +778,14 @@ impl Dispatcher for SingleThreadedDispatcher {
     }
 
     fn pop_layer(&mut self) {
+        if let Some(recording) = &mut self.recording {
+            if recording.pop_layer() {
+                return;
+            }
+            let recording = self.recording.take().unwrap();
+            self.finish_recording(*recording);
+            return;
+        }
         let source_viewport = Bounds::of_viewport(self.viewport.width(), self.viewport.height());
         let mut displaced = None;
         let popped = self.recorder.pop_layer_placed(|bbox, filter| {
@@ -559,7 +803,7 @@ impl Dispatcher for SingleThreadedDispatcher {
         let index = self.open_filters.pop().unwrap();
         if let Some(plan) = displaced {
             let FilterSource::Drawn { source_shift } = self.filter_sources[index] else {
-                unreachable!("an open filter layer is drawn until it is popped");
+                unreachable!("only drawn filter layers can be displaced");
             };
             self.filter_sources[index] = FilterSource::Displaced { source_shift, plan };
         }
@@ -572,6 +816,7 @@ impl Dispatcher for SingleThreadedDispatcher {
         self.strip_storage.clear();
         self.filter_sources.clear();
         self.open_filters.clear();
+        self.recording = None;
         self.viewport.reset(width, height);
     }
 
@@ -663,15 +908,31 @@ impl Dispatcher for SingleThreadedDispatcher {
         transform: Affine,
         aliasing_threshold: Option<u8>,
     ) {
+        // Clips outlive the layers they are pushed in, so a recorded clip also
+        // applies in the parent.
+        if let Some(recording) = &mut self.recording {
+            recording.record(Command::PushClip(Clip::Path {
+                path: path.clone(),
+                fill_rule,
+                transform,
+                aliasing_threshold,
+            }));
+        }
         self.viewport
             .push_clip_path(path, fill_rule, transform, aliasing_threshold);
     }
 
     fn push_clip_rect(&mut self, rect: &Rect) {
+        if let Some(recording) = &mut self.recording {
+            recording.record(Command::PushClip(Clip::Rect(*rect)));
+        }
         self.viewport.push_clip_rect(rect);
     }
 
     fn pop_clip(&mut self) {
+        if let Some(recording) = &mut self.recording {
+            recording.record(Command::PopClip);
+        }
         self.viewport.pop_clip();
     }
 

@@ -309,6 +309,17 @@ impl<D> CommandRecorder<D> {
         self.pop_layer_placed(FilterLayerPlacement::new)
     }
 
+    /// Pop the currently active layer, a filter layer whose filtered pixmap is
+    /// rendered elsewhere and composited at `placement`.
+    pub fn pop_rendered_filter_layer(&mut self, placement: FilterLayerPlacement) {
+        let popped = self.pop_layer_placed(|_, _| placement);
+        debug_assert_eq!(
+            popped,
+            PoppedLayer::Filter,
+            "only filter layers can be rendered elsewhere"
+        );
+    }
+
     /// Pop the currently active layer. If it is a filter layer, `place` decides
     /// where it is composited, given its tight content bounds and its filter.
     pub fn pop_layer_placed(

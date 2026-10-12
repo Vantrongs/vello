@@ -19,8 +19,8 @@ const NEAR_SOURCE: Vec2 = Vec2::new(-8.0, 24.0);
 const COPY_SPOT: Vec2 = Vec2::new(56.0, 4.0);
 /// Offsets, all multiples of a tile, so that the source keeps its position
 /// within tiles and the blur its decimation phase. The first moves both copies
-/// out of view.
-const OFFSETS: [i64; 3] = [96, 4_096, 60_000];
+/// out of view; the later ones exceed the `u16` domain.
+const OFFSETS: [i64; 5] = [96, 4_096, 60_000, 262_144, 16_777_216];
 
 fn modes() -> impl Iterator<Item = RenderMode> {
     [

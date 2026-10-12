@@ -3,7 +3,7 @@
 
 //! Shared viewport state.
 
-use crate::clip::{ClipRef, ClipState};
+use crate::clip::{ClipRef, ClipState, PushedClip};
 use crate::filter::FilterData;
 use crate::kurbo::{Affine, BezPath, Rect};
 use crate::strip_generator::StripGenerator;
@@ -45,6 +45,12 @@ impl ViewportState {
     /// Return the current clip path and its known shape.
     pub fn clip(&self) -> Option<ClipRef<'_>> {
         self.clip_state.get()
+    }
+
+    /// Return the active clips from the oldest to the most recent, in root
+    /// target coordinates.
+    pub fn clips(&self) -> impl Iterator<Item = PushedClip<'_>> {
+        self.clip_state.clips()
     }
 
     /// Whether any root viewports are currently pushed.
