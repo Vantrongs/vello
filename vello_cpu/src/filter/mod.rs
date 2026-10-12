@@ -11,14 +11,15 @@
 pub(crate) mod context;
 mod drop_shadow;
 mod flood;
-mod gaussian_blur;
+pub(crate) mod gaussian_blur;
 pub(crate) mod pixmap;
 pub(crate) mod placed;
 pub(crate) mod plan;
+pub(crate) mod pyramid;
 
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::{Bounds, Position};
 use context::ScratchBuffer;
+use vello_common::color::{AlphaColor, Srgb};
 use vello_common::filter::PreparedFilter;
 
 /// Trait for filter effects that can be applied to layers.
@@ -70,7 +71,7 @@ pub(crate) fn filter_lowp(
             blur.execute_lowp(pixmap, filter_scratch);
         }
         // An offset only moves pixels, which happens when the layer's output
-        // is assembled, see `plan`.
+        // is computed, see `FilterGraph`.
         PreparedFilter::Offset(_) => {}
         PreparedFilter::DropShadow(drop_shadow) => {
             drop_shadow.execute_lowp(pixmap, filter_scratch);
@@ -104,7 +105,7 @@ pub(crate) fn filter_highp(
             blur.execute_highp(pixmap, filter_scratch);
         }
         // An offset only moves pixels, which happens when the layer's output
-        // is assembled, see `plan`.
+        // is computed, see `FilterGraph`.
         PreparedFilter::Offset(_) => {}
         PreparedFilter::DropShadow(drop_shadow) => {
             drop_shadow.execute_highp(pixmap, filter_scratch);
@@ -112,69 +113,15 @@ pub(crate) fn filter_highp(
     }
 }
 
-/// Run a blur or drop shadow on `pixmap`, which holds its source after the
-/// first `levels` decimations, see [`upscale_reduced`].
-///
-/// Both kernels apply blurs and drop shadows at low precision, so this serves both.
-pub(crate) fn blur_reduced(
-    filter: &PreparedFilter,
-    pixmap: &mut FilterPixmap,
-    levels: u32,
-    filter_scratch: &mut ScratchBuffer,
+/// Recolor `shadow`, the blurred source of a drop shadow, with `color`, and
+/// composite `source` over it if the shadow keeps its source.
+pub(crate) fn colorize_shadow(
+    shadow: &mut FilterPixmap,
+    color: AlphaColor<Srgb>,
+    source: Option<&FilterPixmap>,
 ) {
-    let scratch = filter_scratch.get_scratch_buffer(pixmap.width(), pixmap.height());
-    let (n_decimations, kernel, edge_mode) = match filter {
-        PreparedFilter::GaussianBlur(blur) => (
-            blur.n_decimations,
-            &blur.kernel[..usize::from(blur.kernel_size)],
-            blur.edge_mode,
-        ),
-        PreparedFilter::DropShadow(shadow) => (
-            shadow.n_decimations,
-            &shadow.kernel[..usize::from(shadow.kernel_size)],
-            shadow.edge_mode,
-        ),
-        PreparedFilter::Flood(_) | PreparedFilter::Offset(_) => {
-            unreachable!("only blurs read a reduced source")
-        }
-    };
-    gaussian_blur::apply_blur(
-        pixmap,
-        scratch,
-        n_decimations - levels as usize,
-        kernel,
-        edge_mode,
-    );
-}
-
-/// Return the output inside `crop`, in the grid of the output, of a blur or
-/// drop shadow that [`blur_reduced`] ran on `blurred`, whose pixels each cover
-/// `2^levels` pixels of the output on both axes and which starts at `origin`
-/// in its grid.
-pub(crate) fn upscale_reduced(
-    filter: &PreparedFilter,
-    blurred: &FilterPixmap,
-    levels: u32,
-    origin: Position,
-    crop: Bounds,
-) -> FilterPixmap {
-    match filter {
-        PreparedFilter::GaussianBlur(blur) => {
-            gaussian_blur::upscale_reduced_blur(blurred, blur.edge_mode, levels, origin, crop)
-        }
-        PreparedFilter::DropShadow(shadow) => {
-            let mut output = gaussian_blur::upscale_reduced_blur(
-                blurred,
-                shadow.edge_mode,
-                levels,
-                origin,
-                crop,
-            );
-            drop_shadow::colorize(&mut output, shadow.color);
-            output
-        }
-        PreparedFilter::Flood(_) | PreparedFilter::Offset(_) => {
-            unreachable!("only blurs read a reduced source")
-        }
+    drop_shadow::colorize(shadow, color);
+    if let Some(source) = source {
+        drop_shadow::source_over(shadow.data_mut(), source.data());
     }
 }

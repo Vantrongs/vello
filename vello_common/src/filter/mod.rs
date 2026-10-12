@@ -11,7 +11,7 @@ use crate::filter::drop_shadow::{DropShadow, transform_shadow_params};
 use crate::filter::flood::Flood;
 use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
 use crate::filter::offset::Offset;
-use crate::filter_effects::{EdgeMode, Filter, FilterGraph, FilterPrimitive};
+use crate::filter_effects::{Filter, FilterGraph, FilterPrimitive};
 use crate::geometry::{PaddingU16, PaddingU64, RectU16, SizeU16};
 use crate::kurbo::{Affine, Rect};
 use crate::math::snap_up;
@@ -317,58 +317,6 @@ impl FilterData {
     pub fn source_shift(&self) -> (u64, u64) {
         (self.source_padding.left, self.source_padding.top)
     }
-
-    /// Return how the filter moves its source, if it is a single offset or
-    /// drop shadow primitive.
-    pub fn displacement(&self) -> Option<Displacement> {
-        let [primitive] = self.filter.graph.primitives.as_slice() else {
-            return None;
-        };
-        let (dx, dy, std_deviation) = match primitive {
-            FilterPrimitive::Offset { dx, dy } => {
-                let (dx, dy) = transform_offset_params(*dx, *dy, &self.transform);
-                (dx, dy, 0.0)
-            }
-            FilterPrimitive::DropShadow {
-                dx,
-                dy,
-                std_deviation,
-                ..
-            }
-            | FilterPrimitive::DropShadowOnly {
-                dx,
-                dy,
-                std_deviation,
-                ..
-            } => transform_shadow_params(*dx, *dy, *std_deviation, &self.transform),
-            _ => return None,
-        };
-        let blur = FilterPrimitive::GaussianBlur {
-            std_deviation,
-            edge_mode: EdgeMode::None,
-        };
-        Some(Displacement {
-            offset: (round(dx), round(dy)),
-            blur_padding: snapped_padding(blur.filter_expansion()),
-            keeps_source: matches!(primitive, FilterPrimitive::DropShadow { .. }),
-        })
-    }
-}
-
-/// How an offset or drop shadow filter moves its source.
-///
-/// The output is a copy of the source moved by whole device pixels, blurred
-/// and recolored first for a drop shadow, with the source itself composited
-/// over it when `keeps_source` is set.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Displacement {
-    /// The translation of the moved copy in whole device pixels, rounded half
-    /// away from zero.
-    pub offset: (f32, f32),
-    /// How far the blur of the moved copy reads around each pixel; zero for an offset.
-    pub blur_padding: PaddingU64,
-    /// Whether the unmoved source is composited over the moved copy.
-    pub keeps_source: bool,
 }
 
 fn snapped_padding(expansion: Rect) -> PaddingU64 {
@@ -518,16 +466,6 @@ fn validate_offset(dx: f32, dy: f32) {
     );
 }
 
-#[cfg(feature = "std")]
-fn round(value: f32) -> f32 {
-    value.round()
-}
-
-#[cfg(not(feature = "std"))]
-fn round(value: f32) -> f32 {
-    crate::kurbo::common::FloatFuncs::round(value)
-}
-
 /// Transform an offset's dx/dy using the affine transformation's linear part.
 ///
 /// An offset past the range of `f32` saturates at it, which already moves the
@@ -555,6 +493,7 @@ fn transform_offset_params(dx: f32, dy: f32, transform: &Affine) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::color::palette::css::RED;
+    use crate::filter_effects::EdgeMode;
 
     fn offset(dx: f32, dy: f32) -> FilterData {
         FilterData::new(
@@ -599,71 +538,11 @@ mod tests {
     }
 
     #[test]
-    fn offset_displacement_rounds_half_away_from_zero_in_device_space() {
-        for (amount, rounded) in [(-4.5, -5.0), (-0.5, -1.0), (0.5, 1.0), (4.5, 5.0)] {
-            assert_eq!(
-                offset(amount, -amount).displacement(),
-                Some(Displacement {
-                    offset: (rounded, -rounded),
-                    blur_padding: PaddingU64::ZERO,
-                    keeps_source: false,
-                })
-            );
-        }
-        let scaled = FilterData::new(
-            Filter::from_primitive(FilterPrimitive::Offset { dx: 1.5, dy: 0.0 }),
-            Affine::scale(2.0),
-        );
-        assert_eq!(scaled.displacement().unwrap().offset, (3.0, 0.0));
-        assert_eq!(
-            FilterData::new(blur(1.0), Affine::IDENTITY).displacement(),
-            None
-        );
-    }
-
-    #[test]
-    fn shadow_displacement_pads_only_the_applied_blur() {
-        for (primitive, keeps_source) in [
-            (
-                FilterPrimitive::DropShadow {
-                    dx: 1.5,
-                    dy: -70_000.0,
-                    std_deviation: 8.0,
-                    edge_mode: EdgeMode::None,
-                    color: RED,
-                },
-                true,
-            ),
-            (
-                FilterPrimitive::DropShadowOnly {
-                    dx: 1.5,
-                    dy: -70_000.0,
-                    std_deviation: 8.0,
-                    edge_mode: EdgeMode::None,
-                    color: RED,
-                },
-                false,
-            ),
-        ] {
-            let data = FilterData::new(Filter::from_primitive(primitive), Affine::scale(2.0));
-            assert_eq!(
-                data.displacement(),
-                Some(Displacement {
-                    offset: (3.0, -140_000.0),
-                    blur_padding: PaddingU64::new(48, 48, 48, 48),
-                    keeps_source,
-                })
-            );
-        }
-    }
-
-    #[test]
     fn paddings_beyond_u64_saturate() {
         let data = offset(f32::MAX, -f32::MAX);
         assert_eq!(sides(data.source_padding), (u64::MAX, 0, 0, u64::MAX));
         assert_eq!(sides(data.filter_padding), (0, u64::MAX, u64::MAX, 0));
         assert_eq!(data.source_viewport_size(4, 4), None);
-        assert_eq!(data.displacement().unwrap().offset, (f32::MAX, -f32::MAX));
     }
 
     #[test]
@@ -713,8 +592,7 @@ mod tests {
                 panic!("an offset prepares an offset");
             };
             assert_eq!((prepared.dx, prepared.dy), expected, "{transform:?}");
-            let data = FilterData::new(offset, transform);
-            assert!(data.displacement().is_some(), "{transform:?}");
+            let _ = FilterData::new(offset, transform);
         }
     }
 

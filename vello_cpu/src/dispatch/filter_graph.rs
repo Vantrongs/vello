@@ -2,55 +2,51 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Filter layers, rendered from the parts of their source that their visible
-//! output reads.
+//! output depends on.
 //!
 //! A filter layer records its commands instead of drawing them. When it is
-//! popped, the regions of its source that its output inside the view reads
-//! are planned backwards through every filter nested in it, see [`FilterPlan`].
-//! A nested filter has to produce its output where its parent reads its
-//! source, so its output regions are the regions all of its parent's outputs
-//! read, merged. Each region is therefore planned and rendered once however
-//! many outputs read it, and the work follows the view, not the extent of the
-//! source, the distance it is moved or how deeply filters are nested.
+//! popped, it and the filter layers nested in it are placed as the recorder
+//! places filter layers, see [`Node`]: each runs its filter on a pixmap
+//! around the content of its source, and its output is composited into its
+//! parent's source. Those rectangles lie in coordinates of the root target
+//! that are exact integers of any size, see [`Coord`], so they can be far
+//! larger than any pixmap.
 //!
-//! The commands are then replayed into windows that cover those regions.
-//! Strips, tiles and fine rasterization address pixels with `u16`, so a
-//! window is at most 65532 pixels wide; regions and windows themselves are
-//! placed in coordinates of the root target wide enough for any copy that
-//! filters move away and back, see [`Coord`].
-//!
-//! Nested filters are rendered first and handed to the windows of their parent
-//! as finished pixmaps, so every filter sees all of the source it reads and
-//! the result does not depend on where window edges fall. A wide blur reads
-//! its source decimated from tiles rendered at full resolution, and the
-//! filters nested in that source are streamed tile by tile, see
-//! [`Rendering::decimate`].
+//! The output is then computed only where the view shows it: each filter
+//! computes the pixels of an area from the pixels of its source that they
+//! depend on, see [`Pyramid`] for blurs, and the source is rendered for those
+//! pixels in windows of at most 65532 pixels a side, the most that strips,
+//! tiles and fine rasterization address, with the output of each nested filter
+//! computed the same way where a window shows it. Pixels are those of the
+//! filters run on whole pixmaps, while memory follows the view and the work
+//! follows the source the visible output depends on.
 
 use super::Dispatcher;
 use super::single_threaded::SingleThreadedDispatcher;
 use crate::RasterizerSettings;
+use crate::filter::colorize_shadow;
 use crate::filter::context::ScratchBuffer;
-use crate::filter::placed::{Bounds, Coord, Index, Pieces, PlacedPixmap, Position, Regions};
-use crate::filter::plan::{Blurred, FilterPlan, Reach};
+use crate::filter::pixmap::FilterPixmap;
+use crate::filter::placed::{Bounds, Coord, Padding, PlacedPixmap, Position, Regions};
+use crate::filter::plan::{Effect, Reach};
+use crate::filter::pyramid::{Blur, Pyramid};
 use crate::fine::FineKernel;
 use crate::kurbo::{Affine, BezPath, Join, Rect, Stroke};
-use crate::peniko::{BlendMode, Fill};
+use crate::peniko::{BlendMode, Compose, Fill};
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::marker::PhantomData;
 use vello_common::clip::PushedClip;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd};
-use vello_common::filter::FilterData;
+use vello_common::filter::{FilterData, PreparedFilter};
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint};
 use vello_common::pixmap::PixmapMut;
-
-/// Width and height of a window, the largest tile multiple in the `u16` domain.
-const WINDOW_SIZE: i64 = 65532;
 
 /// A clip as it was pushed, in root target coordinates.
 #[derive(Clone, Debug)]
@@ -168,6 +164,8 @@ pub(crate) struct Recording {
     view: Bounds,
     /// Clips active when the layer was pushed.
     clips: Vec<Clip>,
+    /// Whether the area the output is composited into is visible, see [`shows_area`].
+    area_shown: bool,
     commands: Vec<Command>,
     /// The number of open layers, the recorded layer included.
     depth: usize,
@@ -175,11 +173,17 @@ pub(crate) struct Recording {
 
 impl Recording {
     /// Start recording a filter layer whose output is visible in `view`.
-    pub(crate) fn new(filter: FilterData, view: Bounds, clips: Vec<Clip>) -> Self {
+    pub(crate) fn new(
+        filter: FilterData,
+        view: Bounds,
+        clips: Vec<Clip>,
+        area_shown: bool,
+    ) -> Self {
         Self {
             filter,
             view,
             clips,
+            area_shown,
             commands: Vec::new(),
             depth: 1,
         }
@@ -206,7 +210,7 @@ impl Recording {
             self.clips,
             &mut layers,
         );
-        FilterGraph::new(self.commands, layers, self.view, level)
+        FilterGraph::new(self.commands, layers, self.view, self.area_shown, level)
     }
 }
 
@@ -359,9 +363,17 @@ struct GraphLayer {
     steps: Vec<Step>,
     /// The filter layers nested directly in this one.
     children: Vec<Child>,
-    /// A rectangle in root target coordinates that holds everything the
-    /// layer's own commands draw, if they draw anything.
-    drawn: Option<Rect>,
+}
+
+impl GraphLayer {
+    /// Return for each of the layer's own commands that draws a rectangle in
+    /// root target coordinates that holds what it draws.
+    fn drawn(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.steps.iter().filter_map(|step| match step {
+            Step::Command { drawn, .. } => *drawn,
+            Step::Nested { .. } => None,
+        })
+    }
 }
 
 /// A filter layer nested directly in another.
@@ -371,17 +383,21 @@ struct Child {
     /// A rectangle in root target coordinates outside of which the clip
     /// paths of the layers it is composited through hide it.
     clip: Rect,
+    /// A rectangle in root target coordinates outside of which the clip paths
+    /// of the layers it is nested in cut it from the content bounds of its
+    /// parent, [`UNBOUNDED`] if none do.
+    enclosing: Rect,
+    /// Whether the area it is composited into is visible in its parent, see [`shows_area`].
+    area_shown: bool,
 }
 
 /// A recorded command, or a nested filter layer rendered on its own.
 #[derive(Clone, Copy, Debug)]
 enum Step {
-    Command(usize),
+    /// The command `command`, which draws inside `drawn` if it draws.
+    Command { command: usize, drawn: Option<Rect> },
     /// The filter layer `layer`, pushed by the command `push`.
-    Nested {
-        layer: usize,
-        push: usize,
-    },
+    Nested { layer: usize, push: usize },
 }
 
 /// Add the filter layer whose commands are `range` and the filter layers
@@ -399,20 +415,18 @@ fn parse(
         clips: Vec::new(),
         steps: Vec::new(),
         children: Vec::new(),
-        drawn: None,
     });
     let mut active_clips = clips.clone();
     let mut clip_bounds = ClipBounds::new(&clips);
     let mut steps = Vec::new();
     let mut children = Vec::new();
-    let mut drawn: Option<Rect> = None;
     let mut command = range.start;
     while command < range.end {
         if let Command::PushLayer(layer) = &commands[command]
             && let Some(filter) = &layer.filter
         {
             let end = matching_pop(commands, command);
-            let clip = layer.clip_bounds().intersect(clip_bounds.composited());
+            let enclosing = clip_bounds.composited();
             let child = parse(
                 commands,
                 command + 1..end,
@@ -420,7 +434,12 @@ fn parse(
                 active_clips.clone(),
                 layers,
             );
-            children.push(Child { layer: child, clip });
+            children.push(Child {
+                layer: child,
+                clip: layer.clip_bounds().intersect(enclosing),
+                enclosing,
+                area_shown: clip_bounds.area_shown() || shows_area(layer.blend_mode),
+            });
             steps.push(Step::Nested {
                 layer: child,
                 push: command,
@@ -429,7 +448,10 @@ fn parse(
             for (inner, nested) in commands.iter().enumerate().take(end).skip(command + 1) {
                 if track_clips(nested, &mut active_clips) {
                     clip_bounds.track(nested);
-                    steps.push(Step::Command(inner));
+                    steps.push(Step::Command {
+                        command: inner,
+                        drawn: None,
+                    });
                 }
             }
             command = end + 1;
@@ -437,18 +459,16 @@ fn parse(
         }
         track_clips(&commands[command], &mut active_clips);
         clip_bounds.track(&commands[command]);
-        if let Some(bounds) = commands[command].bounds() {
-            let bounds = bounds.intersect(clip_bounds.drawn());
-            drawn = Some(drawn.map_or(bounds, |drawn| drawn.union(bounds)));
-        }
-        steps.push(Step::Command(command));
+        let drawn = commands[command]
+            .bounds()
+            .map(|bounds| bounds.intersect(clip_bounds.drawn()));
+        steps.push(Step::Command { command, drawn });
         command += 1;
     }
     let layer = &mut layers[index];
     layer.clips = clips;
     layer.steps = steps;
     layer.children = children;
-    layer.drawn = drawn;
     index
 }
 
@@ -490,6 +510,8 @@ fn finite_or_unbounded(rect: Rect) -> Rect {
 struct ClipBounds {
     clips: Vec<Rect>,
     layers: Vec<Rect>,
+    /// For each layer, whether an open layer shows the area it is composited into.
+    shown: Vec<bool>,
 }
 
 impl ClipBounds {
@@ -498,6 +520,7 @@ impl ClipBounds {
         let mut bounds = Self {
             clips: vec![UNBOUNDED],
             layers: vec![UNBOUNDED],
+            shown: vec![false],
         };
         for clip in clips {
             bounds.push_clip(clip);
@@ -516,6 +539,11 @@ impl ClipBounds {
         self.clips.last().unwrap().intersect(self.composited())
     }
 
+    /// Return whether an open layer shows the area it is composited into.
+    fn area_shown(&self) -> bool {
+        *self.shown.last().unwrap()
+    }
+
     /// Return the bounds of the output of a filter layer, which clips pushed
     /// on their own leave as it is.
     fn composited(&self) -> Rect {
@@ -532,9 +560,12 @@ impl ClipBounds {
                 let bounds = layer.clip_bounds();
                 self.layers
                     .push(self.layers.last().unwrap().intersect(bounds));
+                self.shown
+                    .push(self.area_shown() || shows_area(layer.blend_mode));
             }
             Command::PopLayer if self.layers.len() > 1 => {
                 self.layers.pop();
+                self.shown.pop();
             }
             _ => {}
         }
@@ -588,6 +619,20 @@ impl Command {
     }
 }
 
+/// Return whether compositing a transparent pixel with `blend_mode` changes
+/// what lies under it, which makes the area a layer is composited into visible.
+pub(crate) fn shows_area(blend_mode: BlendMode) -> bool {
+    matches!(
+        blend_mode.compose,
+        Compose::Clear
+            | Compose::Copy
+            | Compose::SrcIn
+            | Compose::DestIn
+            | Compose::SrcOut
+            | Compose::DestAtop
+    )
+}
+
 /// Return the index of the `PopLayer` that closes the layer pushed at `push`.
 fn matching_pop(commands: &[Command], push: usize) -> usize {
     let mut depth = 0_usize;
@@ -606,8 +651,7 @@ fn matching_pop(commands: &[Command], push: usize) -> usize {
     unreachable!("a finished recording closes every layer it opens")
 }
 
-/// A recorded filter layer and the filter layers nested in it, planned and
-/// replayed into windows.
+/// A recorded filter layer and the filter layers nested in it, placed.
 #[derive(Debug)]
 pub(crate) struct FilterGraph {
     commands: Vec<Command>,
@@ -615,314 +659,421 @@ pub(crate) struct FilterGraph {
     /// One node for each layer, children after their parents. The first is
     /// the recorded layer.
     nodes: Vec<Node>,
+    /// Where the output of the recorded layer is visible.
+    view: Bounds,
     simd_level: Level,
 }
 
-/// A filter layer with its output planned.
+/// A filter layer placed as the recorder places filter layers in a target
+/// large enough to hold all of its content, in root target coordinates.
 ///
-/// The output is needed where it is composited into the windows of its parent
-/// or into the view, which are replayed in advance, and where the source of a
-/// blur that reads a coarser source is decimated, which streams the source of
-/// its nested filter layers tile by tile, see [`Rendering::decimate`].
+/// The filter runs on a pixmap that covers the bounds of the content the
+/// layer's source draws and of the pixmaps of the nested layers, widened by
+/// the filter padding, and its output is composited into its parent where
+/// that pixmap lies. The bounds of the content are those of the strips the
+/// source draws, so they are found by replaying it in windows, see
+/// [`FilterGraph::content_bounds`]. A command that draws without bounds, such
+/// as a rectangle with an infinite side, is bounded by the viewport the
+/// recorder draws it in: the view widened by the source paddings of the
+/// layers down to this one.
+///
+/// Where the content ends matters only to a filter that reads past it, a
+/// blur or a flood, to a layer composited into an area that is visible, see
+/// [`shows_area`], and to the layers these are nested in. The other pixmaps
+/// cover the bounds of what the commands can draw instead, which leaves the
+/// output as it is and saves replaying content that is not visible.
 #[derive(Debug)]
 struct Node {
-    /// The output that is composited into windows replayed in advance.
-    plan: FilterPlan,
-    /// Windows of the source of `plan`.
-    windows: Vec<Window>,
-    /// Where the output of `plan` has content.
-    extents: Index,
-    /// The output that is read where a coarser source is decimated.
-    streamed: FilterPlan,
-    /// Where the source of `streamed` can have content, and where the source
-    /// its filter reads can, in that source's grid.
-    content: Index,
-    filtered: Index,
-    /// Regions of the source the filter reads if that is coarser than the
-    /// output, each pixel the average of the source pixels it covers.
-    decimated: Vec<Bounds>,
-    /// Where the source of `decimated` can have content at full resolution.
-    decimated_content: Regions,
-}
-
-/// The planned regions of a node, before its windows are replayed.
-struct Planned {
-    plan: FilterPlan,
-    streamed: FilterPlan,
-    /// Regions of the source to replay into windows in advance.
-    regions: Regions,
-    /// Where the source the output keeps can have content.
-    kept_content: Regions,
-    /// Where the source the filter reads can have content, in its grid.
-    filtered_content: Regions,
-    decimated: Regions,
-    decimated_content: Regions,
-}
-
-/// Plan the output regions of every layer. The first layer is needed inside `view`.
-///
-/// A region of a source is rendered only where that source has content, so
-/// that the copies a drop shadow that keeps its source makes of every copy
-/// nested in it are read only where one is visible. Where the layers have
-/// content is first found from the children up, inside the regions the
-/// parents can read at most, so that it too stays within what is visible.
-fn plan(layers: &[GraphLayer], view: Bounds) -> Vec<Planned> {
-    let count = layers.len();
-    // From the parents down: how far each layer is needed.
-    let mut hulls = vec![Bounds::EMPTY; count];
-    hulls[0] = view;
-    let mut reaches = Vec::with_capacity(count);
-    for (index, layer) in layers.iter().enumerate() {
-        let reach = Reach::new(&layer.filter);
-        let (kept, filtered) = reach.reads(hulls[index]);
-        let source = kept.union(filtered.refine(reach.reduction()));
-        for child in &layer.children {
-            hulls[child.layer] = hulls[child.layer].union(source);
-        }
-        reaches.push(reach);
-    }
-    // From the children up: where each layer has content.
-    let mut contents = vec![Regions::default(); count];
-    let mut kept_contents = vec![Regions::default(); count];
-    let mut filtered_contents = vec![Regions::default(); count];
-    let mut read_contents = vec![Regions::default(); count];
-    for index in (0..count).rev() {
-        let (reach, hull) = (&reaches[index], hulls[index]);
-        let reduction = reach.reduction();
-        let (kept_area, filtered_area) = reach.reads(hull);
-        let content_in = |area| source_content(&layers[index], area, &contents);
-        let (kept, read) = if reduction == 0 {
-            let content = content_in(kept_area.union(filtered_area));
-            (content.clone(), content)
-        } else {
-            (
-                content_in(kept_area),
-                content_in(filtered_area.refine(reduction)),
-            )
-        };
-        let mut filtered = Regions::default();
-        read.iter()
-            .for_each(|region| filtered.insert(region.coarsen(reduction)));
-        let mut content = Regions::default();
-        for region in filtered.iter() {
-            content.insert(reach.writes(region).intersect(hull));
-        }
-        if reach.keeps_source() {
-            for region in kept.iter() {
-                content.insert(region);
-            }
-        }
-        contents[index] = content;
-        kept_contents[index] = kept;
-        filtered_contents[index] = filtered;
-        read_contents[index] = read;
-    }
-    // From the parents down: the regions of each layer that are needed.
-    let mut shown = vec![Regions::default(); count];
-    shown[0].insert(view);
-    let mut streamed = vec![Regions::default(); count];
-    let mut planned = Vec::with_capacity(count);
-    for (index, layer) in layers.iter().enumerate() {
-        let reduction = reaches[index].reduction();
-        let plan = FilterPlan::new(reaches[index].clone(), &core::mem::take(&mut shown[index]));
-        let stream = FilterPlan::new(
-            reaches[index].clone(),
-            &core::mem::take(&mut streamed[index]),
-        );
-        let (mut windows, filtered) = plan.source_regions();
-        let (mut streams, stream_filtered) = stream.source_regions();
-        let mut decimated = Regions::default();
-        if reduction == 0 {
-            filtered.iter().for_each(|region| windows.insert(region));
-            stream_filtered
-                .iter()
-                .for_each(|region| streams.insert(region));
-        } else {
-            let mut coarse = filtered;
-            stream_filtered
-                .iter()
-                .for_each(|region| coarse.insert(region));
-            decimated = intersection(&coarse, &filtered_contents[index]);
-            decimated
-                .iter()
-                .for_each(|region| streams.insert(region.refine(reduction)));
-        }
-        for child in &layer.children {
-            let clip = Bounds::covering(child.clip, 1.0);
-            for content in contents[child.layer].iter() {
-                let content = content.intersect(clip);
-                for (sources, needed) in [(&windows, &mut shown), (&streams, &mut streamed)] {
-                    for source in sources.touching(content) {
-                        needed[child.layer].insert(source.intersect(content));
-                    }
-                }
-            }
-        }
-        planned.push(Planned {
-            plan,
-            streamed: stream,
-            regions: intersection(&windows, &kept_contents[index]),
-            kept_content: core::mem::take(&mut kept_contents[index]),
-            filtered_content: core::mem::take(&mut filtered_contents[index]),
-            decimated,
-            decimated_content: core::mem::take(&mut read_contents[index]),
-        });
-    }
-    planned
-}
-
-/// Return where the source of `layer` has content inside `area`: its own
-/// drawing and the content of its children, inside their clips.
-fn source_content(layer: &GraphLayer, area: Bounds, contents: &[Regions]) -> Regions {
-    let mut content = Regions::default();
-    if let Some(drawn) = layer.drawn {
-        content.insert(Bounds::covering(drawn, 1.0).intersect(area));
-    }
-    for child in &layer.children {
-        let clip = Bounds::covering(child.clip, 1.0).intersect(area);
-        for region in contents[child.layer].iter() {
-            content.insert(region.intersect(clip));
-        }
-    }
-    content
-}
-
-/// Return the parts of `regions` inside `content`.
-fn intersection(regions: &Regions, content: &Regions) -> Regions {
-    let mut parts = Regions::default();
-    for region in regions.iter() {
-        for content in content.touching(region) {
-            parts.insert(region.intersect(content));
-        }
-    }
-    parts
+    reach: Reach,
+    /// The pixmap the filter runs on, where the output is composited into the
+    /// parent; empty if the source has no content.
+    pixmap: Bounds,
+    /// Where the source can have content inside the pixmap.
+    source: Regions,
+    /// Where the source of the blur can have content, relative to the pixmap.
+    blurred: Regions,
+    /// Where the output of the filter can have content, before a drop shadow
+    /// puts the source over it.
+    filtered: Regions,
+    /// Where the output can have content.
+    content: Regions,
 }
 
 impl FilterGraph {
+    /// Place the layers, the first of which is composited into an area that
+    /// is visible if `area_shown` is set.
     fn new(
         commands: Vec<Command>,
         layers: Vec<GraphLayer>,
         view: Bounds,
+        area_shown: bool,
         simd_level: Level,
     ) -> Self {
-        let planned = plan(&layers, view);
-        // Replay children first, so that a parent's windows know where the
-        // children they composite have content.
-        let mut extents = vec![Index::default(); layers.len()];
-        let mut nodes = Vec::with_capacity(layers.len());
-        for (index, planned) in planned.into_iter().enumerate().rev() {
-            let replay = Replay {
-                layer: &layers[index],
-                commands: &commands,
-                layers: &layers,
-                extents: &extents,
-                simd_level,
-            };
-            let windows = replay.windows(&planned.regions);
-            let kept = Index::new(windows.iter().map(Window::content));
-            let reduced = planned.plan.reduction() > 0;
-            let filtered = if reduced {
-                Index::new(planned.decimated.iter())
-            } else {
-                kept.clone()
-            };
-            extents[index] = Index::new(planned.plan.extents(&kept, &filtered));
-            let content = Index::new(planned.kept_content.iter());
-            nodes.push(Node {
-                plan: planned.plan,
-                windows,
-                extents: Index::default(),
-                streamed: planned.streamed,
-                filtered: if reduced {
-                    filtered
-                } else {
-                    Index::new(planned.filtered_content.iter())
-                },
-                content,
-                decimated: planned.decimated.iter().collect(),
-                decimated_content: planned.decimated_content,
-            });
+        let count = layers.len();
+        let reaches: Vec<Reach> = layers
+            .iter()
+            .map(|layer| Reach::new(&layer.filter))
+            .collect();
+        // From the parents down: the viewports that bound unbounded commands,
+        // and whether the output depends on where the content ends, see `Node`.
+        let mut viewports = vec![Bounds::EMPTY; count];
+        let mut exact = vec![false; count];
+        viewports[0] = view.expand(&reaches[0].source_padding);
+        exact[0] = area_shown || reaches[0].reads_extent();
+        for (index, layer) in layers.iter().enumerate() {
+            for child in &layer.children {
+                viewports[child.layer] =
+                    viewports[index].expand(&reaches[child.layer].source_padding);
+                exact[child.layer] =
+                    exact[index] || child.area_shown || reaches[child.layer].reads_extent();
+            }
         }
-        nodes.reverse();
-        for (node, extents) in nodes.iter_mut().zip(extents) {
-            node.extents = extents;
-        }
-        Self {
+        let mut graph = Self {
             commands,
             layers,
-            nodes,
+            nodes: Vec::with_capacity(count),
+            view,
             simd_level,
+        };
+        // From the children up: a layer's pixmap covers its children's.
+        let mut nodes: Vec<Option<Node>> = (0..count).map(|_| None).collect();
+        for (index, reach) in reaches.into_iter().enumerate().rev() {
+            let node = graph.place(index, reach, &viewports[index], exact[index], &nodes);
+            nodes[index] = Some(node);
+        }
+        graph.nodes = nodes.into_iter().map(Option::unwrap).collect();
+        graph
+    }
+
+    /// Place layer `index`, whose children are placed in `nodes`; `viewport`
+    /// bounds its unbounded commands. Unless `exact` is set, the pixmap covers
+    /// the bounds of what the source can draw rather than of what it draws.
+    fn place(
+        &self,
+        index: usize,
+        reach: Reach,
+        viewport: &Bounds,
+        exact: bool,
+        nodes: &[Option<Node>],
+    ) -> Node {
+        let layer = &self.layers[index];
+        let child = |child: &Child| nodes[child.layer].as_ref().unwrap();
+        let drawn: Vec<Option<Bounds>> = layer.drawn().map(Bounds::covering).collect();
+        // Pixmaps outside the clip paths of regular layers count in full, see
+        // `CommandRecorder::pop_layer`.
+        let mut bounds = Bounds::EMPTY;
+        let mut candidates: Vec<Bounds> = drawn
+            .iter()
+            .map(|drawn| drawn.clone().unwrap_or_else(|| viewport.clone()))
+            .collect();
+        for nested in &layer.children {
+            let pixmap = &child(nested).pixmap;
+            match Bounds::covering(nested.enclosing) {
+                Some(enclosing) => candidates.push(enclosing.intersect(pixmap)),
+                None => bounds = bounds.union(pixmap),
+            }
+        }
+        let pixmap_of = |node: usize| nodes[node].as_ref().unwrap().pixmap.clone();
+        let bounds = if exact {
+            self.content_bounds(index, candidates, bounds, &pixmap_of)
+        } else {
+            candidates
+                .iter()
+                .fold(bounds, |bounds, candidate| bounds.union(candidate))
+        };
+        let pixmap = bounds.expand(&reach.filter_padding).snap_to_tiles();
+        let mut source = Regions::default();
+        for drawn in drawn {
+            source.insert(drawn.map_or(pixmap.clone(), |drawn| drawn.intersect(&pixmap)));
+        }
+        for nested in &layer.children {
+            let node = child(nested);
+            let shown = node.pixmap.clip(nested.clip).intersect(&pixmap);
+            for content in node.content.touching(&shown) {
+                source.insert(content.intersect(&shown));
+            }
+        }
+        let local = |regions: &Regions| {
+            let origin = pixmap.origin();
+            let back = (-&origin.0, -&origin.1);
+            let mut local = Regions::default();
+            for region in regions.iter() {
+                local.insert(region.translate(&back));
+            }
+            local
+        };
+        let moved = |offset: &Position| {
+            let mut moved = Regions::default();
+            for region in source.iter() {
+                moved.insert(region.translate(offset).intersect(&pixmap));
+            }
+            moved
+        };
+        let (blurred, filtered) = match &reach.effect {
+            Effect::Flood => (Regions::default(), Regions::of(pixmap.clone())),
+            Effect::Offset(offset) => (Regions::default(), moved(offset)),
+            Effect::Blur(None) => (Regions::default(), source.clone()),
+            Effect::Blur(Some(blur)) => (local(&source), spread(&source, blur, &pixmap)),
+            Effect::Shadow { offset, blur, .. } => {
+                let moved = moved(offset);
+                match blur {
+                    Some(blur) => (local(&moved), spread(&moved, blur, &pixmap)),
+                    None => (Regions::default(), moved),
+                }
+            }
+        };
+        let mut content = filtered.clone();
+        if let Effect::Shadow {
+            keeps_source: true, ..
+        } = &reach.effect
+        {
+            for region in source.iter() {
+                content.insert(region.clone());
+            }
+        }
+        Node {
+            reach,
+            pixmap,
+            source,
+            blurred,
+            filtered,
+            content,
         }
     }
 
-    /// Return where the output has content in the root grid.
-    fn extents(&self) -> &Index {
-        &self.nodes[0].extents
-    }
-
-    /// Return where the visible part of the output is composited in `view`.
-    pub(crate) fn placement_in(&self, view: Bounds) -> RectU16 {
-        self.extents()
+    /// Return the bounds of the content of the source of layer `index`, given
+    /// `bounds` that it covers: the union of the content bounds of windows
+    /// over the cells of a grid that hold `candidates`, which hold everything
+    /// it draws that can widen `bounds`. `pixmap` returns the pixmap of each
+    /// nested layer.
+    ///
+    /// Cells inside the bounds found so far cannot widen them, so the
+    /// candidates that reach furthest are replayed first, and a candidate
+    /// spanning several cells is replayed at its corners before the halves of
+    /// what remains of it: content that fills a candidate is bounded by its
+    /// corners, so the cells replayed follow the extent of the content rather
+    /// than its area.
+    fn content_bounds(
+        &self,
+        index: usize,
+        mut candidates: Vec<Bounds>,
+        mut bounds: Bounds,
+        pixmap: &dyn Fn(usize) -> Bounds,
+    ) -> Bounds {
+        candidates.retain(|candidate| !candidate.is_empty());
+        let extent = candidates
             .iter()
-            .fold(Bounds::EMPTY, |placement, extent| {
-                placement.union(extent.intersect(view))
-            })
-            .snap_to_tiles()
-            .to_rect_u16((Coord::ZERO, Coord::ZERO))
+            .fold(Bounds::EMPTY, |extent, candidate| extent.union(candidate));
+        if extent.is_empty() {
+            return bounds;
+        }
+        let replay = |cell: &(Coord, Coord), bounds: &mut Bounds| {
+            let area = cell_bounds(cell).intersect(&extent).snap_to_tiles();
+            if !bounds.contains(&area) {
+                let window = self.window(index, &area, pixmap);
+                *bounds = bounds.union(&window.window_content());
+            }
+        };
+        // The stack pops the candidates reaching furthest first.
+        let reaching = |side: fn(&Bounds) -> &Coord, last: bool| {
+            let mut ordered: Vec<usize> = (0..candidates.len()).collect();
+            ordered.sort_by(|&a, &b| side(&candidates[a]).cmp(side(&candidates[b])));
+            if last {
+                ordered.last().copied()
+            } else {
+                ordered.first().copied()
+            }
+        };
+        let mut extremes: Vec<usize> = [
+            reaching(|bounds| &bounds.x0, false),
+            reaching(|bounds| &bounds.y0, false),
+            reaching(|bounds| &bounds.x1, true),
+            reaching(|bounds| &bounds.y1, true),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        extremes.sort_unstable();
+        extremes.dedup();
+        // Each area with the corners already replayed: top left, top right,
+        // bottom left and bottom right.
+        let mut pending: Vec<(Bounds, [bool; 4])> = Vec::with_capacity(candidates.len());
+        for (index, candidate) in candidates.iter().enumerate() {
+            if extremes.binary_search(&index).is_err() {
+                pending.push((candidate.clone(), [false; 4]));
+            }
+        }
+        pending.extend(
+            extremes
+                .iter()
+                .map(|&index| (candidates[index].clone(), [false; 4])),
+        );
+        while let Some((area, replayed)) = pending.pop() {
+            if bounds.contains(&area) {
+                continue;
+            }
+            let first = cell_of(&area.x0, &area.y0);
+            let last = cell_of(&(&area.x1 - 1), &(&area.y1 - 1));
+            let corners = [
+                (first.0.clone(), first.1.clone()),
+                (last.0.clone(), first.1.clone()),
+                (first.0.clone(), last.1.clone()),
+                (last.0.clone(), last.1.clone()),
+            ];
+            for (corner, cell) in corners.iter().enumerate() {
+                if !replayed[corner] && !corners[..corner].contains(cell) {
+                    replay(cell, &mut bounds);
+                }
+            }
+            if first == last || bounds.contains(&area) {
+                continue;
+            }
+            // Split at a cell edge across the axis with more cells; each half
+            // keeps two of the corners.
+            let (mut low, mut high) = (area.clone(), area.clone());
+            let middle = |first: &Coord, last: &Coord| {
+                ((first + last).div_floor(&Coord::from(2_i64)) + 1).mul(&Coord::from(PROBE_SIZE))
+            };
+            let kept = if &last.0 - &first.0 >= &last.1 - &first.1 {
+                low.x1 = middle(&first.0, &last.0);
+                high.x0 = low.x1.clone();
+                [[true, false, true, false], [false, true, false, true]]
+            } else {
+                low.y1 = middle(&first.1, &last.1);
+                high.y0 = low.y1.clone();
+                [[true, true, false, false], [false, false, true, true]]
+            };
+            pending.push((low, kept[0]));
+            pending.push((high, kept[1]));
+        }
+        bounds
     }
 
-    /// Render the layer and the filters nested in it, and return its output in the root grid.
+    /// Replay layer `index` into a window covering `area`, which starts on a
+    /// tile corner and spans at most [`WINDOW_SIZE`] pixels on each side, with
+    /// nested layers composited where `pixmap` says.
+    fn window(
+        &self,
+        index: usize,
+        area: &Bounds,
+        pixmap: &dyn Fn(usize) -> Bounds,
+    ) -> SingleThreadedDispatcher {
+        let layer = &self.layers[index];
+        let origin = area.origin();
+        let side = |length: Coord| u16::try_from(length.to_i64().unwrap()).unwrap();
+        let size = (side(area.width()), side(area.height()));
+        let to_window = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
+        SingleThreadedDispatcher::window(size, self.simd_level, origin.clone(), |target| {
+            for clip in &layer.clips {
+                clip.push_into(target, to_window);
+            }
+            for step in &layer.steps {
+                match *step {
+                    Step::Command { command, drawn } => {
+                        // A command drawing outside the window has no strips in it.
+                        let outside = drawn
+                            .and_then(Bounds::covering)
+                            .is_some_and(|drawn| !drawn.touches(area));
+                        if !outside {
+                            apply(target, &self.commands[command], to_window);
+                        }
+                    }
+                    Step::Nested { layer, push } => {
+                        let Command::PushLayer(pushed) = &self.commands[push] else {
+                            unreachable!("a nested layer starts with its push");
+                        };
+                        target.push_rendered_filter_layer(
+                            pushed,
+                            pushed.mask.clone(),
+                            to_window,
+                            self.layers[layer].filter.clone(),
+                            pixmap(layer).intersect(area).to_rect_u16(&origin),
+                            layer,
+                        );
+                    }
+                }
+            }
+        })
+    }
+
+    /// Return where the output of the recorded layer is composited in the view.
+    fn placement(&self) -> Bounds {
+        self.nodes[0].pixmap.intersect(&self.view)
+    }
+
+    /// Return where the output of the recorded layer is composited in the view.
+    pub(crate) fn placement_in_view(&self) -> RectU16 {
+        self.placement().to_rect_u16(&(Coord::ZERO, Coord::ZERO))
+    }
+
+    /// Render the visible output of the recorded layer, placed in the root grid.
     pub(crate) fn render<S: Simd, F: FineKernel<S>>(
         &self,
         simd: S,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
-    ) -> Pieces {
-        let mut rendering = Rendering::<S, F> {
+    ) -> PlacedPixmap {
+        let rendering = Rendering::<S, F> {
             graph: self,
             simd,
             encoded_paints,
             image_resolver,
-            decimated: self.nodes.iter().map(|_| Pieces::default()).collect(),
-            blurred: BTreeMap::new(),
-            scratch: ScratchBuffer::new(),
+            pyramids: self.nodes.iter().map(|_| RefCell::new(None)).collect(),
+            scratch: RefCell::new(ScratchBuffer::new()),
             kernel: PhantomData,
         };
-        // Children first: decimating a source streams the filters nested in it.
-        for index in (0..self.nodes.len()).rev() {
-            if !self.nodes[index].decimated.is_empty() {
-                rendering.decimated[index] = rendering.decimate(index);
-            }
+        let area = self.placement();
+        if area.is_empty() {
+            return PlacedPixmap::new(area);
         }
-        let mut outputs: Vec<Pieces> = self.nodes.iter().map(|_| Pieces::default()).collect();
-        for (index, node) in self.nodes.iter().enumerate().rev() {
-            let kept = Pieces::new(
-                node.windows
-                    .iter()
-                    .filter_map(|window| {
-                        window.render::<S, F>(simd, encoded_paints, image_resolver, &outputs)
-                    })
-                    .collect(),
-            );
-            let filtered = if node.plan.reduction() == 0 {
-                &kept
-            } else {
-                &rendering.decimated[index]
-            };
-            outputs[index] = Pieces::new(node.plan.render(
-                &kept,
-                filtered,
-                &mut rendering.scratch,
-                &mut |pixmap, filter, scratch| F::filter_layer(pixmap, filter, scratch),
-            ));
+        PlacedPixmap {
+            pixmap: rendering.output(0, &area),
+            bounds: area,
         }
-        core::mem::take(&mut outputs[0])
     }
 }
 
-/// The tiles a source is rendered in at full resolution while it is
-/// decimated are `2^TILE_LEVELS` pixels wide.
-const TILE_LEVELS: u32 = 10;
+/// Return where the output of a blur of `content` on `pixmap` can have content.
+fn spread(content: &Regions, blur: &Blur, pixmap: &Bounds) -> Regions {
+    let mut support = blur.support();
+    let mut shifts = vec![(Coord::ZERO, Coord::ZERO)];
+    if blur.edge_mode == EdgeMode::Wrap {
+        // A level wraps at its size, whose pixels each cover `2^level` pixels
+        // of the pixmap, so the copies that wrapping brings in lie one pixmap
+        // and less than `2^decimations` pixels away.
+        support = support + Coord::from(2_i64).shl(blur.decimations);
+        let (width, height) = (pixmap.width(), pixmap.height());
+        shifts = [-&width, Coord::ZERO, width]
+            .into_iter()
+            .flat_map(|x| [-&height, Coord::ZERO, height.clone()].map(|y| (x.clone(), y)))
+            .collect();
+    }
+    let padding = Padding::uniform(support);
+    let mut spread = Regions::default();
+    for region in content.iter() {
+        for shift in &shifts {
+            spread.insert(region.translate(shift).expand(&padding).intersect(pixmap));
+        }
+    }
+    spread
+}
+
+/// The width and height of the cells replayed to find the bounds of content,
+/// small so that finding the bounds of a large area of content takes little memory.
+const PROBE_SIZE: i64 = 256;
+
+/// Return the cell replayed to find the bounds of content that holds `(x, y)`.
+fn cell_of(x: &Coord, y: &Coord) -> (Coord, Coord) {
+    let size = Coord::from(PROBE_SIZE);
+    (x.div_floor(&size), y.div_floor(&size))
+}
+
+/// Return the bounds of the cell `(column, row)` replayed to find the bounds of content.
+fn cell_bounds((column, row): &(Coord, Coord)) -> Bounds {
+    let size = Coord::from(PROBE_SIZE);
+    let (x0, y0) = (column.mul(&size), row.mul(&size));
+    Bounds::new(x0.clone(), y0.clone(), &x0 + &size, &y0 + &size)
+}
 
 /// The state of rendering a filter graph.
 struct Rendering<'a, S: Simd, F> {
@@ -930,286 +1081,170 @@ struct Rendering<'a, S: Simd, F> {
     simd: S,
     encoded_paints: &'a [EncodedPaint],
     image_resolver: &'a dyn ImageResolver,
-    /// The decimated source of each node that reads one.
-    decimated: Vec<Pieces>,
-    /// The pixmaps that blurs reading a decimated source ran on, by node and
-    /// region of their streamed output.
-    blurred: BTreeMap<(usize, usize), Blurred>,
-    scratch: ScratchBuffer,
+    /// The blurs of the layers that blur, prepared when first needed.
+    pyramids: Vec<RefCell<Option<Pyramid>>>,
+    scratch: RefCell<ScratchBuffer>,
     kernel: PhantomData<F>,
 }
 
 impl<S: Simd, F: FineKernel<S>> Rendering<'_, S, F> {
-    /// Return the source the filter of `node` reads in the regions
-    /// [`Node::decimated`], with each pixel the average of the pixels of the
-    /// full-resolution source it covers.
-    ///
-    /// The source is rendered at full resolution in tiles that line up with
-    /// the coarse pixels and only where it has content, so memory stays within
-    /// a tile and the coarse regions. The work is that of rendering the source
-    /// the visible output depends on at full resolution, which grows with the
-    /// square of the blur's width.
-    fn decimate(&mut self, node: usize) -> Pieces {
-        let graph = self.graph;
-        let graph_node = &graph.nodes[node];
-        let levels = graph_node.plan.reduction();
-        let content = &graph_node.decimated_content;
-        let mut pieces = Vec::with_capacity(graph_node.decimated.len());
-        for &region in &graph_node.decimated {
-            let mut coarse = PlacedPixmap::new(region);
-            if levels <= TILE_LEVELS {
-                // Each tile holds whole squares of the coarse pixels.
-                for tile in content_tiles(region.refine(levels), content) {
-                    let source = self.source(node, &Regions::of(tile));
-                    if !source.is_empty() {
-                        coarse.average(&Pieces::new(source).crop(tile), levels);
-                    }
-                }
-            } else {
-                let (width, height) = region.size();
-                for (index, (y, x)) in (0..height)
-                    .flat_map(|y| (0..width).map(move |x| (y, x)))
-                    .enumerate()
-                {
-                    let (x, y) = (
-                        region.x0 + i64::from(x).into(),
-                        region.y0 + i64::from(y).into(),
-                    );
-                    let square = Bounds::new(x, y, x + Coord::from(1), y + Coord::from(1));
-                    let mut sums = [0_u128; 4];
-                    for tile in content_tiles(square.refine(levels), content) {
-                        for piece in self.source(node, &Regions::of(tile)) {
-                            piece.add_to(&mut sums);
-                        }
-                    }
-                    coarse.set_average(index, sums, levels);
-                }
+    /// Return the output of layer `index` inside `area`, which lies in its pixmap.
+    fn output(&self, index: usize, area: &Bounds) -> FilterPixmap {
+        let node = &self.graph.nodes[index];
+        if !node.content.overlaps(area) {
+            let (width, height) = area.size();
+            return FilterPixmap::new(width, height);
+        }
+        match &node.reach.effect {
+            Effect::Flood => {
+                let (width, height) = area.size();
+                let mut pixmap = FilterPixmap::new(width, height);
+                let filter = &self.graph.layers[index].filter;
+                F::filter_layer(
+                    &mut pixmap,
+                    PreparedFilter::new(&filter.filter, &filter.transform),
+                    &mut self.scratch.borrow_mut(),
+                );
+                pixmap
             }
-            pieces.push(coarse);
-        }
-        Pieces::new(pieces)
-    }
-
-    /// Render the source of `node` inside `regions` at full resolution, with
-    /// the nested filter layers streamed.
-    fn source(&mut self, node: usize, regions: &Regions) -> Vec<PlacedPixmap> {
-        let graph = self.graph;
-        let layer = &graph.layers[node];
-        let mut nested: Vec<Pieces> = graph.nodes.iter().map(|_| Pieces::default()).collect();
-        let mut extents = vec![Index::default(); graph.nodes.len()];
-        for child in &layer.children {
-            let clip = Bounds::covering(child.clip, 1.0);
-            let mut pieces = Vec::new();
-            for region in regions.iter() {
-                let area = region.intersect(clip);
-                if !area.is_empty() {
-                    pieces.extend(self.stream(child.layer, area));
-                }
-            }
-            nested[child.layer] = Pieces::new(pieces);
-            extents[child.layer] = nested[child.layer].index().clone();
-        }
-        let replay = Replay {
-            layer,
-            commands: &graph.commands,
-            layers: &graph.layers,
-            extents: &extents,
-            simd_level: graph.simd_level,
-        };
-        replay
-            .windows(regions)
-            .iter()
-            .filter_map(|window| {
-                window.render::<S, F>(self.simd, self.encoded_paints, self.image_resolver, &nested)
-            })
-            .collect()
-    }
-
-    /// Return the output of `node` inside `area`, which lies in its streamed output.
-    fn stream(&mut self, node: usize, area: Bounds) -> Vec<PlacedPixmap> {
-        let graph = self.graph;
-        let graph_node = &graph.nodes[node];
-        let plan = &graph_node.streamed;
-        let reduced = plan.reduction() > 0;
-        let mut output = Vec::new();
-        for (region, layout) in plan.parts(area, &graph_node.content, &graph_node.filtered) {
-            let source = Pieces::new(self.source(node, &layout.sources(reduced)));
-            let Self {
-                decimated,
-                blurred,
-                scratch,
-                ..
-            } = self;
-            let (filtered, blurred) = if reduced {
-                let blurred = blurred
-                    .entry((node, region))
-                    .or_insert_with(|| plan.blur(&layout, &decimated[node], scratch));
-                (&decimated[node], Some(&*blurred))
-            } else {
-                (&source, None)
-            };
-            output.push(plan.compose(
-                &layout,
-                &source,
-                filtered,
-                blurred,
-                scratch,
-                &mut |pixmap, filter, scratch| F::filter_layer(pixmap, filter, scratch),
-            ));
-        }
-        output
-    }
-}
-
-/// Return the squares `2^TILE_LEVELS` pixels wide on a grid anchored at the
-/// origin that overlap both `area` and `content`, cut to `area`, each once,
-/// row by row.
-fn content_tiles(area: Bounds, content: &Regions) -> impl Iterator<Item = Bounds> {
-    let members: Vec<Bounds> = content
-        .touching(area)
-        .map(|member| member.intersect(area))
-        .filter(|member| !member.is_empty())
-        .collect();
-    let rows = tile_spans(
-        members
-            .iter()
-            .map(|member| (member.y0, member.y1))
-            .collect(),
-    );
-    rows.flat_map(move |row| {
-        let band =
-            Bounds::new(Coord::ZERO, row, Coord::from(1), row + Coord::from(1)).refine(TILE_LEVELS);
-        let columns = tile_spans(
-            members
-                .iter()
-                .filter(|member| member.y0 < band.y1 && band.y0 < member.y1)
-                .map(|member| (member.x0, member.x1))
-                .collect(),
-        );
-        columns.map(move |column| {
-            Bounds::new(column, row, column + Coord::from(1), row + Coord::from(1))
-                .refine(TILE_LEVELS)
-                .intersect(area)
-        })
-    })
-}
-
-/// Return the tiles `2^TILE_LEVELS` pixels wide that the `spans` of pixels
-/// along one axis cover, each once, in order.
-fn tile_spans(spans: Vec<(Coord, Coord)>) -> impl Iterator<Item = Coord> {
-    let mut spans: Vec<(Coord, Coord)> = spans
-        .into_iter()
-        .map(|(start, end)| {
-            let tiles = Bounds::new(start, Coord::ZERO, end, Coord::from(1)).coarsen(TILE_LEVELS);
-            (tiles.x0, tiles.x1)
-        })
-        .collect();
-    spans.sort_unstable();
-    let mut merged: Vec<(Coord, Coord)> = Vec::new();
-    for (start, end) in spans {
-        match merged.last_mut() {
-            Some(last) if start <= last.1 => last.1 = last.1.max(end),
-            _ => merged.push((start, end)),
-        }
-    }
-    merged.into_iter().flat_map(|(start, end)| {
-        core::iter::successors(Some(start), move |&tile| {
-            let next = tile + Coord::from(1);
-            (next < end).then_some(next)
-        })
-    })
-}
-
-/// What replaying the windows of one layer needs.
-struct Replay<'a> {
-    layer: &'a GraphLayer,
-    commands: &'a [Command],
-    layers: &'a [GraphLayer],
-    /// Where the outputs of the filter layers nested in it have content, by layer.
-    extents: &'a [Index],
-    simd_level: Level,
-}
-
-impl Replay<'_> {
-    /// Replay the layer into windows covering `regions`.
-    fn windows(&self, regions: &Regions) -> Vec<Window> {
-        regions
-            .iter()
-            .flat_map(window_grid)
-            .map(|window| self.window(window))
-            .collect()
-    }
-
-    fn window(&self, window: Bounds) -> Window {
-        let origin = window.origin();
-        let size = window.size();
-        let size = (
-            u16::try_from(size.0).unwrap(),
-            u16::try_from(size.1).unwrap(),
-        );
-        let to_window = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
-        let dispatcher =
-            SingleThreadedDispatcher::window(size.0, size.1, self.simd_level, origin, |target| {
-                for clip in &self.layer.clips {
-                    clip.push_into(target, to_window);
-                }
-                for step in &self.layer.steps {
-                    match *step {
-                        Step::Command(command) => {
-                            apply(target, &self.commands[command], to_window);
-                        }
-                        Step::Nested { layer, push } => {
-                            let Command::PushLayer(pushed) = &self.commands[push] else {
-                                unreachable!("a nested layer starts with its push");
-                            };
-                            inject(
-                                target,
-                                pushed,
-                                &self.layers[layer].filter,
-                                layer,
-                                &self.extents[layer],
-                                window,
-                                to_window,
-                            );
-                        }
+            Effect::Offset(offset) => self.moved(index, area, offset),
+            Effect::Blur(None) => self.source(index, area).pixmap,
+            Effect::Blur(Some(blur)) => self.blurred(index, area, blur, None),
+            Effect::Shadow {
+                offset,
+                blur,
+                color,
+                keeps_source,
+            } => {
+                let mut shadow = match blur {
+                    _ if !node.filtered.overlaps(area) => {
+                        let (width, height) = area.size();
+                        FilterPixmap::new(width, height)
                     }
-                }
-            });
-        Window { origin, dispatcher }
-    }
-}
-
-/// A window of a layer's source, replayed into its own dispatcher.
-#[derive(Debug)]
-struct Window {
-    /// The window's origin in root target coordinates.
-    origin: Position,
-    dispatcher: SingleThreadedDispatcher,
-}
-
-impl Window {
-    /// Return the bounds of the window content.
-    fn content(&self) -> Bounds {
-        self.dispatcher.window_content()
+                    Some(blur) => self.blurred(index, area, blur, Some(offset)),
+                    None => self.moved(index, area, offset),
+                };
+                let source = keeps_source.then(|| self.source(index, area).pixmap);
+                colorize_shadow(&mut shadow, *color, source.as_ref());
+                shadow
+            }
+        }
     }
 
-    /// Render the window content, or return `None` if it is empty. `nested`
-    /// holds the outputs of the nested filter layers, by layer.
-    fn render<S: Simd, F: FineKernel<S>>(
+    /// Return the source of layer `index` moved by `offset` inside `area`,
+    /// which lies in its pixmap; what the move takes out of the pixmap is lost.
+    fn moved(&self, index: usize, area: &Bounds, offset: &Position) -> FilterPixmap {
+        let node = &self.graph.nodes[index];
+        let from = area
+            .translate(&(-&offset.0, -&offset.1))
+            .intersect(&node.pixmap);
+        let mut moved = PlacedPixmap::new(area.clone());
+        if !from.is_empty() {
+            moved.copy_from(&self.source(index, &from).translate(offset), area);
+        }
+        moved.pixmap
+    }
+
+    /// Return the blur of the source of layer `index`, moved by `offset` if
+    /// there is one, inside `area`, which lies in its pixmap.
+    fn blurred(
         &self,
-        simd: S,
-        encoded_paints: &[EncodedPaint],
-        image_resolver: &dyn ImageResolver,
-        nested: &[Pieces],
-    ) -> Option<PlacedPixmap> {
-        let encoded_paints = paints_at(encoded_paints, self.origin);
-        self.dispatcher
-            .render_window::<S, F>(simd, &encoded_paints, image_resolver, nested)
+        index: usize,
+        area: &Bounds,
+        blur: &Blur,
+        offset: Option<&Position>,
+    ) -> FilterPixmap {
+        let node = &self.graph.nodes[index];
+        let origin = node.pixmap.origin();
+        let mut pyramid = self.pyramids[index].borrow_mut();
+        let pyramid = pyramid.get_or_insert_with(|| {
+            Pyramid::new(
+                blur.clone(),
+                node.pixmap.width(),
+                node.pixmap.height(),
+                &node.blurred,
+            )
+        });
+        let back = (-&origin.0, -&origin.1);
+        pyramid.blur(&area.translate(&back), &mut |local| {
+            let area = local.translate(&origin);
+            match offset {
+                Some(offset) => self.moved(index, &area, offset),
+                None => self.source(index, &area).pixmap,
+            }
+        })
     }
+
+    /// Render the source of layer `index` inside `area`, which lies in its pixmap.
+    fn source(&self, index: usize, area: &Bounds) -> PlacedPixmap {
+        let graph = self.graph;
+        let node = &graph.nodes[index];
+        let mut source = PlacedPixmap::new(area.clone());
+        // Windows are rendered in whole tiles.
+        let content = node.source.hull_within(area).snap_to_tiles();
+        for shown in split(&content, WINDOW_SIZE) {
+            let mut nested = BTreeMap::new();
+            for child in &graph.layers[index].children {
+                let child_node = &graph.nodes[child.layer];
+                let needed = child_node.pixmap.intersect(&shown);
+                if child_node.content.overlaps(&needed) {
+                    nested.insert(
+                        child.layer,
+                        PlacedPixmap {
+                            pixmap: self.output(child.layer, &needed),
+                            bounds: needed,
+                        },
+                    );
+                }
+            }
+            let window = graph.window(index, &shown, &|layer| graph.nodes[layer].pixmap.clone());
+            let encoded_paints = paints_at(self.encoded_paints, &shown.origin());
+            if let Some(rendered) = window.render_window::<S, F>(
+                self.simd,
+                &encoded_paints,
+                self.image_resolver,
+                &nested,
+                &shown,
+            ) {
+                source.copy_from(&rendered, area);
+            }
+        }
+        source
+    }
+}
+
+/// Width and height of a window, the largest tile multiple in the `u16` domain.
+const WINDOW_SIZE: i64 = 65532;
+
+/// Return `bounds` split into pieces at most `size` wide and high, from its top left.
+fn split(bounds: &Bounds, size: i64) -> Vec<Bounds> {
+    let steps = |start: &Coord, end: &Coord| {
+        let count = (end - start).div_floor(&Coord::from(size)).to_usize() + 1;
+        (0..count)
+            .map(|step| start + i64::try_from(step).unwrap() * size)
+            .filter(|from| from < end)
+            .map(|from| {
+                let to = (&from + size).min(end.clone());
+                (from, to)
+            })
+            .collect::<Vec<_>>()
+    };
+    if bounds.is_empty() {
+        return Vec::new();
+    }
+    let columns = steps(&bounds.x0, &bounds.x1);
+    steps(&bounds.y0, &bounds.y1)
+        .into_iter()
+        .flat_map(|(y0, y1)| {
+            columns
+                .iter()
+                .map(move |(x0, x1)| Bounds::new(x0.clone(), y0.clone(), x1.clone(), y1.clone()))
+        })
+        .collect()
 }
 
 /// Return copies of `paints` for sampling at the pixels of a window at `origin`.
-fn paints_at(paints: &[EncodedPaint], origin: Position) -> Vec<EncodedPaint> {
+fn paints_at(paints: &[EncodedPaint], origin: &Position) -> Vec<EncodedPaint> {
     let to_source = Affine::translate((origin.0.to_f64(), origin.1.to_f64()));
     paints
         .iter()
@@ -1225,27 +1260,6 @@ fn paints_at(paints: &[EncodedPaint], origin: Position) -> Vec<EncodedPaint> {
         .collect()
 }
 
-/// Split `region` into windows on a tile-aligned grid.
-fn window_grid(region: Bounds) -> impl Iterator<Item = Bounds> {
-    let snapped = region.snap_to_tiles();
-    let steps = |start: Coord, end: Coord| {
-        core::iter::successors(Some(start), move |&value| {
-            let next = value + WINDOW_SIZE.into();
-            (next < end).then_some(next)
-        })
-    };
-    steps(snapped.y0, region.y1).flat_map(move |y| {
-        steps(snapped.x0, region.x1).map(move |x| {
-            Bounds::new(
-                x,
-                y,
-                (x + WINDOW_SIZE.into()).min(region.x1),
-                (y + WINDOW_SIZE.into()).min(region.y1),
-            )
-        })
-    })
-}
-
 /// A filter without reach, which is never applied. Wrapping a window's content
 /// in it records the tight bounds of that content and renders it into its own pixmap.
 pub(crate) fn content_filter() -> FilterData {
@@ -1256,33 +1270,6 @@ pub(crate) fn content_filter() -> FilterData {
         }),
         Affine::IDENTITY,
     )
-}
-
-/// Composite the part of a nested filter's output that falls into `window`.
-fn inject(
-    target: &mut SingleThreadedDispatcher,
-    layer: &Layer,
-    filter: &FilterData,
-    node: usize,
-    extents: &Index,
-    window: Bounds,
-    to_window: Affine,
-) {
-    let dest = extents
-        .touching(window)
-        .fold(Bounds::EMPTY, |dest, (_, extent)| {
-            dest.union(extent.intersect(window))
-        })
-        .snap_to_tiles()
-        .to_rect_u16(window.origin());
-    target.push_rendered_filter_layer(
-        layer,
-        layer.mask.clone(),
-        to_window,
-        filter.clone(),
-        dest,
-        node,
-    );
 }
 
 fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Affine) {
@@ -1348,228 +1335,5 @@ fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Af
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::vec;
-    use vello_common::color::palette::css::BLUE;
-    use vello_common::paint::PremulColor;
-
-    /// Record `filters`, each nested in the one before, around `rects` in root
-    /// target coordinates, as `RenderContext` would, and plan them in `view`.
-    fn graph(view: Bounds, filters: &[FilterPrimitive], rects: &[Rect]) -> FilterGraph {
-        let filter_data = |primitive: &FilterPrimitive| {
-            FilterData::new(Filter::from_primitive(primitive.clone()), Affine::IDENTITY)
-        };
-        let mut recording = Recording::new(filter_data(&filters[0]), view, Vec::new());
-        for primitive in &filters[1..] {
-            recording.push_layer(
-                None,
-                Fill::NonZero,
-                Affine::IDENTITY,
-                BlendMode::default(),
-                1.0,
-                None,
-                None,
-                Some(filter_data(primitive)),
-            );
-        }
-        for rect in rects {
-            recording.fill_rect_fast(
-                rect,
-                Paint::Solid(PremulColor::from_alpha_color(BLUE)),
-                BlendMode::default(),
-                None,
-            );
-        }
-        for _ in 0..filters.len() {
-            recording.pop_layer();
-        }
-        recording.finish(Level::fallback())
-    }
-
-    /// What rendering a graph takes.
-    #[derive(Debug, PartialEq)]
-    struct Work {
-        nodes: usize,
-        windows: usize,
-        /// The pixels of the windows replayed in advance.
-        window_pixels: u128,
-        strips: usize,
-        /// The pixels of the pixmaps the filters run on.
-        pixmap_pixels: u128,
-        /// The pixels of the decimated sources, and of the tiles of the
-        /// full-resolution sources they average.
-        decimated_pixels: u128,
-        tile_pixels: u128,
-    }
-
-    fn view() -> Bounds {
-        Bounds::new(0, 0, 64, 64)
-    }
-
-    fn work(graph: &FilterGraph) -> Work {
-        let windows = || graph.nodes.iter().flat_map(|node| &node.windows);
-        let pixmap_pixels = graph
-            .nodes
-            .iter()
-            .flat_map(|node| {
-                let kept = Index::new(node.windows.iter().map(Window::content));
-                let filtered = if node.plan.reduction() == 0 {
-                    kept.clone()
-                } else {
-                    Index::new(node.decimated.iter().copied())
-                };
-                node.plan.pixmaps(&kept, &filtered)
-            })
-            .map(Bounds::area)
-            .sum();
-        let tiles = |node: &Node| {
-            let levels = node.plan.reduction();
-            node.decimated
-                .iter()
-                .flat_map(move |region| {
-                    content_tiles(region.refine(levels), &node.decimated_content)
-                })
-                .map(Bounds::area)
-                .sum::<u128>()
-        };
-        Work {
-            nodes: graph.nodes.len(),
-            windows: windows().count(),
-            window_pixels: windows()
-                .map(|window| {
-                    let (width, height) = window.dispatcher.size();
-                    u128::from(width) * u128::from(height)
-                })
-                .sum(),
-            strips: windows()
-                .map(|window| window.dispatcher.strip_count())
-                .sum(),
-            pixmap_pixels,
-            decimated_pixels: graph
-                .nodes
-                .iter()
-                .flat_map(|node| &node.decimated)
-                .map(|region| region.area())
-                .sum(),
-            tile_pixels: graph.nodes.iter().map(tiles).sum(),
-        }
-    }
-
-    #[test]
-    fn nested_shadows_read_each_source_region_once() {
-        const STEP: f64 = 65_536.0;
-        let shadow = FilterPrimitive::DropShadow {
-            dx: STEP as f32,
-            dy: 0.0,
-            std_deviation: 1.0,
-            color: BLUE,
-            edge_mode: EdgeMode::None,
-        };
-        for depth in 1..=16_usize {
-            let x = 16.0 - STEP * depth as f64;
-            let graph = graph(
-                view(),
-                &vec![shadow.clone(); depth],
-                &[Rect::new(x, 16.0, x + 32.0, 48.0)],
-            );
-            let work = work(&graph);
-            // Each layer reads only the copy that its shadows move into the view.
-            assert_eq!(work.nodes, depth, "depth {depth}");
-            assert_eq!(work.windows, depth, "depth {depth}");
-        }
-    }
-
-    #[test]
-    fn nested_shadows_with_distinct_offsets_read_only_visible_copies() {
-        let shadow = |dx: f64, dy: f64| FilterPrimitive::DropShadow {
-            dx: dx as f32,
-            dy: dy as f32,
-            std_deviation: 0.0,
-            color: BLUE,
-            edge_mode: EdgeMode::None,
-        };
-        let square = Rect::new(16.0, 16.0, 48.0, 48.0);
-        let directions: [fn(f64) -> (f64, f64); 4] = [
-            |step| (step, 0.0),
-            |step| (-step, step),
-            |step| (step, -step),
-            |step| (-step, -step),
-        ];
-        for direction in directions {
-            for depth in 1..=16_usize {
-                // Every subset of the shadows moves the square to its own place,
-                // and only the square itself is visible.
-                let shadows: Vec<_> = (0..depth)
-                    .map(|level| {
-                        let (dx, dy) = direction(256.0 * f64::from(1_u32 << level));
-                        shadow(dx, dy)
-                    })
-                    .collect();
-                let work = work(&graph(view(), &shadows, &[square]));
-                assert_eq!(work.nodes, depth, "depth {depth}");
-                assert!(work.windows <= depth, "depth {depth}: {work:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn moved_source_is_rasterized_only_where_it_is_read() {
-        let blur = FilterPrimitive::GaussianBlur {
-            std_deviation: 4.0,
-            edge_mode: EdgeMode::None,
-        };
-        let work_at = |distance: f64| {
-            let offset = FilterPrimitive::Offset {
-                dx: -distance as f32,
-                dy: -distance as f32,
-            };
-            // A band from the origin to the source that is read, and a square in the nested blur.
-            let band = Rect::new(distance + 4.0, 0.0, distance + 12.0, distance + 64.0);
-            let square = Rect::new(
-                distance + 24.0,
-                distance + 24.0,
-                distance + 48.0,
-                distance + 48.0,
-            );
-            work(&graph(view(), &[offset, blur.clone()], &[band, square]))
-        };
-        // The first distance keeps the source inside the `u16` domain.
-        let near = work_at(96.0);
-        assert!(near.strips > 0);
-        for distance in [4_096.0, 60_000.0, 262_144.0, 16_777_216.0] {
-            assert_eq!(work_at(distance), near, "distance {distance}");
-        }
-    }
-
-    #[test]
-    fn wide_blur_reads_a_bounded_source() {
-        let view = Bounds::new(0, 0, 12, 12);
-        for std_deviation in [4.0_f32, 40.0, 400.0, 4_000.0, 20_000.0] {
-            let blur = FilterPrimitive::GaussianBlur {
-                std_deviation,
-                edge_mode: EdgeMode::None,
-            };
-            let reach = 4.0 * f64::from(std_deviation);
-            let square = Rect::new(-reach, -reach, 12.0 + reach, 12.0 + reach);
-            let graph = graph(view, &[blur], &[square]);
-            let work = work(&graph);
-            assert!(
-                work.window_pixels <= 1 << 20
-                    && work.pixmap_pixels <= 1 << 20
-                    && work.decimated_pixels <= 1 << 20,
-                "sigma {std_deviation}: {work:?}"
-            );
-            // Each pixel of the source within the blur's reach is rendered
-            // once, in tiles.
-            let levels = 2 * graph.nodes[0].plan.reduction();
-            let side = 7.0 * f64::from(std_deviation);
-            assert!(
-                work.tile_pixels == work.decimated_pixels << levels
-                    && work.tile_pixels as f64 <= side * side,
-                "sigma {std_deviation}: {work:?}"
-            );
-        }
-    }
-}
+#[cfg(all(test, feature = "std"))]
+mod tests;

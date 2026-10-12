@@ -21,8 +21,6 @@
 use super::FilterEffect;
 use crate::filter::context::ScratchBuffer;
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::{Bounds, Coord, Position};
-use alloc::vec::Vec;
 use vello_common::filter::gaussian_blur::{DecimationSizer, GaussianBlur};
 use vello_common::filter_effects::EdgeMode;
 use vello_common::peniko::color::PremulRgba8;
@@ -108,170 +106,6 @@ pub(crate) fn apply_blur(
         (width, height),
         "Final dimensions should match original"
     );
-}
-
-/// Return the pixels inside `crop`, in the grid of the output, of a blur whose
-/// last `n_decimations - levels` decimations [`apply_blur`] ran on `blurred`.
-/// The pixels of `blurred` each cover `2^levels` pixels of the output on both
-/// axes, and it starts at `origin` in its grid.
-///
-/// The upscaling back to the output computes on each level only the pixels
-/// that `crop` depends on, so memory and work follow the crop rather than the
-/// output's full extent.
-pub(crate) fn upscale_reduced_blur(
-    blurred: &FilterPixmap,
-    edge_mode: EdgeMode,
-    levels: u32,
-    origin: Position,
-    crop: Bounds,
-) -> FilterPixmap {
-    // The runs each level upscales into, from the output to the level below the pixmap.
-    let mut runs = Vec::with_capacity(levels as usize);
-    let (width, height) = crop.size();
-    let mut x = Run::new(crop.x0, width, origin.0, levels);
-    let mut y = Run::new(crop.y0, height, origin.1, levels);
-    for _ in 0..levels {
-        runs.push((x, y));
-        x = x.source();
-        y = y.source();
-    }
-    let mut patch = patch_of(blurred, x, y, edge_mode);
-    let size = (blurred.width(), blurred.height());
-    for (x, y) in runs.into_iter().rev() {
-        patch = upscale_patch(&patch, x, y, edge_mode, size);
-    }
-    patch
-}
-
-/// A run of pixels along one axis of a level of the blur's pyramid, `shift`
-/// levels finer than the pixmap. It starts at `coarse * 2^shift + sub` relative
-/// to the pixmap's origin, which takes more bits than `i128` holds for the
-/// widest blurs, and may extend past the level: each of its pixels holds the
-/// value the level's edge mode gives that position.
-#[derive(Clone, Copy, Debug)]
-struct Run {
-    coarse: i64,
-    /// Less than `2^shift`.
-    sub: u128,
-    shift: u32,
-    len: u32,
-}
-
-impl Run {
-    /// Return the run of `len` pixels from `start` in a grid `shift` levels
-    /// finer than a pixmap that starts at `origin` in its own grid.
-    fn new(start: Coord, len: u32, origin: Coord, shift: u32) -> Self {
-        Self {
-            coarse: (start.shr(shift) - origin).clamped_i64(),
-            sub: start.low_bits(shift),
-            shift,
-            len,
-        }
-    }
-
-    /// Return whether the start of the run is odd.
-    fn odd(self) -> bool {
-        if self.shift == 0 {
-            self.coarse & 1 == 1
-        } else {
-            self.sub & 1 == 1
-        }
-    }
-
-    /// Return the run of the next coarser level that upscaling this run reads:
-    /// from the pixel before the one under its start to the one after the one
-    /// under its end.
-    fn source(self) -> Self {
-        let shift = self.shift - 1;
-        let (coarse, sub) = match self.sub >> 1 {
-            0 if shift == 0 => (self.coarse - 1, 0),
-            0 => (self.coarse - 1, (1 << shift) - 1),
-            sub => (self.coarse, sub - 1),
-        };
-        Self {
-            coarse,
-            sub,
-            shift,
-            len: (u32::from(self.odd()) + self.len - 1) / 2 + 3,
-        }
-    }
-
-    /// Return whether pixel `index` of the run lies outside its level, which is
-    /// `size` pixels of the pixmap wide.
-    fn outside(self, index: u32, size: u32) -> bool {
-        let coarse = self.coarse + ((self.sub + u128::from(index)) >> self.shift) as i64;
-        coarse < 0 || coarse >= i64::from(size)
-    }
-}
-
-/// Return the pixels of `pixmap` in the runs `x` and `y` of its own level.
-fn patch_of(pixmap: &FilterPixmap, x: Run, y: Run, edge_mode: EdgeMode) -> FilterPixmap {
-    let mut pixels = FilterPixmap::new(x.len, y.len);
-    for row in 0..y.len {
-        let source_y = y.coarse + i64::from(row);
-        for column in 0..x.len {
-            let source_x = x.coarse + i64::from(column);
-            let pixel = sample(source_y, pixmap.height(), edge_mode, |source_y| {
-                sample(source_x, pixmap.width(), edge_mode, |source_x| {
-                    pixmap.sample(source_x, source_y)
-                })
-            });
-            pixels.set_pixel(column, row, pixel);
-        }
-    }
-    pixels
-}
-
-/// Upscale `coarse`, the pixels of a level of the blur's pyramid in the runs
-/// that [`Run::source`] gives for `x` and `y`, into the runs `x` and `y` of the
-/// next finer level, like [`upscale`]. The pixmap is `size` pixels large.
-fn upscale_patch(
-    coarse: &FilterPixmap,
-    x: Run,
-    y: Run,
-    edge_mode: EdgeMode,
-    size: (u32, u32),
-) -> FilterPixmap {
-    let mut wide = FilterPixmap::new(x.len, coarse.height());
-    for row in 0..coarse.height() {
-        for column in 0..x.len {
-            let pixel = if edge_mode == EdgeMode::None && x.outside(column, size.0) {
-                TRANSPARENT_BLACK
-            } else {
-                upsample(x.odd(), column, |index| coarse.sample(index, row))
-            };
-            wide.set_pixel(column, row, pixel);
-        }
-    }
-    let mut pixels = FilterPixmap::new(x.len, y.len);
-    for column in 0..x.len {
-        for row in 0..y.len {
-            let pixel = if edge_mode == EdgeMode::None && y.outside(row, size.1) {
-                TRANSPARENT_BLACK
-            } else {
-                upsample(y.odd(), row, |index| wide.sample(column, index))
-            };
-            pixels.set_pixel(column, row, pixel);
-        }
-    }
-    pixels
-}
-
-/// Return pixel `index` of a run upscaled from `coarse`, the run that
-/// [`Run::source`] gives for it, like [`upscale`]. `odd` tells whether the
-/// run starts at an odd position.
-///
-/// The coarse run holds what the edge mode gives past the edges of its level,
-/// and upscaling past them gives what the edge mode gives on the finer level
-/// for every mode but [`EdgeMode::None`], whose pixels there are transparent.
-fn upsample(odd: bool, index: u32, coarse: impl Fn(u32) -> PremulRgba8) -> PremulRgba8 {
-    let position = u32::from(odd) + index;
-    let center = position / 2 + 1;
-    if position.is_multiple_of(2) {
-        interpolate_25_75(coarse(center - 1), coarse(center))
-    } else {
-        interpolate_75_25(coarse(center), coarse(center + 1))
-    }
 }
 
 /// Apply separable Gaussian convolution with logical dimensions.
@@ -705,7 +539,7 @@ fn extend(coord: i64, size: u32, edge_mode: EdgeMode) -> u32 {
 /// This binomial pattern approximates a Gaussian and contributes variance=0.75 to the blur.
 /// Adds 4 before the shift to implement round-to-nearest instead of floor division.
 #[inline(always)]
-fn decimate_weighted(
+pub(crate) fn decimate_weighted(
     p0: PremulRgba8,
     p1: PremulRgba8,
     p2: PremulRgba8,
@@ -724,7 +558,7 @@ fn decimate_weighted(
 /// Favors the right/next pixel (p1) with 75% weight.
 /// Adds 2 before the shift to implement round-to-nearest instead of floor division.
 #[inline(always)]
-fn interpolate_25_75(p0: PremulRgba8, p1: PremulRgba8) -> PremulRgba8 {
+pub(crate) fn interpolate_25_75(p0: PremulRgba8, p1: PremulRgba8) -> PremulRgba8 {
     let r = ((p0.r as u32 + p1.r as u32 * 3 + 2) >> 2) as u8;
     let g = ((p0.g as u32 + p1.g as u32 * 3 + 2) >> 2) as u8;
     let b = ((p0.b as u32 + p1.b as u32 * 3 + 2) >> 2) as u8;
@@ -738,7 +572,7 @@ fn interpolate_25_75(p0: PremulRgba8, p1: PremulRgba8) -> PremulRgba8 {
 /// Used during upsampling for positions closer to the first pixel.
 /// Adds 2 before the shift to implement round-to-nearest instead of floor division.
 #[inline(always)]
-fn interpolate_75_25(p0: PremulRgba8, p1: PremulRgba8) -> PremulRgba8 {
+pub(crate) fn interpolate_75_25(p0: PremulRgba8, p1: PremulRgba8) -> PremulRgba8 {
     let r = ((p0.r as u32 * 3 + p1.r as u32 + 2) >> 2) as u8;
     let g = ((p0.g as u32 * 3 + p1.g as u32 + 2) >> 2) as u8;
     let b = ((p0.b as u32 * 3 + p1.b as u32 + 2) >> 2) as u8;
@@ -1553,197 +1387,6 @@ mod tests {
                 pixels.data().iter().all(|&pixel| pixel == color),
                 "{width}x{height}"
             );
-        }
-    }
-
-    fn patterned(width: u32, height: u32) -> FilterPixmap {
-        let mut pixmap = FilterPixmap::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                let alpha = ((x / 7 * 89 + y / 5 * 53 + x * y) % 256) as u8;
-                pixmap.set_pixel(
-                    x,
-                    y,
-                    PremulRgba8 {
-                        r: alpha,
-                        g: alpha / 3,
-                        b: ((x * 13 + y * 29) % 256) as u8 & alpha,
-                        a: alpha,
-                    },
-                );
-            }
-        }
-        pixmap
-    }
-
-    /// Return the top-left `width` by `height` pixels of `pixmap`.
-    fn top_left(pixmap: &FilterPixmap, width: u32, height: u32) -> FilterPixmap {
-        let mut result = FilterPixmap::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                result.set_pixel(x, y, pixmap.sample(x, y));
-            }
-        }
-        result
-    }
-
-    fn crop_of(pixmap: &FilterPixmap, crop: Bounds) -> Vec<PremulRgba8> {
-        let mut pixels = Vec::new();
-        let (x0, y0) = (crop.x0.to_i64().unwrap(), crop.y0.to_i64().unwrap());
-        let (width, height) = crop.size();
-        for y in 0..height {
-            for x in 0..width {
-                let at = |start: i64, offset: u32| u32::try_from(start).unwrap() + offset;
-                pixels.push(pixmap.sample(at(x0, x), at(y0, y)));
-            }
-        }
-        pixels
-    }
-
-    fn blur_whole(source: &FilterPixmap, std_deviation: f32, edge_mode: EdgeMode) -> FilterPixmap {
-        let (n_decimations, kernel, count) = plan_decimated_blur(std_deviation);
-        let mut pixmap = top_left(source, source.width(), source.height());
-        let mut scratch = FilterPixmap::new(source.width(), source.height());
-        apply_blur(
-            &mut pixmap,
-            &mut scratch,
-            n_decimations,
-            &kernel[..usize::from(count)],
-            edge_mode,
-        );
-        pixmap
-    }
-
-    fn blur_reduced(
-        mut reduced: FilterPixmap,
-        std_deviation: f32,
-        edge_mode: EdgeMode,
-        levels: u32,
-        crop: Bounds,
-    ) -> FilterPixmap {
-        let (n_decimations, kernel, count) = plan_decimated_blur(std_deviation);
-        let mut scratch = FilterPixmap::new(reduced.width(), reduced.height());
-        apply_blur(
-            &mut reduced,
-            &mut scratch,
-            n_decimations - levels as usize,
-            &kernel[..usize::from(count)],
-            edge_mode,
-        );
-        upscale_reduced_blur(
-            &reduced,
-            edge_mode,
-            levels,
-            (Coord::ZERO, Coord::ZERO),
-            crop,
-        )
-    }
-
-    #[test]
-    fn reduced_blur_of_the_decimated_source_matches_the_whole_blur_for_all_edges() {
-        let (width, height) = (5 << 4, 3 << 4);
-        let source = patterned(width, height);
-        let crops = [
-            Bounds::new(0, 0, i64::from(width), i64::from(height)),
-            Bounds::new(0, 3, 5, 17),
-            Bounds::new(
-                i64::from(width) - 7,
-                i64::from(height) - 1,
-                i64::from(width),
-                i64::from(height),
-            ),
-            Bounds::new(13, 21, 40, 22),
-            Bounds::new(31, 0, 32, i64::from(height)),
-        ];
-        for edge_mode in [
-            EdgeMode::None,
-            EdgeMode::Duplicate,
-            EdgeMode::Wrap,
-            EdgeMode::Mirror,
-        ] {
-            for std_deviation in [3.0, 9.0, 30.0] {
-                let whole = blur_whole(&source, std_deviation, edge_mode);
-                let (n_decimations, ..) = plan_decimated_blur(std_deviation);
-                for levels in 1..=n_decimations.min(4) as u32 {
-                    let mut decimated = top_left(&source, width, height);
-                    let (mut w, mut h) = (width, height);
-                    for _ in 0..levels {
-                        (w, h) = downscale(&mut decimated, w, h, edge_mode);
-                    }
-                    for crop in crops {
-                        let reduced = top_left(&decimated, w, h);
-                        let result = blur_reduced(reduced, std_deviation, edge_mode, levels, crop);
-                        assert_eq!((result.width(), result.height()), crop.size());
-                        assert!(
-                            result.data() == crop_of(&whole, crop),
-                            "{edge_mode:?} sigma {std_deviation} levels {levels} {crop:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// The coarser source of a wide blur averages each block of pixels, as
-    /// rasterizing at the coarser scale does, rather than decimating with the
-    /// blur's binomial filter.
-    #[test]
-    fn reduced_blur_of_the_averaged_source_stays_within_tolerance() {
-        let (width, height) = (3 << 9, 2 << 9);
-        let mut source = FilterPixmap::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                let alpha = if (x / 37 + y / 23) % 2 == 0 { 255 } else { 0 };
-                let red = if x < width / 3 { alpha } else { 0 };
-                source.set_pixel(
-                    x,
-                    y,
-                    PremulRgba8 {
-                        r: red,
-                        g: 0,
-                        b: alpha,
-                        a: alpha,
-                    },
-                );
-            }
-        }
-        for std_deviation in [70.0, 100.0, 150.0, 300.0] {
-            let (n_decimations, ..) = plan_decimated_blur(std_deviation);
-            let levels = (n_decimations - crate::filter::plan::EXACT_DECIMATIONS) as u32;
-            assert!(levels > 0, "sigma {std_deviation}");
-            let whole = blur_whole(&source, std_deviation, EdgeMode::None);
-            let block = 1 << levels;
-            let mut averaged = FilterPixmap::new(width / block, height / block);
-            for y in 0..height / block {
-                for x in 0..width / block {
-                    let mut sums = [0_u32; 4];
-                    for dy in 0..block {
-                        for dx in 0..block {
-                            let p = source.sample(x * block + dx, y * block + dy);
-                            for (sum, value) in sums.iter_mut().zip([p.r, p.g, p.b, p.a]) {
-                                *sum += u32::from(value);
-                            }
-                        }
-                    }
-                    let [r, g, b, a] =
-                        sums.map(|sum| ((sum + block * block / 2) / (block * block)) as u8);
-                    averaged.set_pixel(x, y, PremulRgba8 { r, g, b, a });
-                }
-            }
-            let crop = Bounds::new(0, 0, i64::from(width), i64::from(height));
-            let result = blur_reduced(averaged, std_deviation, EdgeMode::None, levels, crop);
-            let (mut max, mut sum) = (0_u8, 0_u64);
-            for (actual, expected) in result.data().iter().zip(whole.data()) {
-                for (a, e) in [actual.r, actual.g, actual.b, actual.a]
-                    .into_iter()
-                    .zip([expected.r, expected.g, expected.b, expected.a])
-                {
-                    max = max.max(a.abs_diff(e));
-                    sum += u64::from(a.abs_diff(e));
-                }
-            }
-            let mean = sum as f64 / (result.data().len() * 4) as f64;
-            assert!(max <= 1, "sigma {std_deviation}: max {max}, mean {mean:.3}");
         }
     }
 }

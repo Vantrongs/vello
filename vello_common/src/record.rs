@@ -238,6 +238,13 @@ impl<D> CommandRecorder<D> {
         !self.layer_stack.is_empty()
     }
 
+    /// Return the properties of the open layers, outermost first.
+    pub fn open_layers(&self) -> impl Iterator<Item = &LayerProps> + '_ {
+        self.layer_stack
+            .iter()
+            .map(|layer| &self.layers[layer.id as usize].props)
+    }
+
     /// Reset the command recorder.
     #[inline]
     pub fn reset(&mut self, width: u16, height: u16) {

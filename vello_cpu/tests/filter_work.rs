@@ -235,7 +235,13 @@ fn offset_allocates_the_same_however_far_the_source_lies() {
     // The first distance keeps the source inside the `u16` domain, the later
     // ones lie in it, at its end and beyond it.
     let (near, expected) = measure(|| moved_into_view(96.0));
-    assert!(expected.chunks_exact(4).any(|pixel| pixel[3] != 0));
+    assert!(
+        expected
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0)
+    );
     for distance in [4_096.0, 60_000.0, 262_144.0, 16_777_216.0] {
         let (usage, pixels) = measure(|| moved_into_view(distance));
         assert!(pixels == expected, "pixels at distance {distance}");
@@ -243,6 +249,37 @@ fn offset_allocates_the_same_however_far_the_source_lies() {
             usage.peak <= near.peak + near.peak / 4 && usage.total <= near.total + near.total / 4,
             "distance {distance}: {usage:?}, at 96: {near:?}"
         );
+    }
+}
+
+/// Blur, in a 64 by 64 view, a band reaching `length` pixels down from its
+/// top, whose end the blur's edges depend on.
+fn blurred_band(length: f64, edge_mode: EdgeMode) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
+        std_deviation: 4.0,
+        edge_mode,
+    }));
+    context.set_paint(BLUE);
+    context.fill_rect(&Rect::new(20.5, 8.0, 40.5, length));
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn blur_of_a_band_holds_the_same_memory_however_long_it_is() {
+    // Finding where the band ends replays its edges, so the work grows with
+    // its length, but the memory held does not.
+    for edge_mode in [EdgeMode::None, EdgeMode::Duplicate] {
+        let (short, expected) = measure(|| blurred_band(4_096.0, edge_mode));
+        for length in [65_536.0, 1_048_576.0, 16_777_216.0] {
+            let (usage, pixels) = measure(|| blurred_band(length, edge_mode));
+            assert!(pixels == expected, "{edge_mode:?} at length {length}");
+            assert!(
+                usage.peak <= short.peak + short.peak / 4,
+                "{edge_mode:?} at length {length}: {usage:?}, at 4096: {short:?}"
+            );
+        }
     }
 }
 
@@ -275,7 +312,7 @@ fn blur_of_a_square_covering_its_reach_is_opaque() {
             // which hold 99.7% of its weight; the square reaches four.
             let size = 12.0 + 8.0 * f64::from(std_deviation) * scale;
             let (usage, pixels) = measure(|| blurred_square(std_deviation, size, scale));
-            for pixel in pixels.chunks_exact(4) {
+            for pixel in pixels.as_chunks::<4>().0 {
                 assert!(
                     pixel[0] == 0 && pixel[1] == 0 && pixel[2] >= 253 && pixel[3] >= 253,
                     "sigma {std_deviation} at scale {scale}: {pixel:?}"
@@ -483,6 +520,60 @@ fn opposite_shifts_past_any_coordinate_domain_cancel() {
             }
         }
     }
+}
+
+/// Blur, in a 64 by 64 view, squares lying `distance` pixels away from it on
+/// either side with a narrow blur nested in a blur by `std_deviation`.
+fn far_squares_in_nested_blurs(std_deviation: f32, distance: f64) -> Vec<u8> {
+    let blur = |std_deviation| {
+        Filter::from_primitive(FilterPrimitive::GaussianBlur {
+            std_deviation,
+            edge_mode: EdgeMode::None,
+        })
+    };
+    let mut context = context(64, 64);
+    context.push_filter_layer(blur(std_deviation));
+    context.push_filter_layer(blur(100.0));
+    context.set_paint(BLUE);
+    for corner in [-distance, distance] {
+        context.fill_rect(&Rect::new(corner, corner, corner + 64.0, corner + 64.0));
+    }
+    context.pop_layer();
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn blur_nested_in_a_wider_one_holds_the_same_memory_however_wide_that_is() {
+    // The outer blur reads the inner one where it has content, around each
+    // square, not across the whole reach between them.
+    let (narrow, _) = measure(|| far_squares_in_nested_blurs(10_000.0, 25_000.0));
+    for std_deviation in [20_000.0, 1.0e6, 1.0e10] {
+        let (usage, _) = measure(|| far_squares_in_nested_blurs(std_deviation, 25_000.0));
+        assert!(
+            usage.peak <= narrow.peak + narrow.peak / 4,
+            "outer {std_deviation}: {usage:?}, at 10000: {narrow:?}"
+        );
+    }
+}
+
+#[test]
+fn offset_past_f32_in_a_scaled_space_is_not_undone_by_a_smaller_one() {
+    // The inner offset moves the square by twice `f32::MAX` in the target's
+    // space, and the outer one back by `f32::MAX`, which leaves it out of view.
+    let offset = |distance: f32| FilterPrimitive::Offset {
+        dx: distance,
+        dy: distance,
+    };
+    let mut context = context(64, 64);
+    context.push_filter_layer(Filter::from_primitive(offset(-f32::MAX)));
+    context.set_transform(Affine::scale(2.0));
+    context.push_filter_layer(Filter::from_primitive(offset(f32::MAX)));
+    context.set_paint(BLUE);
+    context.fill_rect(&Rect::new(8.0, 8.0, 24.0, 24.0));
+    context.pop_layer();
+    context.pop_layer();
+    assert!(render(context).iter().all(|&value| value == 0));
 }
 
 /// Render, in a 64 by 64 view under an offset by `-far`, a red shadow of a

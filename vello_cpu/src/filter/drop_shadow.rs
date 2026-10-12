@@ -12,9 +12,9 @@
 //! 5. Composite shadow with original graphic
 //!
 //! The filter itself performs steps 1, 3 and 4 in place. Moving the shadow and
-//! compositing the original happen when the layer's output is assembled, see
-//! [`FilterPlan`](crate::filter::plan::FilterPlan), so that the shadow's
-//! pixmap does not have to span the offset.
+//! compositing the original happen where the layer's output is computed, see
+//! [`FilterGraph`](crate::dispatch::filter_graph::FilterGraph), so that only
+//! the visible part of the shadow is computed.
 //!
 //! @see <https://drafts.fxtf.org/filter-effects-2/#feDropShadowElement>
 
