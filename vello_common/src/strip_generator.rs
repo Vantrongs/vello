@@ -11,6 +11,7 @@ use crate::kurbo::{Affine, PathEl, Rect, Stroke};
 use crate::peniko::Fill;
 use crate::strip::Strip;
 use crate::tile::Tiles;
+use crate::util::strip_bbox;
 use crate::{flatten, rect, strip};
 use alloc::vec::Vec;
 use peniko::kurbo::StrokeCtx;
@@ -266,11 +267,36 @@ impl StripGenerator {
     }
 }
 
+/// Whether `strips` lie entirely where `clip` is proven fully opaque, so intersecting
+/// them with it would change nothing.
+pub(crate) fn within_opaque_clip(clip: &PathDataRef<'_>, strips: &[Strip]) -> bool {
+    clip.opaque_bbox.is_some_and(|opaque| {
+        strip_bbox(strips).is_some_and(|draw| {
+            opaque.x0 <= draw.x0
+                && opaque.y0 <= draw.y0
+                && opaque.x1 >= draw.x1
+                && opaque.y1 >= draw.y1
+        })
+    })
+}
+
+/// Appends the strips of `source` to `target`, rebasing their alpha indices.
+fn append_rebased(target: &mut StripStorage, source: &StripStorage) {
+    let alpha_offset = target.alphas.len() as u32;
+    target.strips.extend(source.strips.iter().map(|strip| {
+        let mut strip = *strip;
+        strip.set_alpha_idx(strip.alpha_idx() + alpha_offset);
+        strip
+    }));
+    target.alphas.extend_from_slice(&source.alphas);
+}
+
 /// Render strips via `render_fn` with optional clip intersection.
 ///
 /// When `clip_path` is `Some`, strips are rendered into `temp_storage` first, then
-/// intersected with the clip mask into `strip_storage`. Otherwise strips are rendered
-/// directly into `strip_storage`.
+/// intersected with the clip mask into `strip_storage`, unless all their coverage is
+/// within a proven opaque part of the mask. Otherwise strips are rendered directly
+/// into `strip_storage`.
 fn render_with_clip(
     level: Level,
     temp_storage: &mut StripStorage,
@@ -289,10 +315,16 @@ fn render_with_clip(
 
         render_fn(&mut temp_storage.strips, &mut temp_storage.alphas);
 
+        if within_opaque_clip(&clip_path, &temp_storage.strips) {
+            append_rebased(strip_storage, temp_storage);
+            return;
+        }
+
         let path_data = PathDataRef {
             strips: &temp_storage.strips,
             alphas: &temp_storage.alphas,
             bbox: RectU16::new(0, 0, u16::MAX, u16::MAX),
+            opaque_bbox: None,
         };
         intersect(level, clip_path, path_data, strip_storage);
     } else {
