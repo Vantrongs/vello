@@ -26,6 +26,52 @@ pub(crate) fn pixel_size(level: u32) -> f64 {
     (0..level).fold(1.0, |size, _| size * 2.0)
 }
 
+/// A whole number of pixels, `high * 2^64 + low` with `low` in `0..2^64`, so
+/// that the offsets of any number of filters, each up to `f32::MAX`, add up
+/// exactly and opposite ones cancel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Shift {
+    high: i128,
+    low: i128,
+}
+
+impl Shift {
+    /// Return the whole number of pixels `value`.
+    pub(crate) fn of(value: f32) -> Self {
+        // An `f32` this large is a multiple of `2^64`, and `i128` holds the rest exactly.
+        if value.abs() >= (1_u128 << 126) as f32 {
+            Self {
+                high: (value / (1_u128 << 64) as f32) as i128,
+                low: 0,
+            }
+        } else {
+            Self::normalized(0, value as i128)
+        }
+    }
+
+    fn normalized(high: i128, low: i128) -> Self {
+        Self {
+            high: high + (low >> 64),
+            low: low & i128::from(u64::MAX),
+        }
+    }
+
+    pub(crate) fn add(self, other: Self) -> Self {
+        Self::normalized(self.high + other.high, self.low + other.low)
+    }
+
+    /// Return the number, saturated at `±i64::MAX`, which lie beyond the
+    /// domain of every grid and can be negated.
+    pub(crate) fn saturated(self) -> i64 {
+        let value = self
+            .high
+            .checked_mul(1 << 64)
+            .and_then(|high| high.checked_add(self.low))
+            .unwrap_or(if self.high < 0 { i128::MIN } else { i128::MAX });
+        value.clamp((-i64::MAX).into(), i64::MAX.into()) as i64
+    }
+}
+
 /// A rectangle in a pixel grid, with coordinates in `-LIMIT..=LIMIT`: whatever
 /// lies outside that domain is cut off. Empty rectangles are normalized to
 /// [`Bounds::EMPTY`], so their width and height are never negative.
@@ -477,7 +523,7 @@ impl PlacedPixmap {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bounds, Regions};
+    use super::{Bounds, Regions, Shift};
     use alloc::vec::Vec;
 
     /// Merge like [`Regions::insert`], comparing with every member.
@@ -492,6 +538,24 @@ mod tests {
             bounds = bounds.union(regions.swap_remove(index));
         }
         regions.push(bounds);
+    }
+
+    #[test]
+    fn shifts_add_up_exactly() {
+        let sum = |values: &[f32]| {
+            values
+                .iter()
+                .fold(Shift::default(), |sum, &value| sum.add(Shift::of(value)))
+                .saturated()
+        };
+        let big = 2.0_f32.powi(127);
+        assert_eq!(sum(&[f32::MAX, 1.0, -f32::MAX]), 1);
+        assert_eq!(sum(&[-f32::MAX, -3.0, f32::MAX, f32::MAX, -f32::MAX]), -3);
+        assert_eq!(sum(&[big, -f32::MAX, big, -(2.0_f32.powi(104))]), 0);
+        assert_eq!(sum(&[f32::MAX, f32::MAX]), i64::MAX);
+        assert_eq!(sum(&[-f32::MAX, -f32::MAX, -f32::MAX]), -i64::MAX);
+        assert_eq!(sum(&[-1.5e9, 2.5e9]), 1_000_000_000);
+        assert_eq!(sum(&[9.0e18, 9.0e18, -9.0e18]), 9_000_000_202_358_128_640);
     }
 
     #[test]

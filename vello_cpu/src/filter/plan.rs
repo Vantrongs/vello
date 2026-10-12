@@ -24,7 +24,7 @@ use crate::filter::context::ScratchBuffer;
 use crate::filter::drop_shadow::source_over;
 use crate::filter::filter_reduced;
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::{Bounds, Index, Pieces, PlacedPixmap, Regions, pixel_size};
+use crate::filter::placed::{Bounds, Index, Pieces, PlacedPixmap, Regions, Shift, pixel_size};
 use crate::kurbo::Affine;
 use alloc::vec::Vec;
 use vello_common::filter::{FilterData, PreparedFilter};
@@ -57,25 +57,40 @@ pub(crate) struct Reach {
 #[derive(Clone, Copy, Debug)]
 enum Effect {
     /// Filtered as a whole in a pixmap around the source it reads, with
-    /// paddings in the grid of that source.
+    /// paddings in the grid of that source, and moved by `offset` in the
+    /// output's grid.
     Whole {
         source_padding: PaddingU64,
         filter_padding: PaddingU64,
+        offset: (i64, i64),
     },
     /// Moved by `offset` in the output's grid, see the module documentation,
     /// after a blur that reads `blur_padding` around each pixel in the grid of
-    /// the source it reads.
+    /// the source it reads. The source it keeps is moved by `kept`.
     Displaced {
         offset: (i64, i64),
+        kept: (i64, i64),
         blur_padding: PaddingU64,
         keeps_source: bool,
     },
 }
 
+/// The offset of `filter` in the grid of root target pixels `2^level` wide, if it moves its source.
+fn offset_at(filter: &FilterData, level: u32) -> (Shift, Shift) {
+    filter_at(filter, level)
+        .displacement()
+        .map_or_else(Default::default, |displacement| {
+            let (dx, dy) = displacement.offset;
+            (Shift::of(dx), Shift::of(dy))
+        })
+}
+
 impl Reach {
     /// Return how `filter`, whose parameters are in the root grid, reads and
-    /// writes in the grid of root target pixels `2^level` wide.
-    pub(crate) fn new(filter: &FilterData, level: u32) -> Self {
+    /// writes in the grid of root target pixels `2^level` wide, with its output
+    /// moved further by the offset filters `shifts`. Unless `moves` is set, the
+    /// offset of `filter` itself is left out.
+    pub(crate) fn new(filter: &FilterData, level: u32, shifts: &[FilterData], moves: bool) -> Self {
         let output = filter_at(filter, level);
         let decimations = match PreparedFilter::new(&output.filter, &output.transform) {
             PreparedFilter::GaussianBlur(blur) => blur.n_decimations,
@@ -90,15 +105,33 @@ impl Reach {
         } else {
             filter_at(filter, level + reduction)
         };
+        // Offsets are summed before they are narrowed, so that opposite ones
+        // cancel however far they reach.
+        let shift = shifts
+            .iter()
+            .map(|shift| offset_at(shift, level))
+            .fold(<(Shift, Shift)>::default(), |(x, y), (dx, dy)| {
+                (x.add(dx), y.add(dy))
+            });
+        let narrow = |(x, y): (Shift, Shift)| (x.saturated(), y.saturated());
         let effect = match (output.displacement(), source.displacement()) {
-            (Some(displacement), Some(coarse)) => Effect::Displaced {
-                offset: displacement.offset,
-                blur_padding: coarse.blur_padding,
-                keeps_source: displacement.keeps_source,
-            },
+            (Some(displacement), Some(coarse)) => {
+                let own = if moves {
+                    offset_at(filter, level)
+                } else {
+                    Default::default()
+                };
+                Effect::Displaced {
+                    offset: narrow((shift.0.add(own.0), shift.1.add(own.1))),
+                    kept: narrow(shift),
+                    blur_padding: coarse.blur_padding,
+                    keeps_source: displacement.keeps_source,
+                }
+            }
             _ => Effect::Whole {
                 source_padding: source.source_padding,
                 filter_padding: source.filter_padding,
+                offset: narrow(shift),
             },
         };
         Self {
@@ -118,27 +151,28 @@ impl Reach {
     /// keeps, in the output's grid, and the part the filter reads,
     /// [`Self::reduction`] steps coarser.
     pub(crate) fn reads(&self, output: Bounds) -> (Bounds, Bounds) {
+        let (dx, dy) = self.offset();
+        let moved = output.translate((-dx, -dy)).coarsen(self.reduction);
         match self.effect {
-            Effect::Whole { source_padding, .. } => (
-                Bounds::EMPTY,
-                output.coarsen(self.reduction).expand(source_padding),
-            ),
+            Effect::Whole { source_padding, .. } => (Bounds::EMPTY, moved.expand(source_padding)),
             Effect::Displaced {
-                offset: (dx, dy),
+                kept: (kx, ky),
                 blur_padding,
                 keeps_source,
+                ..
             } => {
-                let moved = output
-                    .translate((-dx, -dy))
-                    .coarsen(self.reduction)
-                    .expand(blur_padding);
-                (if keeps_source { output } else { Bounds::EMPTY }, moved)
+                let kept = if keeps_source {
+                    output.translate((-kx, -ky))
+                } else {
+                    Bounds::EMPTY
+                };
+                (kept, moved.expand(blur_padding))
             }
         }
     }
 
-    /// Return whether the output holds the source unmoved, where [`Self::reads`]
-    /// places the part it keeps.
+    /// Return whether the output holds a copy of the source moved only by
+    /// [`Self::kept_offset`], where [`Self::reads`] places the part it keeps.
     pub(crate) fn keeps_source(&self) -> bool {
         matches!(
             self.effect,
@@ -162,8 +196,15 @@ impl Reach {
     /// Return by how much the filtered source is moved.
     fn offset(&self) -> (i64, i64) {
         match self.effect {
+            Effect::Whole { offset, .. } | Effect::Displaced { offset, .. } => offset,
+        }
+    }
+
+    /// Return by how much the kept source is moved.
+    pub(crate) fn kept_offset(&self) -> (i64, i64) {
+        match self.effect {
             Effect::Whole { .. } => (0, 0),
-            Effect::Displaced { offset, .. } => offset,
+            Effect::Displaced { kept, .. } => kept,
         }
     }
 
@@ -202,7 +243,7 @@ struct Layout {
     filtered: Bounds,
     /// The filtered output, in the output's grid before it is moved.
     result: Bounds,
-    /// The kept source, in the output's grid.
+    /// The kept source, in the output's grid before it is moved.
     kept: Bounds,
     /// Where the output has content.
     extent: Bounds,
@@ -274,8 +315,8 @@ impl FilterPlan {
                     pixmap.copy_from(&result.translate(self.reach.offset()), layout.extent);
                 }
                 if !layout.kept.is_empty() {
-                    let kept = kept.crop(layout.kept);
-                    pixmap.combine(&kept, layout.kept, source_over);
+                    let kept = kept.crop(layout.kept).translate(self.reach.kept_offset());
+                    pixmap.combine(&kept, kept.bounds, source_over);
                 }
                 pixmap
             })
@@ -316,7 +357,9 @@ impl FilterPlan {
             filtered: pixmap,
             result,
             kept,
-            extent: result.translate((dx, dy)).union(kept),
+            extent: result
+                .translate((dx, dy))
+                .union(kept.translate(self.reach.kept_offset())),
         }
     }
 

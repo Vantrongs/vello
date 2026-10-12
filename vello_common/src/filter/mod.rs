@@ -348,7 +348,7 @@ impl FilterData {
             edge_mode: EdgeMode::None,
         };
         Some(Displacement {
-            offset: (round(dx) as i64, round(dy) as i64),
+            offset: (round(dx), round(dy)),
             blur_padding: snapped_padding(blur.filter_expansion()),
             keeps_source: matches!(primitive, FilterPrimitive::DropShadow { .. }),
         })
@@ -360,11 +360,11 @@ impl FilterData {
 /// The output is a copy of the source moved by whole device pixels, blurred
 /// and recolored first for a drop shadow, with the source itself composited
 /// over it when `keeps_source` is set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Displacement {
-    /// The translation of the moved copy, rounded half away from zero and
-    /// saturated at the bounds of `i64`.
-    pub offset: (i64, i64),
+    /// The translation of the moved copy in whole device pixels, rounded half
+    /// away from zero.
+    pub offset: (f32, f32),
     /// How far the blur of the moved copy reads around each pixel; zero for an offset.
     pub blur_padding: PaddingU64,
     /// Whether the unmoved source is composited over the moved copy.
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn offset_displacement_rounds_half_away_from_zero_in_device_space() {
-        for (amount, rounded) in [(-4.5, -5), (-0.5, -1), (0.5, 1), (4.5, 5)] {
+        for (amount, rounded) in [(-4.5, -5.0), (-0.5, -1.0), (0.5, 1.0), (4.5, 5.0)] {
             assert_eq!(
                 offset(amount, -amount).displacement(),
                 Some(Displacement {
@@ -614,7 +614,7 @@ mod tests {
             Filter::from_primitive(FilterPrimitive::Offset { dx: 1.5, dy: 0.0 }),
             Affine::scale(2.0),
         );
-        assert_eq!(scaled.displacement().unwrap().offset, (3, 0));
+        assert_eq!(scaled.displacement().unwrap().offset, (3.0, 0.0));
         assert_eq!(
             FilterData::new(blur(1.0), Affine::IDENTITY).displacement(),
             None
@@ -649,7 +649,7 @@ mod tests {
             assert_eq!(
                 data.displacement(),
                 Some(Displacement {
-                    offset: (3, -140_000),
+                    offset: (3.0, -140_000.0),
                     blur_padding: PaddingU64::new(48, 48, 48, 48),
                     keeps_source,
                 })
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(sides(data.source_padding), (u64::MAX, 0, 0, u64::MAX));
         assert_eq!(sides(data.filter_padding), (0, u64::MAX, u64::MAX, 0));
         assert_eq!(data.source_viewport_size(4, 4), None);
-        assert_eq!(data.displacement().unwrap().offset, (i64::MAX, i64::MIN));
+        assert_eq!(data.displacement().unwrap().offset, (f32::MAX, -f32::MAX));
     }
 
     #[test]
@@ -715,6 +715,63 @@ mod tests {
             assert_eq!((prepared.dx, prepared.dy), expected, "{transform:?}");
             let data = FilterData::new(offset, transform);
             assert!(data.displacement().is_some(), "{transform:?}");
+        }
+    }
+
+    #[test]
+    fn paddings_cover_the_offset_under_any_finite_transform() {
+        let coefficients = [
+            f64::MAX,
+            -f64::MAX,
+            f64::MAX / 3.0,
+            -1.0e300,
+            1.0,
+            -0.5,
+            0.0,
+        ];
+        let amounts = [2.0, -3.0, 0.0, 1.0e30, -f32::MAX, f32::MAX];
+        // Where the padding of `extent`, in whole pixels, has to reach.
+        let reach = |extent: f64| {
+            if extent >= u64::MAX as f64 {
+                u64::MAX
+            } else {
+                extent.max(0.0).ceil() as u64
+            }
+        };
+        let pick = |index: usize| coefficients[index % coefficients.len()];
+        for index in 0..coefficients.len().pow(4) {
+            let n = coefficients.len();
+            let [a, b, c, d] = [index, index / n, index / n / n, index / n / n / n].map(pick);
+            let transform = Affine::new([a, b, c, d, 0.0, 0.0]);
+            for index in 0..amounts.len().pow(2) {
+                let (dx, dy) = (
+                    amounts[index % amounts.len()],
+                    amounts[index / amounts.len()],
+                );
+                let data = FilterData::new(
+                    Filter::from_primitive(FilterPrimitive::Offset { dx, dy }),
+                    transform,
+                );
+                // The device offset without overflow: each term is at most
+                // `f64::MAX` times a finite `f32`, so a quarter of each fits.
+                let device = |x: f64, y: f64| {
+                    let quarter = x / 4.0 * f64::from(dx) + y / 4.0 * f64::from(dy);
+                    if quarter.abs() > f64::MAX / 4.0 {
+                        f64::INFINITY.copysign(quarter)
+                    } else {
+                        quarter * 4.0
+                    }
+                };
+                let (x, y) = (device(a, c), device(b, d));
+                let padding = data.filter_padding;
+                assert!(
+                    padding.right >= reach(x)
+                        && padding.left >= reach(-x)
+                        && padding.bottom >= reach(y)
+                        && padding.top >= reach(-y),
+                    "{transform:?}, {dx}, {dy}: {padding:?}"
+                );
+            }
         }
     }
 

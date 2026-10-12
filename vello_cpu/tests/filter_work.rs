@@ -345,3 +345,94 @@ fn copies_moved_past_any_coordinate_domain_leave_the_view_as_it_is() {
         );
     }
 }
+
+/// Render a square in a 64 by 64 view inside `filters`, each nested in the one
+/// before, under a transform scaling by `scale`.
+fn nested_in(filters: &[FilterPrimitive], scale: f64) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.set_transform(Affine::scale(scale));
+    for filter in filters {
+        context.push_filter_layer(Filter::from_primitive(filter.clone()));
+    }
+    context.set_paint(BLUE);
+    context.fill_rect(&Rect::new(16.0, 16.0, 48.0, 48.0).scale_from_origin(1.0 / scale));
+    for _ in filters {
+        context.pop_layer();
+    }
+    render(context)
+}
+
+#[test]
+fn opposite_shifts_past_any_coordinate_domain_cancel() {
+    let offset = |distance: f32| FilterPrimitive::Offset {
+        dx: distance,
+        dy: -distance,
+    };
+    let shadow = |distance: f32, std_deviation: f32, keeps_source: bool| {
+        let color = AlphaColor::from_rgba8(255, 0, 0, 255);
+        let (dx, dy, edge_mode) = (distance, -distance, EdgeMode::None);
+        if keeps_source {
+            FilterPrimitive::DropShadow {
+                dx,
+                dy,
+                std_deviation,
+                color,
+                edge_mode,
+            }
+        } else {
+            FilterPrimitive::DropShadowOnly {
+                dx,
+                dy,
+                std_deviation,
+                color,
+                edge_mode,
+            }
+        }
+    };
+    let blur = FilterPrimitive::GaussianBlur {
+        std_deviation: 2.0,
+        edge_mode: EdgeMode::None,
+    };
+    // At larger scales, every distance exceeds `f32` in the target's space.
+    for scale in [1.0, 4.0, 1.0e30] {
+        for far in [3.2e9, 1.0e19, f32::MAX] {
+            for std_deviation in [0.0, 2.0] {
+                // Each nesting, and the same without the moves that cancel.
+                let cases = [
+                    (vec![offset(far), offset(-far)], vec![]),
+                    (
+                        vec![offset(-far), offset(4.0), offset(far)],
+                        vec![offset(4.0)],
+                    ),
+                    (
+                        vec![offset(far), blur.clone(), offset(-far)],
+                        vec![blur.clone()],
+                    ),
+                    (
+                        vec![offset(far), shadow(-far, std_deviation, true)],
+                        vec![shadow(0.0, std_deviation, false)],
+                    ),
+                    (
+                        vec![shadow(far, std_deviation, true), offset(-far)],
+                        vec![shadow(0.0, std_deviation, false)],
+                    ),
+                    (
+                        vec![offset(-far), shadow(far, std_deviation, false), offset(4.0)],
+                        vec![shadow(4.0, std_deviation, false)],
+                    ),
+                ];
+                for (filters, reference) in cases {
+                    let expected = nested_in(&reference, scale);
+                    assert!(
+                        expected.iter().any(|&value| value != 0) || scale > 4.0,
+                        "{reference:?}"
+                    );
+                    assert!(
+                        nested_in(&filters, scale) == expected,
+                        "{filters:?} at scale {scale}"
+                    );
+                }
+            }
+        }
+    }
+}

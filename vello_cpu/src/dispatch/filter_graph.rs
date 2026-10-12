@@ -205,6 +205,7 @@ impl Recording {
             self.clips,
             &mut layers,
         );
+        fold_far_shifts(&self.commands, &mut layers);
         FilterGraph::new(&self.commands, &layers, self.view, level)
     }
 }
@@ -361,6 +362,11 @@ struct GraphLayer {
     /// A rectangle in root target coordinates that holds everything the
     /// layer's own commands draw, if they draw anything.
     drawn: Option<Rect>,
+    /// Offset filters of other layers that move this layer's output, see [`fold_far_shifts`].
+    shifts: Vec<FilterData>,
+    /// Whether the layer's own offset moves its output, which is not the case
+    /// once it is folded into another layer.
+    moves: bool,
 }
 
 /// A filter layer nested directly in another.
@@ -399,6 +405,8 @@ fn parse(
         steps: Vec::new(),
         children: Vec::new(),
         drawn: None,
+        shifts: Vec::new(),
+        moves: true,
     });
     let mut active_clips = clips.clone();
     let mut clip_bounds = ClipBounds::new(&clips);
@@ -449,6 +457,96 @@ fn parse(
     layer.children = children;
     layer.drawn = drawn;
     index
+}
+
+/// The sum of the offsets of a chain of layers, in root target pixels, from
+/// which [`fold_far_shifts`] folds them: below it, the copies the chain moves
+/// stay far inside the coordinate domain of [`Bounds`].
+const FAR: f64 = (1_u64 << 59) as f64;
+
+/// Fold the offsets of each chain of layers that pass the output of the next
+/// one on unchanged, and together move it by at least [`FAR`], into one layer
+/// of the chain: into its first layer that does more than move its source and
+/// whose own offset reaches that far, else its first layer that does more,
+/// else its last layer.
+///
+/// Every filter moves its output with its source, so the chain's output stays
+/// the same, but opposite offsets now cancel before the copy they move is cut
+/// off at the edge of the domain. Chains moved less keep their offsets where
+/// they are, because a filter's pixmap is anchored where its source has
+/// content, and moving that changes the decimation of a blur.
+fn fold_far_shifts(commands: &[Command], layers: &mut [GraphLayer]) {
+    let next: Vec<Option<usize>> = layers
+        .iter()
+        .map(|layer| passed_on(commands, layer))
+        .collect();
+    let mut inner = vec![false; layers.len()];
+    for &child in next.iter().flatten() {
+        inner[child] = true;
+    }
+    let offset = |layer: &GraphLayer| {
+        let [FilterPrimitive::Offset { .. }] = layer.filter.filter.graph.primitives.as_slice()
+        else {
+            return None;
+        };
+        layer
+            .filter
+            .displacement()
+            .map(|displacement| displacement.offset)
+    };
+    let far = |offset: Option<(f32, f32)>| {
+        offset.map_or(0.0, |(dx, dy)| f64::from(dx.abs()) + f64::from(dy.abs()))
+    };
+    for first in (0..layers.len()).filter(|&layer| !inner[layer]) {
+        let mut chain = vec![first];
+        while let Some(child) = next[*chain.last().unwrap()] {
+            chain.push(child);
+        }
+        let moved: f64 = chain.iter().map(|&layer| far(offset(&layers[layer]))).sum();
+        if moved < FAR {
+            continue;
+        }
+        let filters = || {
+            chain
+                .iter()
+                .copied()
+                .filter(|&layer| offset(&layers[layer]).is_none())
+        };
+        let own = |layer: usize| {
+            far(layers[layer]
+                .filter
+                .displacement()
+                .map(|displacement| displacement.offset))
+        };
+        let target = filters()
+            .find(|&layer| own(layer) >= FAR)
+            .or_else(|| filters().next())
+            .unwrap_or(*chain.last().unwrap());
+        for &layer in &chain {
+            if layer != target && offset(&layers[layer]).is_some() {
+                let filter = layers[layer].filter.clone();
+                layers[target].shifts.push(filter);
+                layers[layer].moves = false;
+            }
+        }
+    }
+}
+
+/// Return the filter layer whose output `layer` takes as its source as it is:
+/// its only content, composited without clips, masks, opacity or blending.
+fn passed_on(commands: &[Command], layer: &GraphLayer) -> Option<usize> {
+    let [Step::Nested { layer: child, push }] = layer.steps.as_slice() else {
+        return None;
+    };
+    let Command::PushLayer(pushed) = &commands[*push] else {
+        unreachable!("a nested layer starts with its push");
+    };
+    let plain = layer.clips.is_empty()
+        && pushed.clip_path.is_none()
+        && pushed.mask.is_none()
+        && pushed.opacity == 1.0
+        && pushed.blend_mode == BlendMode::default();
+    plain.then_some(*child)
 }
 
 /// Apply `command` to `clips` and return whether it pushes or pops a clip.
@@ -683,7 +781,7 @@ fn plan(layers: &[GraphLayer], view: Bounds) -> Vec<Planned> {
     let mut index = BTreeMap::new();
     for (layer_index, layer) in layers.iter().enumerate() {
         for (level, hull) in core::mem::take(&mut hulls[layer_index]) {
-            let reach = Reach::new(&layer.filter, level);
+            let reach = Reach::new(&layer.filter, level, &layer.shifts, layer.moves);
             for (level, source) in source_levels(&reach, level, hull) {
                 for child in &layer.children {
                     let child_hull = hulls[child.layer].entry(level).or_insert(Bounds::EMPTY);
@@ -724,7 +822,7 @@ fn plan(layers: &[GraphLayer], view: Bounds) -> Vec<Planned> {
         }
         if reach.keeps_source() {
             for region in kept.iter() {
-                content.insert(region);
+                content.insert(region.translate(reach.kept_offset()));
             }
         }
         let need = &mut needs[node];
