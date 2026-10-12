@@ -237,7 +237,7 @@ impl ClipState {
     /// Push a new root viewport.
     pub fn push_root_viewport(
         &mut self,
-        source_shift: (u16, u16),
+        source_shift: (u32, u32),
         strip_generator: &mut StripGenerator,
     ) {
         let parent_context = core::mem::replace(&mut self.context, self.context_pool.take());
@@ -327,7 +327,8 @@ impl ClipState {
         self.revision = 0;
     }
 
-    fn active_shift(&self) -> Affine {
+    /// Translation from root target coordinates to the active root viewport.
+    pub(crate) fn active_shift(&self) -> Affine {
         self.frames
             .last()
             .map_or(Affine::IDENTITY, |frame| frame.source_shift)

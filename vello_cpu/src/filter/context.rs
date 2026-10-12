@@ -1,6 +1,7 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use crate::filter::pixmap::FilterPixmap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use vello_common::pixmap::Pixmap;
@@ -38,7 +39,7 @@ impl FilterContext {
 
 #[derive(Debug, Default)]
 pub(crate) struct ScratchBuffer {
-    scratch_buffer: Option<Pixmap>,
+    scratch_buffer: Option<FilterPixmap>,
 }
 
 impl ScratchBuffer {
@@ -46,10 +47,10 @@ impl ScratchBuffer {
         Self::default()
     }
 
-    pub(crate) fn get_scratch_buffer(&mut self, width: u16, height: u16) -> &mut Pixmap {
+    pub(crate) fn get_scratch_buffer(&mut self, width: u32, height: u32) -> &mut FilterPixmap {
         match &mut self.scratch_buffer {
             None => {
-                self.scratch_buffer = Some(Pixmap::new(width, height));
+                self.scratch_buffer = Some(FilterPixmap::new(width, height));
             }
             Some(buf) if buf.width() < width || buf.height() < height => {
                 buf.resize(width, height);

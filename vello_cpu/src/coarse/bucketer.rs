@@ -391,9 +391,6 @@ impl CommandBucketer {
         }
 
         self.active_layers.push(ActiveLayer {
-            // TODO: Masks are currently probably broken if they are used inside of a filter layer,
-            // since they aren't shifted and also only work if the mask has the same dimensions as
-            // our allocated filter layer.
             mask: props.mask.clone(),
             blend_mode: props.blend_mode,
             opacity: props.opacity,

@@ -15,8 +15,11 @@ mod image;
 
 use crate::filter::context::ScratchBuffer;
 use crate::filter::filter_lowp;
+use crate::filter::pixmap::FilterPixmap;
 use crate::fine::lowp::image::{BilinearImagePainter, PlainBilinearImagePainter};
-use crate::fine::{COLOR_COMPONENTS, FineKernel, Painter, Splat4thExt, TILE_HEIGHT_COMPONENTS};
+use crate::fine::{
+    COLOR_COMPONENTS, FineKernel, Painter, Splat4thExt, TILE_HEIGHT_COMPONENTS, sample_mask,
+};
 use crate::peniko::BlendMode;
 use crate::region::Region;
 use crate::util::NormalizedMulExt;
@@ -25,8 +28,7 @@ use bytemuck::{cast_slice, cast_slice_mut};
 use core::iter;
 use vello_common::encode::{EncodedGradient, EncodedImage};
 use vello_common::fearless_simd::*;
-use vello_common::filter_effects::Filter;
-use vello_common::kurbo::Affine;
+use vello_common::filter::PreparedFilter;
 use vello_common::mask::Mask;
 use vello_common::paint::{PremulColor, Tint, TintMode};
 use vello_common::pixmap::Pixmap;
@@ -56,12 +58,11 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
         reason = "`FineKernel` is public but this specific method is not needed."
     )]
     fn filter_layer(
-        pixmap: &mut Pixmap,
-        filter: &Filter,
+        pixmap: &mut FilterPixmap,
+        filter: PreparedFilter,
         filter_scratch: &mut ScratchBuffer,
-        transform: Affine,
     ) {
-        filter_lowp(filter, pixmap, filter_scratch, transform);
+        filter_lowp(filter, pixmap, filter_scratch);
     }
 
     /// Fills a buffer with a solid color using SIMD operations.
@@ -241,8 +242,8 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        mut start_x: usize,
-        start_y: u16,
+        mut start_x: i64,
+        start_y: i64,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
         alphas: Option<&[u8]>,
@@ -251,24 +252,16 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
         let alpha_iter = alphas.map(|a| cast_slice::<u8, [u8; 8]>(a).iter().copied());
 
         let mask_iter = mask.map(|m| {
-            iter::from_fn(|| {
-                let sample = |x: usize, y: u16| {
-                    if x < usize::from(m.width()) && y < m.height() {
-                        m.sample(u16::try_from(x).unwrap(), y)
-                    } else {
-                        255
-                    }
-                };
-
+            iter::from_fn(move || {
                 let samples = [
-                    sample(start_x, start_y),
-                    sample(start_x, start_y + 1),
-                    sample(start_x, start_y + 2),
-                    sample(start_x, start_y + 3),
-                    sample(start_x + 1, start_y),
-                    sample(start_x + 1, start_y + 1),
-                    sample(start_x + 1, start_y + 2),
-                    sample(start_x + 1, start_y + 3),
+                    sample_mask(m, start_x, start_y),
+                    sample_mask(m, start_x, start_y + 1),
+                    sample_mask(m, start_x, start_y + 2),
+                    sample_mask(m, start_x, start_y + 3),
+                    sample_mask(m, start_x + 1, start_y),
+                    sample_mask(m, start_x + 1, start_y + 1),
+                    sample_mask(m, start_x + 1, start_y + 2),
+                    sample_mask(m, start_x + 1, start_y + 3),
                 ];
 
                 start_x += 2;

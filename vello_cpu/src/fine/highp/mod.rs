@@ -15,16 +15,15 @@
 
 use crate::filter::context::ScratchBuffer;
 use crate::filter::filter_highp;
+use crate::filter::pixmap::FilterPixmap;
 use crate::fine::FineKernel;
-use crate::fine::{COLOR_COMPONENTS, Painter, Splat4thExt};
+use crate::fine::{COLOR_COMPONENTS, Painter, Splat4thExt, sample_mask};
 use crate::peniko::BlendMode;
 use crate::region::Region;
 use vello_common::fearless_simd::*;
-use vello_common::filter_effects::Filter;
-use vello_common::kurbo::Affine;
+use vello_common::filter::PreparedFilter;
 use vello_common::mask::Mask;
 use vello_common::paint::{PremulColor, Tint, TintMode};
-use vello_common::pixmap::Pixmap;
 use vello_common::tile::Tile;
 
 pub(crate) mod blend;
@@ -53,12 +52,11 @@ impl<S: Simd> FineKernel<S> for F32Kernel {
         reason = "`FineKernel` is public but this specific method is not needed."
     )]
     fn filter_layer(
-        pixmap: &mut Pixmap,
-        filter: &Filter,
+        pixmap: &mut FilterPixmap,
+        filter: PreparedFilter,
         filter_scratch: &mut ScratchBuffer,
-        transform: Affine,
     ) {
-        filter_highp(filter, pixmap, filter_scratch, transform);
+        filter_highp(filter, pixmap, filter_scratch);
     }
 
     /// Fills a buffer with a solid color using SIMD operations.
@@ -194,8 +192,8 @@ impl<S: Simd> FineKernel<S> for F32Kernel {
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        mut start_x: usize,
-        start_y: u16,
+        mut start_x: i64,
+        start_y: i64,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
         alphas: Option<&[u8]>,
@@ -204,44 +202,13 @@ impl<S: Simd> FineKernel<S> for F32Kernel {
         let alpha_iter = alphas.map(|a| bytemuck::cast_slice::<u8, [u8; 4]>(a).iter().copied());
 
         let mask_iter = mask.map(|m| {
-            let width = usize::from(m.width());
-            let height = m.height();
-
             core::iter::from_fn(move || {
-                let samples = if start_x < width && start_y + 3 < height {
-                    // All in bounds, sample directly
-                    [
-                        m.sample(u16::try_from(start_x).unwrap(), start_y),
-                        m.sample(u16::try_from(start_x).unwrap(), start_y + 1),
-                        m.sample(u16::try_from(start_x).unwrap(), start_y + 2),
-                        m.sample(u16::try_from(start_x).unwrap(), start_y + 3),
-                    ]
-                } else {
-                    // Fallback: check each individually
-                    [
-                        if start_x < width && start_y < height {
-                            m.sample(u16::try_from(start_x).unwrap(), start_y)
-                        } else {
-                            255
-                        },
-                        if start_x < width && start_y + 1 < height {
-                            m.sample(u16::try_from(start_x).unwrap(), start_y + 1)
-                        } else {
-                            255
-                        },
-                        if start_x < width && start_y + 2 < height {
-                            m.sample(u16::try_from(start_x).unwrap(), start_y + 2)
-                        } else {
-                            255
-                        },
-                        if start_x < width && start_y + 3 < height {
-                            m.sample(u16::try_from(start_x).unwrap(), start_y + 3)
-                        } else {
-                            255
-                        },
-                    ]
-                };
-
+                let samples = [
+                    sample_mask(m, start_x, start_y),
+                    sample_mask(m, start_x, start_y + 1),
+                    sample_mask(m, start_x, start_y + 2),
+                    sample_mask(m, start_x, start_y + 3),
+                ];
                 start_x += 1;
 
                 Some(samples)

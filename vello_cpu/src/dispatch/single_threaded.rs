@@ -6,21 +6,23 @@ use crate::coarse::CommandBucketer;
 use crate::coarse::depth::DepthBuffer;
 use crate::dispatch::Dispatcher;
 use crate::filter::context::FilterContext;
+use crate::filter::pixmap::FilterPixmap;
 use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_region};
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
 use crate::record::RecordedFill;
 use crate::region::Regions;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use vello_common::TargetInit;
 use vello_common::color::AlphaColor;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd};
-use vello_common::filter::FilterData;
+use vello_common::filter::{FilterData, PreparedFilter};
 use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint, PremulColor};
-use vello_common::pixmap::{Pixmap, PixmapMut};
+use vello_common::pixmap::PixmapMut;
 use vello_common::record::{
     CommandRecorder, LayerClip, LayerProps, Node, PoppedLayer, RecordedLayerKind,
 };
@@ -39,6 +41,9 @@ pub(crate) struct SingleThreadedDispatcher {
     recorder: CommandRecorder<RecordedFill>,
     /// Storage for generated strips and alpha coverage data.
     strip_storage: StripStorage,
+    /// Translation from root target coordinates to each filter layer's source
+    /// viewport, in the order of `recorder.filter_layers`.
+    filter_source_shifts: Vec<(i64, i64)>,
     /// SIMD level for fearless SIMD dispatch.
     level: Level,
 }
@@ -56,6 +61,7 @@ impl SingleThreadedDispatcher {
             viewport: ViewportState::new(width, height, level),
             recorder: CommandRecorder::new(width, height),
             strip_storage: StripStorage::new(GenerationMode::Append),
+            filter_source_shifts: Vec::new(),
             level,
         }
     }
@@ -124,6 +130,7 @@ impl SingleThreadedDispatcher {
             &filters,
             target,
             params,
+            (0, 0),
             target_init,
             self.recorder.root_is_blend_target,
             encoded_paints,
@@ -139,6 +146,7 @@ impl SingleThreadedDispatcher {
         filter_ctx: &FilterContext,
         mut target: PixmapMut<'_>,
         params: FineRenderParams,
+        mask_offset: (i64, i64),
         target_init: TargetInit<PremulColor>,
         root_is_blend_target: bool,
         encoded_paints: &[EncodedPaint],
@@ -173,6 +181,7 @@ impl SingleThreadedDispatcher {
             &bucketer,
             resources,
             &mut regions,
+            mask_offset,
             target_init,
             root_is_blend_target,
         );
@@ -183,11 +192,13 @@ impl SingleThreadedDispatcher {
         bucketer: &CommandBucketer,
         resources: FineResources<'_>,
         regions: &mut Regions<'_>,
+        mask_offset: (i64, i64),
         target_init: TargetInit<PremulColor>,
         root_is_blend_target: bool,
     ) {
         // TODO: Reuse fine and depth buffer across targets?
         let mut fine = Fine::<S, F>::new(simd, bucketer.width());
+        fine.set_mask_offset(mask_offset);
         let mut depth = DepthBuffer::new(bucketer.width());
         regions.update(|region| {
             rasterize_region::<S, F>(
@@ -229,7 +240,13 @@ impl SingleThreadedDispatcher {
         // parents. Subsequent sibling filter layers also get added after the previous layer they
         // are composited into. Therefore, iterating in reverse order is enough to ensure that all
         // dependencies have been rendered before they are invoked.
-        for id in self.recorder.filter_layers.iter().rev().copied() {
+        for (&id, &source_shift) in self
+            .recorder
+            .filter_layers
+            .iter()
+            .zip(&self.filter_source_shifts)
+            .rev()
+        {
             let RecordedLayerKind::Filter {
                 filter_data: filter_plan,
                 placement,
@@ -246,19 +263,24 @@ impl SingleThreadedDispatcher {
             let height = pixmap_bbox.height();
             // TODO: See https://github.com/linebender/vello/pull/1701#discussion_r3400709986, explore
             // using pools for more resources.
-            let mut pixmap = Pixmap::new(width, height);
+            let mut pixmap = FilterPixmap::new(u32::from(width), u32::from(height));
             let params = FineRenderParams {
                 scene_size: (width, height),
                 target_offset: (0, 0),
             };
+            let mask_offset = (
+                i64::from(pixmap_bbox.x0) - source_shift.0,
+                i64::from(pixmap_bbox.y0) - source_shift.1,
+            );
 
             self.bucket_and_rasterize::<S, F>(
                 simd,
                 &self.recorder.layers[id as usize].nodes,
                 pixmap_bbox,
                 &filter_ctx,
-                (&mut pixmap).into(),
+                pixmap.as_target(),
                 params,
+                mask_offset,
                 TargetInit::Clear(PremulColor::from_alpha_color(AlphaColor::TRANSPARENT)),
                 false,
                 encoded_paints,
@@ -267,10 +289,11 @@ impl SingleThreadedDispatcher {
 
             F::filter_layer(
                 &mut pixmap,
-                &filter_plan.filter,
+                PreparedFilter::new(&filter_plan.filter, &filter_plan.transform),
                 filter_ctx.scratch(),
-                filter_plan.transform,
             );
+
+            let pixmap = pixmap.into_pixmap();
 
             // Save the filtered pixmap to disk for debugging.
             // #[cfg(all(debug_assertions, feature = "std", feature = "png"))]
@@ -369,6 +392,7 @@ impl Dispatcher for SingleThreadedDispatcher {
     ) {
         if let Some(filter_data) = &filter_data {
             self.viewport.push_root_viewport(filter_data);
+            self.filter_source_shifts.push(self.viewport.source_shift());
         }
 
         let clip_path = clip_path.map(|clip_path| {
@@ -419,6 +443,7 @@ impl Dispatcher for SingleThreadedDispatcher {
         // Bucketer will be reset on demand, so no need to reset it here.
         self.recorder.reset(width, height);
         self.strip_storage.clear();
+        self.filter_source_shifts.clear();
         self.viewport.reset(width, height);
     }
 
@@ -534,7 +559,7 @@ impl Dispatcher for SingleThreadedDispatcher {
     reason = "useful debug utility, can be enabled by uncommenting the call site"
 )]
 #[cfg(all(debug_assertions, feature = "std", feature = "png"))]
-fn save_filtered_layer_debug(pixmap: &Pixmap, layer_id: usize) {
+fn save_filtered_layer_debug(pixmap: &vello_common::pixmap::Pixmap, layer_id: usize) {
     use std::path::PathBuf;
 
     let diffs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vello_tests/diffs");

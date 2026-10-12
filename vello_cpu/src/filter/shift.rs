@@ -3,11 +3,11 @@
 
 //! Shared helpers for pixel-space filter operations.
 
+use crate::filter::pixmap::FilterPixmap;
 use vello_common::color::palette::css::TRANSPARENT;
 #[cfg(not(feature = "std"))]
 use vello_common::kurbo::common::FloatFuncs as _;
 use vello_common::peniko::color::PremulRgba8;
-use vello_common::pixmap::Pixmap;
 
 /// Shift all pixels in a pixmap by the given offset.
 ///
@@ -15,9 +15,13 @@ use vello_common::pixmap::Pixmap;
 /// The iteration order is carefully chosen based on shift direction to avoid overwriting
 /// source pixels before they're read. Areas that become exposed (due to the shift) are
 /// filled with transparent black. Pixels that would move outside the bounds are discarded.
-pub(crate) fn offset_pixels(pixmap: &mut Pixmap, dx: f32, dy: f32) {
-    let dx_pixels = dx.round() as i32;
-    let dy_pixels = dy.round() as i32;
+pub(crate) fn offset_pixels(pixmap: &mut FilterPixmap, dx: f32, dy: f32) {
+    assert!(
+        dx.is_finite() && dy.is_finite(),
+        "filter offsets must be finite"
+    );
+    let dx_pixels = dx.round() as i64;
+    let dy_pixels = dy.round() as i64;
 
     // Early return if no offset
     if dx_pixels == 0 && dy_pixels == 0 {
@@ -27,6 +31,11 @@ pub(crate) fn offset_pixels(pixmap: &mut Pixmap, dx: f32, dy: f32) {
     let width = pixmap.width();
     let height = pixmap.height();
     let transparent = TRANSPARENT.premultiply().to_rgba8();
+    if dx_pixels.unsigned_abs() >= u64::from(width) || dy_pixels.unsigned_abs() >= u64::from(height)
+    {
+        pixmap.data_mut().fill(transparent);
+        return;
+    }
 
     // Process pixels in the correct order to avoid overwriting source data.
     // Key insight: iterate away from the direction of movement.
@@ -112,28 +121,28 @@ pub(crate) fn offset_pixels(pixmap: &mut Pixmap, dx: f32, dy: f32) {
 /// position if it's in the exposed region.
 #[inline(always)]
 fn process_offset_pixel(
-    pixmap: &mut Pixmap,
-    x: u16,
-    y: u16,
-    dx_pixels: i32,
-    dy_pixels: i32,
-    width: u16,
-    height: u16,
+    pixmap: &mut FilterPixmap,
+    x: u32,
+    y: u32,
+    dx_pixels: i64,
+    dy_pixels: i64,
+    width: u32,
+    height: u32,
     transparent: PremulRgba8,
 ) {
-    let new_x = x as i32 + dx_pixels;
-    let new_y = y as i32 + dy_pixels;
+    let new_x = x as i64 + dx_pixels;
+    let new_y = y as i64 + dy_pixels;
 
-    if new_x >= 0 && new_x < width as i32 && new_y >= 0 && new_y < height as i32 {
+    if new_x >= 0 && new_x < width as i64 && new_y >= 0 && new_y < height as i64 {
         let pixel = pixmap.sample(x, y);
-        pixmap.set_pixel(new_x as u16, new_y as u16, pixel);
+        pixmap.set_pixel(new_x as u32, new_y as u32, pixel);
     }
 
     // Clear the source pixel if it's in the exposed region
-    let should_clear = (dx_pixels > 0 && x < dx_pixels as u16)
-        || (dx_pixels < 0 && x >= (width as i32 + dx_pixels) as u16)
-        || (dy_pixels > 0 && y < dy_pixels as u16)
-        || (dy_pixels < 0 && y >= (height as i32 + dy_pixels) as u16);
+    let should_clear = (dx_pixels > 0 && i64::from(x) < dx_pixels)
+        || (dx_pixels < 0 && i64::from(x) >= i64::from(width) + dx_pixels)
+        || (dy_pixels > 0 && i64::from(y) < dy_pixels)
+        || (dy_pixels < 0 && i64::from(y) >= i64::from(height) + dy_pixels);
 
     if should_clear {
         pixmap.set_pixel(x, y, transparent);
@@ -147,7 +156,7 @@ mod tests {
     /// Test `offset_pixels` with positive offset (right and down).
     #[test]
     fn test_offset_pixels_positive() {
-        let mut pixmap = Pixmap::new(4, 4);
+        let mut pixmap = FilterPixmap::new(4, 4);
         // Set center pixel to white
         pixmap.set_pixel(
             1,
@@ -174,7 +183,7 @@ mod tests {
     /// Test `offset_pixels` with negative offset (left and up).
     #[test]
     fn test_offset_pixels_negative() {
-        let mut pixmap = Pixmap::new(4, 4);
+        let mut pixmap = FilterPixmap::new(4, 4);
         // Set pixel at (2,2) to white
         pixmap.set_pixel(
             2,
@@ -201,7 +210,7 @@ mod tests {
     /// Test `offset_pixels` with fractional offset (should round).
     #[test]
     fn test_offset_pixels_fractional() {
-        let mut pixmap = Pixmap::new(4, 4);
+        let mut pixmap = FilterPixmap::new(4, 4);
         pixmap.set_pixel(
             1,
             1,
@@ -224,7 +233,7 @@ mod tests {
     /// Test `offset_pixels` with out-of-bounds offset (should clip).
     #[test]
     fn test_offset_pixels_out_of_bounds() {
-        let mut pixmap = Pixmap::new(4, 4);
+        let mut pixmap = FilterPixmap::new(4, 4);
         pixmap.set_pixel(
             1,
             1,
@@ -247,6 +256,63 @@ mod tests {
         for y in 0..4 {
             for x in 0..4 {
                 assert_eq!(pixmap.sample(x, y).a, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn offsets_match_out_of_place_translation_including_entirely_exposed_frames() {
+        for (width, height) in [(5, 3), (65_535, 1), (65_537, 1), (1, 65_537)] {
+            let mut source = FilterPixmap::new(width, height);
+            for (i, pixel) in source.data_mut().iter_mut().enumerate() {
+                let value = ((i * 41 + 19) % 256) as u8;
+                *pixel = PremulRgba8 {
+                    r: value,
+                    g: value / 2,
+                    b: value / 3,
+                    a: 255,
+                };
+            }
+            for (dx, dy) in [
+                (-70_000, 0),
+                (-65_536, 0),
+                (-5, 0),
+                (-1, -1),
+                (0, -70_000),
+                (0, -3),
+                (0, 0),
+                (1, 1),
+                (5, 0),
+                (65_536, 0),
+                (70_000, 0),
+                (0, 3),
+                (0, 70_000),
+            ] {
+                let mut actual = source.clone();
+                offset_pixels(&mut actual, dx as f32, dy as f32);
+                for y in 0..height {
+                    for x in 0..width {
+                        let sx = i64::from(x) - dx;
+                        let sy = i64::from(y) - dy;
+                        let expected = if (0..i64::from(width)).contains(&sx)
+                            && (0..i64::from(height)).contains(&sy)
+                        {
+                            source.sample(sx as u32, sy as u32)
+                        } else {
+                            PremulRgba8 {
+                                r: 0,
+                                g: 0,
+                                b: 0,
+                                a: 0,
+                            }
+                        };
+                        assert_eq!(
+                            actual.sample(x, y),
+                            expected,
+                            "{width}x{height} offset {dx},{dy} pixel {x},{y}"
+                        );
+                    }
+                }
             }
         }
     }

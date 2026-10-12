@@ -502,8 +502,8 @@ struct FilterPassBuilder<'a> {
 impl<'a> FilterPassBuilder<'a> {
     fn new(op: FilterOp, texture_size: SizeU16, passes: &'a mut FilterPassPlan) -> Self {
         let sizer = DecimationSizer::new(
-            op.textures.original.rect.width(),
-            op.textures.original.rect.height(),
+            u32::from(op.textures.original.rect.width()),
+            u32::from(op.textures.original.rect.height()),
         );
 
         Self {
@@ -518,20 +518,23 @@ impl<'a> FilterPassBuilder<'a> {
 
     /// Compute and update source and destination sizes based on the pass kind.
     fn apply_pass_dimensions(&mut self, kind: u32) -> (SizeU16, SizeU16) {
+        let size = |(w, h): (u32, u32)| {
+            let narrow = |v: u32| {
+                u16::try_from(v).expect("decimation never grows past its u16 texture rect")
+            };
+            SizeU16::from_wh(narrow(w), narrow(h))
+        };
         match kind {
             pass_kind::DOWNSCALE => {
-                let (sw, sh) = self.sizer.current();
-                let (dw, dh) = self.sizer.downscale();
-                (SizeU16::from_wh(sw, sh), SizeU16::from_wh(dw, dh))
+                let source = self.sizer.current();
+                (size(source), size(self.sizer.downscale()))
             }
             pass_kind::UPSCALE => {
-                let (sw, sh) = self.sizer.current();
-                let (dw, dh) = self.sizer.upscale();
-                (SizeU16::from_wh(sw, sh), SizeU16::from_wh(dw, dh))
+                let source = self.sizer.current();
+                (size(source), size(self.sizer.upscale()))
             }
             _ => {
-                let (w, h) = self.sizer.current();
-                let size = SizeU16::from_wh(w, h);
+                let size = size(self.sizer.current());
                 (size, size)
             }
         }

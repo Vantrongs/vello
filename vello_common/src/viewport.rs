@@ -90,10 +90,22 @@ impl ViewportState {
         self.clip_state.pop_clip();
     }
 
+    /// Translation from root target coordinates to the active root viewport.
+    pub fn source_shift(&self) -> (i64, i64) {
+        let shift = self.clip_state.active_shift().translation();
+        (shift.x as i64, shift.y as i64)
+    }
+
     /// Push a new root viewport.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the filter's source viewport does not fit the `u16` domain,
+    /// see [`FilterData::source_viewport_size`].
     pub fn push_root_viewport(&mut self, filter_data: &FilterData) {
         let size = filter_data
-            .source_viewport_size(self.strip_generator.width(), self.strip_generator.height());
+            .source_viewport_size(self.strip_generator.width(), self.strip_generator.height())
+            .expect("filter source viewport exceeds u16 coordinate domain");
         // TODO: Use a pool of strip generators.
         let filter_generator = StripGenerator::new(size.width(), size.height(), self.level);
         let parent_generator = core::mem::replace(&mut self.strip_generator, filter_generator);

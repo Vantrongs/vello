@@ -5,15 +5,15 @@
 
 use super::FilterEffect;
 use crate::filter::context::ScratchBuffer;
+use crate::filter::pixmap::FilterPixmap;
 use vello_common::filter::flood::Flood;
-use vello_common::pixmap::Pixmap;
 
 impl FilterEffect for Flood {
-    fn execute_lowp(&self, pixmap: &mut Pixmap, _filter_scratch: &mut ScratchBuffer) {
+    fn execute_lowp(&self, pixmap: &mut FilterPixmap, _filter_scratch: &mut ScratchBuffer) {
         pixmap.data_mut().fill(self.color.premultiply().to_rgba8());
     }
 
-    fn execute_highp(&self, pixmap: &mut Pixmap, _filter_scratch: &mut ScratchBuffer) {
+    fn execute_highp(&self, pixmap: &mut FilterPixmap, _filter_scratch: &mut ScratchBuffer) {
         pixmap.data_mut().fill(self.color.premultiply().to_rgba8());
     }
 }
@@ -28,7 +28,7 @@ mod tests {
     /// Test flood with semi-transparent color - verifies correct premultiplication.
     #[test]
     fn test_flood_semi_transparent_lowp() {
-        let mut pixmap = Pixmap::new(2, 2);
+        let mut pixmap = FilterPixmap::new(2, 2);
         let mut filter_scratch = ScratchBuffer::new();
 
         // Semi-transparent white (50% alpha)
@@ -59,7 +59,7 @@ mod tests {
     /// Test flood highp with semi-transparent color - verifies correct premultiplication.
     #[test]
     fn test_flood_semi_transparent_highp() {
-        let mut pixmap = Pixmap::new(2, 2);
+        let mut pixmap = FilterPixmap::new(2, 2);
         let mut filter_scratch = ScratchBuffer::new();
 
         // Semi-transparent white (50% alpha)

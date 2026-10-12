@@ -14,6 +14,7 @@ mod lowp;
 use crate::coarse::depth::DepthBuffer;
 use crate::coarse::{CommandBucketer, RenderCmd, RowState};
 use crate::filter::context::ScratchBuffer;
+use crate::filter::pixmap::FilterPixmap;
 use crate::fine::common::gradient::GradientPainter;
 pub(crate) use crate::fine::common::gradient::calculate_t_vals;
 pub(crate) use crate::fine::common::gradient::linear::SimdLinearKind;
@@ -37,8 +38,7 @@ use vello_common::fearless_simd::{
     Bytes, Simd, SimdBase, SimdFloat, SimdInt, SimdInto, f32x4, f32x8, f32x16, u8x16, u8x32, u32x4,
     u32x8,
 };
-use vello_common::filter_effects::Filter;
-use vello_common::kurbo::Affine;
+use vello_common::filter::PreparedFilter;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, ImageSource, Paint, PremulColor, Tint};
 use vello_common::pixmap::Pixmap;
@@ -252,19 +252,14 @@ pub trait FineKernel<S: Simd>: Send + Sync + 'static {
     /// This is used for applying filters to whole layers, which is necessary for
     /// spatial filters (like blur) that need to access neighboring pixels. The filter
     /// is applied in-place to the provided pixmap.
-    ///
-    /// The transform parameter is used to scale filter parameters based on the current
-    /// transformation matrix (e.g., zoom level), ensuring filters look consistent
-    /// regardless of scale.
     #[expect(
         private_interfaces,
         reason = "`FineKernel` is public but this specific method is not needed."
     )]
     fn filter_layer(
-        pixmap: &mut Pixmap,
-        filter: &Filter,
+        pixmap: &mut FilterPixmap,
+        filter: PreparedFilter,
         filter_scratch: &mut ScratchBuffer,
-        transform: Affine,
     );
 
     /// Fill the target buffer with a solid color.
@@ -447,8 +442,8 @@ pub trait FineKernel<S: Simd>: Send + Sync + 'static {
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        start_x: usize,
-        start_y: u16,
+        mask_x: i64,
+        mask_y: i64,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
         alphas: Option<&[u8]>,
@@ -464,6 +459,16 @@ pub trait FineKernel<S: Simd>: Send + Sync + 'static {
         } else {
             Self::alpha_composite_solid(simd, dest, color, alphas);
         }
+    }
+}
+
+/// Sample a mask in root target coordinates; the mask is transparent outside the target.
+#[inline(always)]
+fn sample_mask(mask: &Mask, x: i64, y: i64) -> u8 {
+    if x >= 0 && x < i64::from(mask.width()) && y >= 0 && y < i64::from(mask.height()) {
+        mask.sample(x as u16, y as u16)
+    } else {
+        0
     }
 }
 
@@ -548,6 +553,8 @@ pub struct Fine<S: Simd, T: FineKernel<S>> {
     row_y: u16,
     /// The origin of the current target we are rendering into.
     origin: (u16, u16),
+    /// Translation from target pixels to the root target, where masks are sampled.
+    mask_offset: (i64, i64),
 }
 
 impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
@@ -574,7 +581,20 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             f32_buf: Vec::new(),
             row_y: 0,
             origin: (0, 0),
+            mask_offset: (0, 0),
         }
+    }
+
+    /// Set the translation from target pixels to the root target.
+    pub(crate) fn set_mask_offset(&mut self, mask_offset: (i64, i64)) {
+        self.mask_offset = mask_offset;
+    }
+
+    fn mask_position(&self, x: usize, y: u16) -> (i64, i64) {
+        (
+            x as i64 + self.mask_offset.0,
+            i64::from(y) + self.mask_offset.1,
+        )
     }
 
     fn set_row_y(&mut self, row_y: u16) {
@@ -798,26 +818,14 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     fn mask(&mut self, row_y: u16, span: TileAlignedSpan, mask: &Mask) {
         let x = span.pixel_x();
         let width = span.pixel_width();
+        let (mask_x, mask_y) = self.mask_position(x, row_y);
         let target = self.blend_buffers.last_mut().unwrap();
         let target = &mut target[Self::scratch_range(span)];
-        let y = u32::from(row_y) + u32x4::from_slice(self.simd, &[0, 1, 2, 3]);
-        let iter = (x..x + width).map(|x| {
-            let x_in_range = x < usize::from(mask.width());
-
-            macro_rules! sample {
-                ($idx:expr) => {
-                    if x_in_range && (y[$idx] as u16) < mask.height() {
-                        mask.sample(u16::try_from(x).unwrap(), y[$idx] as u16)
-                    } else {
-                        0
-                    }
-                };
-            }
-
-            let s1 = sample!(0);
-            let s2 = sample!(1);
-            let s3 = sample!(2);
-            let s4 = sample!(3);
+        let iter = (mask_x..mask_x + width as i64).map(|x| {
+            let s1 = sample_mask(mask, x, mask_y);
+            let s2 = sample_mask(mask, x, mask_y + 1);
+            let s3 = sample_mask(mask, x, mask_y + 2);
+            let s4 = sample_mask(mask, x, mask_y + 3);
 
             let samples = u8x16::from_slice(
                 self.simd,
@@ -847,7 +855,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             self.mask(row_y, span, mask);
         }
 
-        let x = span.pixel_x();
+        let (mask_x, mask_y) = self.mask_position(span.pixel_x(), row_y);
         let (source, rest) = self.blend_buffers.split_last_mut().unwrap();
         let target = rest.last_mut().unwrap();
         let range = Self::scratch_range(span);
@@ -860,8 +868,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             T::blend(
                 self.simd,
                 target,
-                x,
-                row_y,
+                mask_x,
+                mask_y,
                 source
                     .chunks_exact(T::Composite::LENGTH)
                     .map(|s| T::Composite::from_slice(self.simd, s)),
@@ -913,7 +921,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             return;
         }
 
-        let x = span.pixel_x();
+        let (mask_x, mask_y) = self.mask_position(span.pixel_x(), self.row_y);
         let color = T::extract_color(color);
         let simd = self.simd;
         let color = T::Composite::from_color(simd, color);
@@ -921,8 +929,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         T::blend(
             simd,
             &mut scratch[Self::scratch_range(span)],
-            x,
-            self.row_y,
+            mask_x,
+            mask_y,
             iter::repeat(color),
             attrs.blend_mode,
             alphas,
@@ -940,6 +948,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     ) {
         let x = span.pixel_x();
         let y = self.row_y;
+        let (mask_x, mask_y) = self.mask_position(x, y);
         let sample_x = x + usize::from(self.origin.0);
         let sample_y = y.saturating_add(self.origin.1);
         let width = span.pixel_width();
@@ -991,8 +1000,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                         T::blend(
                             simd,
                             dest,
-                            x,
-                            y,
+                            mask_x,
+                            mask_y,
                             color_buf
                                 .chunks_exact(T::Composite::LENGTH)
                                 .map(|s| T::Composite::from_slice(simd, s)),
