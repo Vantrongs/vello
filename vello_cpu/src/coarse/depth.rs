@@ -261,10 +261,7 @@ impl DepthBuffer {
             return None;
         }
 
-        Some((
-            bucket_span(run_start, *idx).intersect(bounds)?,
-            run_start..*idx,
-        ))
+        Some((bucket_span(run_start, *idx, bounds)?, run_start..*idx))
     }
 
     /// Finds the next consecutive run visible to `draw_id`.
@@ -288,12 +285,14 @@ impl DepthBuffer {
             return None;
         }
 
-        bucket_span(run_start, *idx).intersect(bounds)
+        bucket_span(run_start, *idx, bounds)
     }
 }
 
-fn bucket_span(start: usize, end: usize) -> TileAlignedSpan {
-    BucketRange::new(start as u16, end as u16).span()
+fn bucket_span(start: usize, end: usize, bounds: TileAlignedSpan) -> Option<TileAlignedSpan> {
+    let start = (start as u16 * DEPTH_BUCKET_TILE_WIDTH).max(bounds.tile_x());
+    let end = (end as u16 * DEPTH_BUCKET_TILE_WIDTH).min(bounds.tile_end());
+    (start < end).then(|| TileAlignedSpan::from_tiles(start, end - start))
 }
 
 #[cfg(test)]
@@ -307,7 +306,7 @@ mod tests {
     }
 
     fn buckets(start: usize, end: usize) -> TileAlignedSpan {
-        bucket_span(start, end)
+        BucketRange::new(start as u16, end as u16).span()
     }
 
     fn bucket_range(span: TileAlignedSpan) -> (usize, usize) {
@@ -459,6 +458,40 @@ mod tests {
             visible_runs(&buffer, buckets(0, 6), 6),
             [(0, 1), (2, 3), (4, 6)]
         );
+    }
+
+    #[test]
+    fn partial_final_bucket_is_clipped_before_converting_to_pixels() {
+        let last_bucket_x = u16::MAX / DEPTH_BUCKET_WIDTH * DEPTH_BUCKET_WIDTH;
+        let max_aligned_width = u16::MAX / Tile::WIDTH * Tile::WIDTH;
+        for width in last_bucket_x..=max_aligned_width {
+            let mut buffer = DepthBuffer::new(width);
+            let span = crate::span::Span::new(0, width).tile_aligned();
+            let mut runs = Vec::new();
+            buffer.for_each_unset_run(span, |run| runs.push(run));
+            assert_eq!(runs, [span], "width = {width}");
+            runs.clear();
+            buffer.for_each_visible_run(span, 1, |run| runs.push(run));
+            assert_eq!(runs, [span], "width = {width}");
+
+            write_buckets(
+                &mut buffer,
+                0..usize::from(last_bucket_x / DEPTH_BUCKET_WIDTH),
+                2,
+            );
+            runs.clear();
+            buffer.for_each_visible_run(span, 1, |run| runs.push(run));
+            let tail = crate::span::Span::new(last_bucket_x, width - last_bucket_x).tile_aligned();
+            let expected = if width == last_bucket_x {
+                vec![]
+            } else {
+                vec![tail]
+            };
+            assert_eq!(runs, expected, "width = {width}");
+            runs.clear();
+            buffer.for_each_unset_run(span, |run| runs.push(run));
+            assert_eq!(runs, expected, "width = {width}");
+        }
     }
 
     #[test]
