@@ -65,6 +65,7 @@ pub mod clip;
 pub(crate) mod cull;
 pub(crate) mod dash;
 pub mod encode;
+pub(crate) mod fill_clip;
 pub mod filter;
 pub mod filter_effects;
 pub mod flatten;

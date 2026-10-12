@@ -5,7 +5,8 @@
 //! well as some code that was copied from kurbo, which is needed to reimplement the
 //! full `flatten` method.
 
-use crate::cull::{Cull, SPLIT_EXTENT, SplitHuge, seg_to_el};
+use crate::cull::SPLIT_EXTENT;
+use crate::fill_clip;
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
 use crate::kurbo::{
@@ -106,26 +107,21 @@ pub(crate) fn flatten<S: Simd>(
         match affine * el {
             PathEl::MoveTo(p) => {
                 if last_pt != start_pt {
-                    callback.callback(LinePathEl::LineTo(start_pt));
+                    line_to(last_pt, start_pt, rect, callback);
                 }
                 last_pt = p;
                 start_pt = p;
                 callback.callback(LinePathEl::MoveTo(p));
             }
             PathEl::LineTo(p) => {
+                line_to(last_pt, p, rect, callback);
                 last_pt = p;
-                callback.callback(LinePathEl::LineTo(p));
             }
             PathEl::QuadTo(p1, p2) => {
                 let p0 = last_pt;
                 if exceeds_split_extent(&[p0, p1, p2]) {
-                    flatten_split(
-                        simd,
-                        PathSeg::Quad(QuadBez::new(p0, p1, p2)),
-                        rect,
-                        callback,
-                        flatten_ctx,
-                    );
+                    let q = PathSeg::Quad(QuadBez::new(p0, p1, p2));
+                    fill_clip::flatten_seg(simd, q, rect, callback, flatten_ctx);
                 } else {
                     flatten_quad(p0, p1, p2, rect, callback);
                 }
@@ -134,13 +130,8 @@ pub(crate) fn flatten<S: Simd>(
             PathEl::CurveTo(p1, p2, p3) => {
                 let p0 = last_pt;
                 if exceeds_split_extent(&[p0, p1, p2, p3]) {
-                    flatten_split(
-                        simd,
-                        PathSeg::Cubic(CubicBez::new(p0, p1, p2, p3)),
-                        rect,
-                        callback,
-                        flatten_ctx,
-                    );
+                    let c = PathSeg::Cubic(CubicBez::new(p0, p1, p2, p3));
+                    fill_clip::flatten_seg(simd, c, rect, callback, flatten_ctx);
                 } else {
                     flatten_cubic(simd, p0, p1, p2, p3, rect, callback, flatten_ctx);
                 }
@@ -148,7 +139,7 @@ pub(crate) fn flatten<S: Simd>(
             }
             PathEl::ClosePath => {
                 if last_pt != start_pt {
-                    callback.callback(LinePathEl::LineTo(start_pt));
+                    line_to(last_pt, start_pt, rect, callback);
 
                     // Kurbo says: "If `quad_to` [or another drawing op] is called immediately
                     // after `close_path` then the current subpath starts at the initial point of
@@ -162,12 +153,23 @@ pub(crate) fn flatten<S: Simd>(
     }
 
     if last_pt != start_pt {
-        callback.callback(LinePathEl::LineTo(start_pt));
+        line_to(last_pt, start_pt, rect, callback);
     }
 }
 
-/// Whether a curve with these device control points is split before flattening
-/// (`cull::SPLIT_EXTENT`): the lines below grow with its size.
+/// The line `p0 p` of a fill (device space), clipped to `rect` in `f64` if it is longer
+/// than `cull::SPLIT_EXTENT`: as `f32` its position in the view would be lost.
+#[inline(always)]
+fn line_to(p0: Point, p: Point, rect: [f64; 4], callback: &mut impl Callback) {
+    if (p.x - p0.x).abs().max((p.y - p0.y).abs()) > SPLIT_EXTENT {
+        fill_clip::line(p0, p, rect, callback);
+    } else {
+        callback.callback(LinePathEl::LineTo(p));
+    }
+}
+
+/// Whether a curve with these device control points is clipped before flattening
+/// (`cull::SPLIT_EXTENT`, `fill_clip`): the lines below grow with its size.
 #[inline(always)]
 fn exceeds_split_extent(pts: &[Point]) -> bool {
     let (mut x0, mut y0, mut x1, mut y1) = (pts[0].x, pts[0].y, pts[0].x, pts[0].y);
@@ -180,42 +182,15 @@ fn exceeds_split_extent(pts: &[Point]) -> bool {
     (x1 - x0).max(y1 - y0) > SPLIT_EXTENT
 }
 
-/// Flattens the pieces `SplitHuge` cuts a huge device-space curve into: chords where
-/// they miss `rect`, curves no larger than it where they meet it.
-#[cold]
-#[inline(never)]
-fn flatten_split<S: Simd>(
-    simd: S,
-    seg: PathSeg,
-    rect: [f64; 4],
-    callback: &mut impl Callback,
-    flatten_ctx: &mut FlattenCtx,
-) {
-    let mut last = seg.start();
-    let cull = Cull::new(Affine::IDENTITY, rect);
-    let pieces = SplitHuge::new([PathEl::MoveTo(last), seg_to_el(&seg)], cull, false);
-    for (el, _) in pieces.skip(1) {
-        match el {
-            PathEl::LineTo(p) => {
-                callback.callback(LinePathEl::LineTo(p));
-                last = p;
-            }
-            PathEl::QuadTo(p1, p2) => {
-                flatten_quad(last, p1, p2, rect, callback);
-                last = p2;
-            }
-            PathEl::CurveTo(p1, p2, p3) => {
-                flatten_cubic(simd, last, p1, p2, p3, rect, callback, flatten_ctx);
-                last = p3;
-            }
-            PathEl::MoveTo(_) | PathEl::ClosePath => unreachable!("pieces of one segment"),
-        }
-    }
-}
-
 /// Flattens the quadratic `p0 p1 p2` (device space), culled against `rect`.
 #[inline(always)]
-fn flatten_quad(p0: Point, p1: Point, p2: Point, rect: [f64; 4], callback: &mut impl Callback) {
+pub(crate) fn flatten_quad(
+    p0: Point,
+    p1: Point,
+    p2: Point,
+    rect: [f64; 4],
+    callback: &mut impl Callback,
+) {
     let [left, top, right, bottom] = rect;
     let line = Line::new(p0, p2);
     // If the quadratic Bézier is fully to the right, top, or bottom of the culling
@@ -324,11 +299,49 @@ fn flatten_cubic<S: Simd>(
         callback.callback(LinePathEl::LineTo(p3));
     } else {
         let c = CubicBez::new(p0, p1, p2, p3);
-        let max = flatten_cubic_simd(simd, c, flatten_ctx);
-
-        for p in &flatten_ctx.flattened_cubics[1..max] {
-            callback.callback(LinePathEl::LineTo(Point::new(p.x as f64, p.y as f64)));
+        let err_div = quad_err_div(c, TOL as f32);
+        // Too curved for `MAX_QUADS` quadratics within the tolerance: in blocks.
+        if err_div > QUADS_ERR_DIV[MAX_QUADS - 1] {
+            fill_clip::flatten_seg(simd, PathSeg::Cubic(c), rect, callback, flatten_ctx);
+        } else {
+            emit_cubic(simd, c, estimate(err_div), callback, flatten_ctx);
         }
+    }
+}
+
+/// Flattens the cubic `c` (device space, in the view) as `flatten_cubic` does one that
+/// is neither culled nor too curved for `MAX_QUADS` quadratics, which `c` must not be.
+pub(crate) fn flatten_block<S: Simd>(
+    simd: S,
+    c: CubicBez,
+    callback: &mut impl Callback,
+    flatten_ctx: &mut FlattenCtx,
+) {
+    let line = Line::new(c.p0, c.p3);
+    if f64::max(
+        line.nearest(c.p1, 0.).distance_sq,
+        line.nearest(c.p2, 0.).distance_sq,
+    ) <= 16. / 9. * TOL_2
+    {
+        callback.callback(LinePathEl::LineTo(c.p3));
+    } else {
+        let n_quads = estimate(quad_err_div(c, TOL as f32));
+        emit_cubic(simd, c, n_quads, callback, flatten_ctx);
+    }
+}
+
+/// Flattens the cubic `c` with `n_quads` quadratics.
+#[inline(always)]
+fn emit_cubic<S: Simd>(
+    simd: S,
+    c: CubicBez,
+    n_quads: usize,
+    callback: &mut impl Callback,
+    flatten_ctx: &mut FlattenCtx,
+) {
+    let max = flatten_cubic_simd(simd, c, n_quads, flatten_ctx);
+    for p in &flatten_ctx.flattened_cubics[1..max] {
+        callback.callback(LinePathEl::LineTo(Point::new(p.x as f64, p.y as f64)));
     }
 }
 
@@ -688,8 +701,12 @@ fn output_lines_simd<S: Simd>(
 }
 
 #[inline(always)]
-fn flatten_cubic_simd<S: Simd>(simd: S, c: CubicBez, ctx: &mut FlattenCtx) -> usize {
-    let n_quads = estimate_num_quads(c, TOL as f32);
+fn flatten_cubic_simd<S: Simd>(
+    simd: S,
+    c: CubicBez,
+    n_quads: usize,
+    ctx: &mut FlattenCtx,
+) -> usize {
     eval_cubics_simd(simd, &c, n_quads, ctx);
     let tol = (TOL as f32) * (1.0 - TO_QUAD_TOL);
     let sqrt_tol = tol.sqrt();
@@ -727,16 +744,16 @@ fn flatten_cubic_simd<S: Simd>(simd: S, c: CubicBez, ctx: &mut FlattenCtx) -> us
     n + 1
 }
 
+/// The measure `estimate` turns into the number of quadratics that approximate `c`
+/// within `accuracy * TO_QUAD_TOL`.
 #[inline(always)]
-fn estimate_num_quads(c: CubicBez, accuracy: f32) -> usize {
+fn quad_err_div(c: CubicBez, accuracy: f32) -> f64 {
     let q_accuracy = (accuracy * TO_QUAD_TOL) as f64;
     let max_hypot2 = 432.0 * q_accuracy * q_accuracy;
     let p1x2 = c.p1.to_vec2() * 3.0 - c.p0.to_vec2();
     let p2x2 = c.p2.to_vec2() * 3.0 - c.p3.to_vec2();
     let err = (p2x2 - p1x2).hypot2();
-    let err_div = err / max_hypot2;
-
-    estimate(err_div)
+    err / max_hypot2
 }
 
 const TO_QUAD_TOL: f32 = 0.1;
@@ -752,20 +769,21 @@ fn estimate(err_div: f64) -> usize {
     // compute this using a precomputed lookup table evaluating 1^6, 2^6, 3^6, etc. and simply
     // comparing if the value is less than or equal to each threshold.
 
-    const LUT: [f64; MAX_QUADS] = [
-        1.0, 64.0, 729.0, 4096.0, 15625.0, 46656.0, 117649.0, 262144.0, 531441.0, 1000000.0,
-        1771561.0, 2985984.0, 4826809.0, 7529536.0, 11390625.0, 16777216.0,
-    ];
-
     #[expect(clippy::needless_range_loop, reason = "better clarity")]
     for i in 0..MAX_QUADS {
-        if err_div <= LUT[i] {
+        if err_div <= QUADS_ERR_DIV[i] {
             return i + 1;
         }
     }
 
     MAX_QUADS
 }
+
+/// The largest `quad_err_div` that `n` quadratics handle, at index `n - 1`: `n^6`.
+const QUADS_ERR_DIV: [f64; MAX_QUADS] = [
+    1.0, 64.0, 729.0, 4096.0, 15625.0, 46656.0, 117649.0, 262144.0, 531441.0, 1000000.0, 1771561.0,
+    2985984.0, 4826809.0, 7529536.0, 11390625.0, 16777216.0,
+];
 
 #[cfg(test)]
 mod tests {

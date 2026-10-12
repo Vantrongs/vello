@@ -40,15 +40,20 @@ const INT_MASK_SHIFT: u32 = INTERSECTION_MASK.count_ones();
 /// Trying to render a path with more lines than this may result in visual artifacts.
 pub const MAX_LINES_PER_PATH: u32 = 1 << (32 - INT_MASK_SHIFT);
 
+// Winding counters (`CulledWindings::coarse`, the strip's winding delta) are `i32`.
+const _: () = assert!(
+    MAX_LINES_PER_PATH <= i32::MAX as u32,
+    "a path's lines can wrap an i32 winding counter"
+);
+
 /// A logical grouping of arrays used for culled tile processing,
 #[derive(Debug, Clone, Default)]
 pub struct CulledWindings {
     /// Fractional winding coverage for each individual scanline in a row.
     pub partial: Vec<[f32; Tile::HEIGHT as usize]>,
-    // Note that this will cause issues if we have windings greater/less than i16,
-    // but this should only occur in pathological cases.
-    /// Accumulated integer winding deltas for each tile row.
-    pub coarse: Vec<i16>,
+    /// Accumulated integer winding deltas for each tile row. Each line changes a row by
+    /// at most one and a path has at most `MAX_LINES_PER_PATH` lines, so this cannot wrap.
+    pub coarse: Vec<i32>,
     /// Bitmask tracking which rows contain active geometry or winding data.
     pub active: Vec<u32>,
     /// Flag indicating if any geometry was early-culled outside the viewport.
