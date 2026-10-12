@@ -287,9 +287,10 @@ impl MultiThreadedDispatcher {
     // recorded commands on the main thread. In this case, we want to abort in case there are no more
     // commands available to process.
     //
-    // The second phase is when we are flushing, in which case. even if the queue is empty, we only
-    // want to abort once all workers have closed the channel (and thus there won't be any more
-    // new recoded commands that will be generated).
+    // The second phase is when we are flushing, in which case we block until the next command
+    // arrives and only stop once all workers have closed the channel (and thus there won't be any
+    // more new recorded commands that will be generated). Blocking instead of polling matters
+    // when cores are scarce: a spinning main thread takes CPU time from the workers it waits for.
     //
     // This is why we have the `abort_empty` flag.
     fn append_strips(&mut self, strips: &[Strip]) -> Range<usize> {
@@ -302,7 +303,13 @@ impl MultiThreadedDispatcher {
 
     fn record_finished_commands(&mut self, abort_empty: bool) {
         loop {
-            match self.recorded_command_receiver.as_mut().unwrap().try_recv() {
+            let receiver = self.recorded_command_receiver.as_mut().unwrap();
+            let next = if abort_empty {
+                receiver.try_recv()
+            } else {
+                receiver.recv().map_err(|_| TryRecvError::Disconnected)
+            };
+            match next {
                 Ok(mut task) => {
                     let num_tasks = task.allocation_group.recorded_commands.len();
                     for cmd in task.allocation_group.recorded_commands.drain(0..num_tasks) {
@@ -372,14 +379,7 @@ impl MultiThreadedDispatcher {
                     // Put the allocation group back so it can be reused in future iterations!
                     self.allocations.put(task.allocation_group);
                 }
-                Err(e) => match e {
-                    TryRecvError::Empty => {
-                        if abort_empty {
-                            return;
-                        }
-                    }
-                    TryRecvError::Disconnected => return,
-                },
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
         }
     }
