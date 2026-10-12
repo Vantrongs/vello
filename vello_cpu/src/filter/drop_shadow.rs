@@ -11,34 +11,36 @@
 //! 4. Composite shadow color with blurred alpha
 //! 5. Composite shadow with original graphic
 //!
+//! The filter itself performs steps 1, 3 and 4 in place. Moving the shadow and
+//! compositing the original happen when the layer's output is assembled, see
+//! [`DisplacedPlan`](crate::filter::displaced::DisplacedPlan), so that the
+//! shadow's pixmap does not have to span the offset.
+//!
 //! @see <https://drafts.fxtf.org/filter-effects-2/#feDropShadowElement>
 
 use super::FilterEffect;
 use super::gaussian_blur::apply_blur;
-use super::shift::offset_pixels;
 use crate::filter::context::ScratchBuffer;
 use crate::filter::pixmap::FilterPixmap;
 use vello_common::color::{AlphaColor, Srgb};
 use vello_common::filter::drop_shadow::DropShadow;
-use vello_common::filter_effects::EdgeMode;
 use vello_common::peniko::color::PremulRgba8;
 #[cfg(not(feature = "std"))]
 use vello_common::peniko::kurbo::common::FloatFuncs as _;
 
 impl FilterEffect for DropShadow {
     fn execute_lowp(&self, pixmap: &mut FilterPixmap, filter_scratch: &mut ScratchBuffer) {
-        apply_drop_shadow(
-            pixmap,
-            self.dx,
-            self.dy,
-            self.std_deviation,
-            self.n_decimations,
-            &self.kernel[..usize::from(self.kernel_size)],
-            self.color,
-            self.edge_mode,
-            self.composite_original,
-            filter_scratch,
-        );
+        if self.std_deviation > 0.0 {
+            let scratch = filter_scratch.get_scratch_buffer(pixmap.width(), pixmap.height());
+            apply_blur(
+                pixmap,
+                scratch,
+                self.n_decimations,
+                &self.kernel[..usize::from(self.kernel_size)],
+                self.edge_mode,
+            );
+        }
+        colorize(pixmap, self.color);
     }
 
     fn execute_highp(&self, pixmap: &mut FilterPixmap, filter_scratch: &mut ScratchBuffer) {
@@ -48,95 +50,33 @@ impl FilterEffect for DropShadow {
     }
 }
 
-/// Apply drop shadow effect.
-///
-/// This is the main entry point that splits the drop shadow operation into well-defined steps:
-/// 1. Offset the shadow pixels
-/// 2. Blur the already-offset shadow
-/// 3. Apply shadow color and optionally composite with original
-fn apply_drop_shadow(
-    pixmap: &mut FilterPixmap,
-    dx: f32,
-    dy: f32,
-    std_deviation: f32,
-    n_decimations: usize,
-    kernel: &[f32],
-    color: AlphaColor<Srgb>,
-    edge_mode: EdgeMode,
-    composite_original: bool,
-    filter_scratch: &mut ScratchBuffer,
-) {
-    // Clone pixmap to create shadow buffer
-    let mut shadow_pixmap = pixmap.clone();
-
-    // Step 1: Offset the shadow pixels
-    offset_pixels(&mut shadow_pixmap, dx, dy);
-
-    // Step 2: Blur the already-offset shadow
-    if std_deviation > 0.0 {
-        let scratch =
-            filter_scratch.get_scratch_buffer(shadow_pixmap.width(), shadow_pixmap.height());
-        apply_blur(
-            &mut shadow_pixmap,
-            scratch,
-            n_decimations,
-            kernel,
-            edge_mode,
-        );
-    }
-
-    // Step 3: Apply shadow color and optionally composite with original
-    write_colored_shadow(&shadow_pixmap, pixmap, color, composite_original);
-}
-
-/// Apply the shadow color and optionally composite with the original.
-///
-/// The shadow has already been offset and blurred, so this simply applies
-/// the shadow color to the alpha channel and, when requested, composites the
-/// original over it using source-over.
-fn write_colored_shadow(
-    shadow: &FilterPixmap,
-    dst: &mut FilterPixmap,
-    color: AlphaColor<Srgb>,
-    composite_original: bool,
-) {
-    let width = dst.width();
-    let height = dst.height();
-
-    // Precompute shadow color components
+/// Replace every pixel by the shadow color with the pixel's alpha.
+fn colorize(pixmap: &mut FilterPixmap, color: AlphaColor<Srgb>) {
     let shadow_r = (color.components[0] * 255.0).round() as u8;
     let shadow_g = (color.components[1] * 255.0).round() as u8;
     let shadow_b = (color.components[2] * 255.0).round() as u8;
 
-    for y in 0..height {
-        for x in 0..width {
-            // Sample alpha directly (shadow is already offset)
-            let alpha = shadow.sample(x, y).a;
+    for pixel in pixmap.data_mut() {
+        let shadow_alpha = (u8_to_norm(pixel.a) * color.components[3]).min(1.0);
+        let final_alpha = norm_to_u8(shadow_alpha);
 
-            // Apply shadow color to alpha
-            let shadow_alpha = (u8_to_norm(alpha) * color.components[3]).min(1.0);
-            let final_alpha = norm_to_u8(shadow_alpha);
+        // Premultiply RGB by alpha as required by PremulRgba8
+        let alpha_u16 = u16::from(final_alpha);
+        let premultiply = |channel: u8| ((u16::from(channel) * alpha_u16) / 255) as u8;
 
-            // Premultiply RGB by alpha as required by PremulRgba8
-            let alpha_u16 = u16::from(final_alpha);
-            let premultiply = |channel: u8| ((u16::from(channel) * alpha_u16) / 255) as u8;
+        *pixel = PremulRgba8 {
+            r: premultiply(shadow_r),
+            g: premultiply(shadow_g),
+            b: premultiply(shadow_b),
+            a: final_alpha,
+        };
+    }
+}
 
-            let colored_shadow = PremulRgba8 {
-                r: premultiply(shadow_r),
-                g: premultiply(shadow_g),
-                b: premultiply(shadow_b),
-                a: final_alpha,
-            };
-
-            let result = if composite_original {
-                // Read original and composite: original over shadow
-                compose_src_over(dst.sample(x, y), colored_shadow)
-            } else {
-                colored_shadow
-            };
-
-            dst.set_pixel(x, y, result);
-        }
+/// Composite a row of the original over a row of its shadow.
+pub(crate) fn source_over(shadow: &mut [PremulRgba8], original: &[PremulRgba8]) {
+    for (shadow, original) in shadow.iter_mut().zip(original) {
+        *shadow = compose_src_over(*original, *shadow);
     }
 }
 
@@ -288,14 +228,11 @@ mod tests {
         );
     }
 
-    /// Test `write_colored_shadow` applies color correctly.
+    /// Test `colorize` applies color correctly.
     #[test]
-    fn test_compose_shadow_color() {
-        let mut shadow_pixmap = FilterPixmap::new(2, 2);
-        let mut dst_pixmap = FilterPixmap::new(2, 2);
-
-        // Shadow has alpha=255 at (0,0)
-        shadow_pixmap.set_pixel(
+    fn test_colorize() {
+        let mut pixmap = FilterPixmap::new(2, 1);
+        pixmap.set_pixel(
             0,
             0,
             PremulRgba8 {
@@ -305,19 +242,22 @@ mod tests {
                 a: 255,
             },
         );
-
         let shadow_color = AlphaColor {
-            components: [1.0, 0.0, 0.0, 1.0], // Red
+            components: [1.0, 0.0, 0.0, 0.5], // Half transparent red
             cs: std::marker::PhantomData::<Srgb>,
         };
 
-        write_colored_shadow(&shadow_pixmap, &mut dst_pixmap, shadow_color, true);
+        colorize(&mut pixmap, shadow_color);
 
-        // Shadow at (0,0) should be red
-        let result = dst_pixmap.sample(0, 0);
-        assert_eq!(result.r, 255);
-        assert_eq!(result.g, 0);
-        assert_eq!(result.b, 0);
-        assert_eq!(result.a, 255);
+        assert_eq!(
+            pixmap.sample(0, 0),
+            PremulRgba8 {
+                r: 128,
+                g: 0,
+                b: 0,
+                a: 128,
+            }
+        );
+        assert_eq!(pixmap.sample(1, 0).a, 0);
     }
 }

@@ -11,7 +11,7 @@ use crate::filter::drop_shadow::{DropShadow, transform_shadow_params};
 use crate::filter::flood::Flood;
 use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
 use crate::filter::offset::Offset;
-use crate::filter_effects::{Filter, FilterPrimitive};
+use crate::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use crate::geometry::{PaddingU16, PaddingU32, RectU16, SizeU16};
 use crate::kurbo::{Affine, Rect, Vec2};
 use crate::math::snap_up;
@@ -143,7 +143,7 @@ impl FilterLayerPlacement {
     /// Place a layer whose tight content bounds are `bbox`.
     ///
     /// `filter_plan` must fit its viewport, see [`FilterData::source_viewport_size`].
-    pub(crate) fn new(bbox: RectU16, filter_plan: &FilterData) -> Self {
+    pub fn new(bbox: RectU16, filter_plan: &FilterData) -> Self {
         if bbox.is_empty() {
             return Self::EMPTY;
         }
@@ -194,6 +194,23 @@ impl FilterLayerPlacement {
             dest_bbox,
             src_x,
             src_y,
+        }
+    }
+
+    /// Place a filtered pixmap that was rendered elsewhere and already covers
+    /// exactly `dest` in the parent layer.
+    ///
+    /// `dest` must start on a tile boundary.
+    pub fn rendered_at(dest: RectU16) -> Self {
+        assert!(
+            dest.x0.is_multiple_of(Tile::WIDTH) && dest.y0.is_multiple_of(Tile::HEIGHT),
+            "filter destination origin must be tile-aligned"
+        );
+        Self {
+            pixmap_bbox: dest,
+            dest_bbox: dest,
+            src_x: 0,
+            src_y: 0,
         }
     }
 
@@ -298,15 +315,56 @@ impl FilterData {
         (self.source_padding.left, self.source_padding.top)
     }
 
-    /// Return the device-space translation, rounded to whole pixels, if the
-    /// filter is a single offset primitive.
-    pub fn pure_offset(&self) -> Option<(i64, i64)> {
-        let [FilterPrimitive::Offset { dx, dy }] = self.filter.graph.primitives.as_slice() else {
+    /// Return how the filter moves its source, if it is a single offset or
+    /// drop shadow primitive.
+    pub fn displacement(&self) -> Option<Displacement> {
+        let [primitive] = self.filter.graph.primitives.as_slice() else {
             return None;
         };
-        let (dx, dy) = transform_offset_params(*dx, *dy, &self.transform);
-        Some((round(dx) as i64, round(dy) as i64))
+        let (dx, dy, std_deviation) = match primitive {
+            FilterPrimitive::Offset { dx, dy } => {
+                let (dx, dy) = transform_offset_params(*dx, *dy, &self.transform);
+                (dx, dy, 0.0)
+            }
+            FilterPrimitive::DropShadow {
+                dx,
+                dy,
+                std_deviation,
+                ..
+            }
+            | FilterPrimitive::DropShadowOnly {
+                dx,
+                dy,
+                std_deviation,
+                ..
+            } => transform_shadow_params(*dx, *dy, *std_deviation, &self.transform),
+            _ => return None,
+        };
+        let blur = FilterPrimitive::GaussianBlur {
+            std_deviation,
+            edge_mode: EdgeMode::None,
+        };
+        Some(Displacement {
+            offset: (round(dx) as i64, round(dy) as i64),
+            blur_padding: snapped_padding(blur.filter_expansion()),
+            keeps_source: matches!(primitive, FilterPrimitive::DropShadow { .. }),
+        })
     }
+}
+
+/// How an offset or drop shadow filter moves its source.
+///
+/// The output is a copy of the source moved by whole device pixels, blurred
+/// and recolored first for a drop shadow, with the source itself composited
+/// over it when `keeps_source` is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Displacement {
+    /// The translation of the moved copy, rounded half away from zero.
+    pub offset: (i64, i64),
+    /// How far the blur of the moved copy reads around each pixel; zero for an offset.
+    pub blur_padding: PaddingU32,
+    /// Whether the unmoved source is composited over the moved copy.
+    pub keeps_source: bool,
 }
 
 fn snapped_padding(expansion: Rect) -> PaddingU32 {
@@ -439,7 +497,6 @@ fn transform_offset_params(dx: f32, dy: f32, transform: &Affine) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::color::palette::css::RED;
-    use crate::filter_effects::EdgeMode;
 
     fn offset(dx: f32, dy: f32) -> FilterData {
         FilterData::new(
@@ -484,22 +541,62 @@ mod tests {
     }
 
     #[test]
-    fn pure_offset_rounds_half_away_from_zero_in_device_space() {
+    fn offset_displacement_rounds_half_away_from_zero_in_device_space() {
         for (amount, rounded) in [(-4.5, -5), (-0.5, -1), (0.5, 1), (4.5, 5)] {
             assert_eq!(
-                offset(amount, -amount).pure_offset(),
-                Some((rounded, -rounded))
+                offset(amount, -amount).displacement(),
+                Some(Displacement {
+                    offset: (rounded, -rounded),
+                    blur_padding: PaddingU32::ZERO,
+                    keeps_source: false,
+                })
             );
         }
         let scaled = FilterData::new(
             Filter::from_primitive(FilterPrimitive::Offset { dx: 1.5, dy: 0.0 }),
             Affine::scale(2.0),
         );
-        assert_eq!(scaled.pure_offset(), Some((3, 0)));
+        assert_eq!(scaled.displacement().unwrap().offset, (3, 0));
         assert_eq!(
-            FilterData::new(blur(1.0), Affine::IDENTITY).pure_offset(),
+            FilterData::new(blur(1.0), Affine::IDENTITY).displacement(),
             None
         );
+    }
+
+    #[test]
+    fn shadow_displacement_pads_only_the_applied_blur() {
+        for (primitive, keeps_source) in [
+            (
+                FilterPrimitive::DropShadow {
+                    dx: 1.5,
+                    dy: -70_000.0,
+                    std_deviation: 8.0,
+                    edge_mode: EdgeMode::None,
+                    color: RED,
+                },
+                true,
+            ),
+            (
+                FilterPrimitive::DropShadowOnly {
+                    dx: 1.5,
+                    dy: -70_000.0,
+                    std_deviation: 8.0,
+                    edge_mode: EdgeMode::None,
+                    color: RED,
+                },
+                false,
+            ),
+        ] {
+            let data = FilterData::new(Filter::from_primitive(primitive), Affine::scale(2.0));
+            assert_eq!(
+                data.displacement(),
+                Some(Displacement {
+                    offset: (3, -140_000),
+                    blur_padding: PaddingU32::new(48, 48, 48, 48),
+                    keeps_source,
+                })
+            );
+        }
     }
 
     #[test]

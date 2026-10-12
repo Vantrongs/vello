@@ -6,7 +6,9 @@ use crate::coarse::CommandBucketer;
 use crate::coarse::depth::DepthBuffer;
 use crate::dispatch::Dispatcher;
 use crate::filter::context::FilterContext;
+use crate::filter::displaced::DisplacedPlan;
 use crate::filter::pixmap::FilterPixmap;
+use crate::filter::placed::{Bounds, PlacedPixmap};
 use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_region};
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
@@ -18,7 +20,7 @@ use vello_common::TargetInit;
 use vello_common::color::AlphaColor;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd};
-use vello_common::filter::{FilterData, PreparedFilter};
+use vello_common::filter::{FilterData, FilterLayerPlacement, PreparedFilter};
 use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint, PremulColor};
@@ -29,6 +31,19 @@ use vello_common::record::{
 use vello_common::strip_generator::{GenerationMode, StripStorage};
 use vello_common::util::strip_bbox;
 use vello_common::viewport::ViewportState;
+
+/// How a filter layer is rendered from its commands, which are drawn in a source
+/// viewport translated by `source_shift` from root target coordinates.
+#[derive(Debug)]
+enum FilterSource {
+    /// Into one pixmap around its content, which is filtered as a whole.
+    Drawn { source_shift: (i64, i64) },
+    /// From the parts its visible output reads, see [`DisplacedPlan`].
+    Displaced {
+        source_shift: (i64, i64),
+        plan: DisplacedPlan,
+    },
+}
 
 /// Single-threaded implementation of the rendering dispatcher.
 #[derive(Debug)]
@@ -41,9 +56,10 @@ pub(crate) struct SingleThreadedDispatcher {
     recorder: CommandRecorder<RecordedFill>,
     /// Storage for generated strips and alpha coverage data.
     strip_storage: StripStorage,
-    /// Translation from root target coordinates to each filter layer's source
-    /// viewport, in the order of `recorder.filter_layers`.
-    filter_source_shifts: Vec<(i64, i64)>,
+    /// How each filter layer is rendered, in the order of `recorder.filter_layers`.
+    filter_sources: Vec<FilterSource>,
+    /// Indices into `filter_sources` of the open filter layers, innermost last.
+    open_filters: Vec<usize>,
     /// SIMD level for fearless SIMD dispatch.
     level: Level,
 }
@@ -61,7 +77,8 @@ impl SingleThreadedDispatcher {
             viewport: ViewportState::new(width, height, level),
             recorder: CommandRecorder::new(width, height),
             strip_storage: StripStorage::new(GenerationMode::Append),
-            filter_source_shifts: Vec::new(),
+            filter_sources: Vec::new(),
+            open_filters: Vec::new(),
             level,
         }
     }
@@ -271,69 +288,149 @@ impl SingleThreadedDispatcher {
         // parents. Subsequent sibling filter layers also get added after the previous layer they
         // are composited into. Therefore, iterating in reverse order is enough to ensure that all
         // dependencies have been rendered before they are invoked.
-        for (&id, &source_shift) in self
+        for (&id, source) in self
             .recorder
             .filter_layers
             .iter()
-            .zip(&self.filter_source_shifts)
+            .zip(&self.filter_sources)
             .rev()
         {
             let RecordedLayerKind::Filter {
-                filter_data: filter_plan,
+                filter_data,
                 placement,
             } = &self.recorder.layers[id as usize].kind
             else {
                 unreachable!("filter_layers only contains filter layers");
             };
-            let pixmap_bbox = placement.pixmap_bbox();
-            if pixmap_bbox.is_empty() {
+            if placement.pixmap_bbox().is_empty() {
                 continue;
             }
+            let filter = PreparedFilter::new(&filter_data.filter, &filter_data.transform);
 
-            let width = pixmap_bbox.width();
-            let height = pixmap_bbox.height();
-            // TODO: See https://github.com/linebender/vello/pull/1701#discussion_r3400709986, explore
-            // using pools for more resources.
-            let mut pixmap = FilterPixmap::new(u32::from(width), u32::from(height));
-            let params = FineRenderParams {
-                scene_size: (width, height),
-                target_offset: (0, 0),
+            let pixmap = match source {
+                FilterSource::Drawn { source_shift } => {
+                    let mut pixmap = self.rasterize_layer::<S, F>(
+                        simd,
+                        id,
+                        placement.pixmap_bbox(),
+                        *source_shift,
+                        &filter_ctx,
+                        encoded_paints,
+                        image_resolver,
+                    );
+                    F::filter_layer(&mut pixmap, filter, filter_ctx.scratch());
+                    pixmap
+                }
+                FilterSource::Displaced { source_shift, plan } => {
+                    let pieces = self.rasterize_areas::<S, F>(
+                        simd,
+                        id,
+                        plan.source_areas(),
+                        *source_shift,
+                        &filter_ctx,
+                        encoded_paints,
+                        image_resolver,
+                    );
+                    plan.assemble(pieces, |pixmap| {
+                        F::filter_layer(pixmap, filter, filter_ctx.scratch());
+                    })
+                    .pixmap
+                }
             };
-            let mask_offset = (
-                i64::from(pixmap_bbox.x0) - source_shift.0,
-                i64::from(pixmap_bbox.y0) - source_shift.1,
-            );
-
-            self.bucket_and_rasterize::<S, F>(
-                simd,
-                &self.recorder.layers[id as usize].nodes,
-                pixmap_bbox,
-                &filter_ctx,
-                pixmap.as_target(),
-                params,
-                mask_offset,
-                TargetInit::Clear(PremulColor::from_alpha_color(AlphaColor::TRANSPARENT)),
-                false,
-                encoded_paints,
-                image_resolver,
-            );
-
-            F::filter_layer(
-                &mut pixmap,
-                PreparedFilter::new(&filter_plan.filter, &filter_plan.transform),
-                filter_ctx.scratch(),
-            );
-
-            let pixmap = pixmap.into_pixmap();
 
             // Save the filtered pixmap to disk for debugging.
             // #[cfg(all(debug_assertions, feature = "std", feature = "png"))]
             // save_filtered_layer_debug(&pixmap, id);
 
-            filter_ctx.set_layer(id as usize, pixmap);
+            filter_ctx.set_layer(id as usize, pixmap.into_pixmap());
         }
 
         filter_ctx
+    }
+
+    /// Rasterize the commands of filter layer `id` inside `area` of its source
+    /// viewport, unfiltered.
+    fn rasterize_layer<S: Simd, F: FineKernel<S>>(
+        &self,
+        simd: S,
+        id: u32,
+        area: RectU16,
+        source_shift: (i64, i64),
+        filter_ctx: &FilterContext,
+        encoded_paints: &[EncodedPaint],
+        image_resolver: &dyn ImageResolver,
+    ) -> FilterPixmap {
+        let (width, height) = (area.width(), area.height());
+        // TODO: See https://github.com/linebender/vello/pull/1701#discussion_r3400709986, explore
+        // using pools for more resources.
+        let mut pixmap = FilterPixmap::new(u32::from(width), u32::from(height));
+        let params = FineRenderParams {
+            scene_size: (width, height),
+            target_offset: (0, 0),
+        };
+        let mask_offset = (
+            i64::from(area.x0) - source_shift.0,
+            i64::from(area.y0) - source_shift.1,
+        );
+
+        self.bucket_and_rasterize::<S, F>(
+            simd,
+            &self.recorder.layers[id as usize].nodes,
+            area,
+            filter_ctx,
+            pixmap.as_target(),
+            params,
+            mask_offset,
+            TargetInit::Clear(PremulColor::from_alpha_color(AlphaColor::TRANSPARENT)),
+            false,
+            encoded_paints,
+            image_resolver,
+        );
+        pixmap
+    }
+
+    /// Rasterize filter layer `id` inside each of `areas` of its source viewport.
+    fn rasterize_areas<S: Simd, F: FineKernel<S>>(
+        &self,
+        simd: S,
+        id: u32,
+        areas: impl Iterator<Item = Bounds>,
+        source_shift: (i64, i64),
+        filter_ctx: &FilterContext,
+        encoded_paints: &[EncodedPaint],
+        image_resolver: &dyn ImageResolver,
+    ) -> Vec<PlacedPixmap> {
+        areas
+            .map(|area| {
+                let rect = area.to_rect_u16((0, 0));
+                PlacedPixmap {
+                    pixmap: self.rasterize_layer::<S, F>(
+                        simd,
+                        id,
+                        rect,
+                        source_shift,
+                        filter_ctx,
+                        encoded_paints,
+                        image_resolver,
+                    ),
+                    bounds: Bounds::of_rect(rect, (0, 0)),
+                }
+            })
+            .collect()
+    }
+
+    /// Plan where a displaced filter layer with content in `bbox` is composited,
+    /// given the size of its source viewport.
+    fn place_displaced(
+        bbox: RectU16,
+        filter: &FilterData,
+        source_viewport: Bounds,
+    ) -> Option<(DisplacedPlan, FilterLayerPlacement)> {
+        let displacement = filter.displacement()?;
+        let view = source_viewport.shrink(filter.source_padding);
+        let plan = DisplacedPlan::new(displacement, Bounds::of_rect(bbox, (0, 0)), view);
+        let dest = plan.output().to_rect_u16((view.x0, view.y0));
+        Some((plan, FilterLayerPlacement::rendered_at(dest)))
     }
 }
 
@@ -427,7 +524,10 @@ impl Dispatcher for SingleThreadedDispatcher {
         });
         if let Some(filter_data) = &filter_data {
             self.viewport.push_root_viewport(filter_data);
-            self.filter_source_shifts.push(self.viewport.source_shift());
+            self.open_filters.push(self.filter_sources.len());
+            self.filter_sources.push(FilterSource::Drawn {
+                source_shift: self.viewport.source_shift(),
+            });
         }
 
         self.recorder.push_layer(
@@ -442,19 +542,36 @@ impl Dispatcher for SingleThreadedDispatcher {
     }
 
     fn pop_layer(&mut self) {
-        match self.recorder.pop_layer() {
-            PoppedLayer::Regular => {}
-            PoppedLayer::Filter => {
-                self.viewport.pop_root_viewport();
+        let source_viewport = Bounds::of_viewport(self.viewport.width(), self.viewport.height());
+        let mut displaced = None;
+        let popped = self.recorder.pop_layer_placed(|bbox, filter| {
+            match Self::place_displaced(bbox, filter, source_viewport) {
+                Some((plan, placement)) => {
+                    displaced = Some(plan);
+                    placement
+                }
+                None => FilterLayerPlacement::new(bbox, filter),
             }
+        });
+        if popped == PoppedLayer::Regular {
+            return;
         }
+        let index = self.open_filters.pop().unwrap();
+        if let Some(plan) = displaced {
+            let FilterSource::Drawn { source_shift } = self.filter_sources[index] else {
+                unreachable!("an open filter layer is drawn until it is popped");
+            };
+            self.filter_sources[index] = FilterSource::Displaced { source_shift, plan };
+        }
+        self.viewport.pop_root_viewport();
     }
 
     fn reset(&mut self, width: u16, height: u16) {
         // Bucketer will be reset on demand, so no need to reset it here.
         self.recorder.reset(width, height);
         self.strip_storage.clear();
-        self.filter_source_shifts.clear();
+        self.filter_sources.clear();
+        self.open_filters.clear();
         self.viewport.reset(width, height);
     }
 

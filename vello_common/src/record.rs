@@ -306,6 +306,15 @@ impl<D> CommandRecorder<D> {
 
     /// Pop the currently active layer.
     pub fn pop_layer(&mut self) -> PoppedLayer {
+        self.pop_layer_placed(FilterLayerPlacement::new)
+    }
+
+    /// Pop the currently active layer. If it is a filter layer, `place` decides
+    /// where it is composited, given its tight content bounds and its filter.
+    pub fn pop_layer_placed(
+        &mut self,
+        place: impl FnOnce(RectU16, &FilterData) -> FilterLayerPlacement,
+    ) -> PoppedLayer {
         let layer = self.layer_stack.pop().unwrap();
         let id = layer.id;
 
@@ -338,7 +347,7 @@ impl<D> CommandRecorder<D> {
                     filter_data: filter_plan,
                     placement,
                 } => {
-                    *placement = FilterLayerPlacement::new(layer.bbox, filter_plan);
+                    *placement = place(layer.bbox, filter_plan);
                     recorded_layer.bbox = placement.pixmap_bbox();
 
                     let filter_size = placement.pixmap_bbox().into();

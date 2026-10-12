@@ -9,12 +9,12 @@
 //! intermediate buffers.
 
 pub(crate) mod context;
+pub(crate) mod displaced;
 mod drop_shadow;
 mod flood;
 mod gaussian_blur;
-mod offset;
 pub(crate) mod pixmap;
-mod shift;
+pub(crate) mod placed;
 
 use crate::filter::pixmap::FilterPixmap;
 use context::ScratchBuffer;
@@ -68,9 +68,9 @@ pub(crate) fn filter_lowp(
         PreparedFilter::GaussianBlur(blur) => {
             blur.execute_lowp(pixmap, filter_scratch);
         }
-        PreparedFilter::Offset(offset) => {
-            offset.execute_lowp(pixmap, filter_scratch);
-        }
+        // An offset only moves pixels, which happens when the layer's output
+        // is assembled, see `displaced`.
+        PreparedFilter::Offset(_) => {}
         PreparedFilter::DropShadow(drop_shadow) => {
             drop_shadow.execute_lowp(pixmap, filter_scratch);
         }
@@ -102,9 +102,9 @@ pub(crate) fn filter_highp(
         PreparedFilter::GaussianBlur(blur) => {
             blur.execute_highp(pixmap, filter_scratch);
         }
-        PreparedFilter::Offset(offset) => {
-            offset.execute_highp(pixmap, filter_scratch);
-        }
+        // An offset only moves pixels, which happens when the layer's output
+        // is assembled, see `displaced`.
+        PreparedFilter::Offset(_) => {}
         PreparedFilter::DropShadow(drop_shadow) => {
             drop_shadow.execute_highp(pixmap, filter_scratch);
         }
