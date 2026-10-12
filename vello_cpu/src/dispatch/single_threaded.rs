@@ -228,6 +228,37 @@ impl SingleThreadedDispatcher {
         self.recorder.push_draw(draw, strips);
     }
 
+    /// Generate the strips of a layer clip in the active viewport.
+    fn layer_clip(
+        &mut self,
+        path: &BezPath,
+        fill_rule: Fill,
+        transform: Affine,
+        aliasing_threshold: Option<u8>,
+    ) -> LayerClip {
+        let strip_start = self.strip_storage.strips.len();
+        let strip_storage = &mut self.strip_storage;
+        self.viewport
+            .with_generator_and_clip(|strip_generator, existing_clip| {
+                strip_generator.generate_filled_path(
+                    path,
+                    fill_rule,
+                    transform,
+                    aliasing_threshold,
+                    strip_storage,
+                    existing_clip.map(|clip| clip.path),
+                );
+
+                let strip_range = strip_start..strip_storage.strips.len();
+                LayerClip {
+                    bbox: strip_bbox(&strip_storage.strips[strip_range.clone()])
+                        .unwrap_or(RectU16::ZERO),
+                    strip_range,
+                    thread_idx: 0,
+                }
+            })
+    }
+
     fn rasterize_filter_layers<S: Simd, F: FineKernel<S>>(
         &self,
         simd: S,
@@ -390,34 +421,14 @@ impl Dispatcher for SingleThreadedDispatcher {
         mask: Option<Mask>,
         filter_data: Option<FilterData>,
     ) {
+        // The clip applies where the filtered layer is composited, in the parent viewport.
+        let clip_path = clip_path.map(|clip_path| {
+            self.layer_clip(clip_path, fill_rule, clip_transform, aliasing_threshold)
+        });
         if let Some(filter_data) = &filter_data {
             self.viewport.push_root_viewport(filter_data);
             self.filter_source_shifts.push(self.viewport.source_shift());
         }
-
-        let clip_path = clip_path.map(|clip_path| {
-            let strip_start = self.strip_storage.strips.len();
-            let strip_storage = &mut self.strip_storage;
-            self.viewport
-                .with_generator_and_clip(|strip_generator, existing_clip| {
-                    strip_generator.generate_filled_path(
-                        clip_path,
-                        fill_rule,
-                        clip_transform,
-                        aliasing_threshold,
-                        strip_storage,
-                        existing_clip.map(|clip| clip.path),
-                    );
-
-                    let strip_range = strip_start..strip_storage.strips.len();
-                    LayerClip {
-                        bbox: strip_bbox(&strip_storage.strips[strip_range.clone()])
-                            .unwrap_or(RectU16::ZERO),
-                        strip_range,
-                        thread_idx: 0,
-                    }
-                })
-        });
 
         self.recorder.push_layer(
             LayerProps {
