@@ -542,7 +542,7 @@ impl EncodeExt for Image {
 }
 
 /// An encoded paint.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum EncodedPaint {
     /// An encoded gradient.
     Gradient(EncodedGradient),
@@ -586,7 +586,7 @@ impl From<EncodedBlurredRoundedRectangle> for EncodedPaint {
 }
 
 /// An encoded image.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EncodedImage {
     /// The underlying pixmap of the image.
     pub source: ImageSource,
@@ -727,7 +727,7 @@ impl RadialKind {
 }
 
 /// Computed properties of a sweep gradient.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SweepKind {
     /// The start angle of the sweep gradient.
     pub start_angle: f32,
@@ -736,7 +736,7 @@ pub struct SweepKind {
 }
 
 /// A kind of encoded gradient.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum EncodedKind {
     /// An encoded linear gradient.
     Linear(LinearKind),
@@ -757,7 +757,7 @@ impl EncodedKind {
 }
 
 /// An encoded gradient.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EncodedGradient {
     /// The cache key for the gradient.
     pub cache_key: CacheKey<GradientCacheKey>,
@@ -844,7 +844,7 @@ pub struct GradientRange {
 }
 
 /// An encoded blurred, rounded rectangle.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EncodedBlurredRoundedRectangle {
     /// An component for computing the blur effect.
     pub exponent: f32,
@@ -1021,7 +1021,7 @@ impl GradientLutExt for u8 {
 }
 
 /// A lookup table for sampled gradient values.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GradientLut<T: GradientLutExt> {
     lut: Vec<[T; 4]>,
     scale: f32,

@@ -10,19 +10,13 @@ use vello_common::pixmap::Pixmap;
 pub(crate) struct FilterContext {
     /// The rendered pixmaps for each filter layer.
     layers: Vec<Option<Arc<Pixmap>>>,
-    scratch: ScratchBuffer,
 }
 
 impl FilterContext {
     pub(crate) fn new(num_layers: usize) -> Self {
         Self {
             layers: (0..num_layers).map(|_| None).collect(),
-            scratch: ScratchBuffer::new(),
         }
-    }
-
-    pub(crate) fn scratch(&mut self) -> &mut ScratchBuffer {
-        &mut self.scratch
     }
 
     pub(crate) fn set_layer(&mut self, id: usize, pixmap: Pixmap) {

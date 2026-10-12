@@ -5,6 +5,7 @@
 
 use crate::RenderMode;
 use crate::dispatch::Dispatcher;
+use crate::dispatch::filter_graph::Recording;
 #[cfg(feature = "multithreading")]
 use crate::dispatch::multi_threaded::MultiThreadedDispatcher;
 #[cfg(feature = "text")]
@@ -18,6 +19,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::any::Any;
 use hashbrown::HashMap;
 use vello_common::blurred_rounded_rect::BlurredRoundedRectangle;
 use vello_common::color::{AlphaColor, Srgb};
@@ -163,6 +165,9 @@ pub struct RenderContext {
     )]
     pub(crate) render_settings: RenderSettings,
     dispatcher: Box<dyn Dispatcher>,
+    /// While `dispatcher` records a filter layer, the dispatcher the layer is
+    /// drawn into once it is popped, see [`Dispatcher::record_filter_layer`].
+    recording_target: Option<Box<dyn Dispatcher>>,
 }
 
 /// Settings to apply to the render context.
@@ -223,6 +228,7 @@ impl RenderContext {
             width,
             height,
             dispatcher,
+            recording_target: None,
             state: RenderState::default(),
             root_transforms: RootTransforms::default(),
             aliasing_threshold,
@@ -500,7 +506,8 @@ impl RenderContext {
     /// # Panics
     ///
     /// Panics if `filter` is provided when this context uses multi-threaded rendering.
-    /// Also panics if the filter's required source viewport exceeds `u16` dimensions.
+    /// Also panics, without changing the context, if the filter is invalid (see
+    /// [`FilterData::new`]).
     pub fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,
@@ -534,6 +541,11 @@ impl RenderContext {
             let (shift_x, shift_y) = data.source_shift();
             Affine::translate((f64::from(shift_x), f64::from(shift_y)))
         });
+        // A filter layer nested in a recorded one is recorded with it.
+        let recorded = filter_data
+            .as_ref()
+            .filter(|_| self.recording_target.is_none())
+            .cloned();
         self.dispatcher.push_layer(
             clip_path,
             self.state.fill_rule,
@@ -544,6 +556,10 @@ impl RenderContext {
             mask,
             filter_data,
         );
+        if let Some(filter) = recorded {
+            let recording = Box::new(self.dispatcher.record_filter_layer(filter));
+            self.recording_target = Some(core::mem::replace(&mut self.dispatcher, recording));
+        }
         self.root_transforms.push_root(relative_transform);
     }
 
@@ -607,6 +623,12 @@ impl RenderContext {
     pub fn pop_layer(&mut self) {
         self.dispatcher.pop_layer();
         self.root_transforms.pop_root();
+        if self.recording_target.is_some() && !self.dispatcher.has_layers() {
+            let target = self.recording_target.take().unwrap();
+            let recording = core::mem::replace(&mut self.dispatcher, target);
+            let recording = (recording as Box<dyn Any>).downcast::<Recording>().unwrap();
+            self.dispatcher.draw_recording(*recording);
+        }
     }
 
     /// Set the current stroke.
@@ -744,6 +766,9 @@ impl RenderContext {
 
     /// Reset the render context.
     pub fn reset(&mut self) {
+        if let Some(target) = self.recording_target.take() {
+            self.dispatcher = target;
+        }
         self.dispatcher.reset(self.width, self.height);
         self.encoded_paints.clear();
         self.mask = None;

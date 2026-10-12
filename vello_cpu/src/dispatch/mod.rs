@@ -1,13 +1,16 @@
 // Copyright 2025 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+pub(crate) mod filter_graph;
 #[cfg(feature = "multithreading")]
 pub(crate) mod multi_threaded;
 pub(crate) mod single_threaded;
 
 use crate::RasterizerSettings;
+use crate::dispatch::filter_graph::Recording;
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
+use core::any::Any;
 use core::fmt::Debug;
 use vello_common::encode::EncodedPaint;
 use vello_common::filter::FilterData;
@@ -15,7 +18,7 @@ use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint};
 use vello_common::pixmap::PixmapMut;
 
-pub(crate) trait Dispatcher: Debug + Send {
+pub(crate) trait Dispatcher: Any + Debug + Send {
     fn has_layers(&self) -> bool;
     fn fill_path(
         &mut self,
@@ -78,4 +81,16 @@ pub(crate) trait Dispatcher: Debug + Send {
         image_resolver: &dyn ImageResolver,
     );
     fn is_multi_threaded(&self) -> bool;
+    /// Start recording the filter layer just pushed with `filter`. Its commands
+    /// go to the returned recording until it is popped, and the recording then
+    /// to [`Self::draw_recording`].
+    fn record_filter_layer(&mut self, filter: FilterData) -> Recording {
+        let _ = filter;
+        unreachable!("only the single-threaded dispatcher renders filters");
+    }
+    /// Composite the filter layer recorded in `recording`.
+    fn draw_recording(&mut self, recording: Recording) {
+        let _ = recording;
+        unreachable!("only the single-threaded dispatcher renders filters");
+    }
 }

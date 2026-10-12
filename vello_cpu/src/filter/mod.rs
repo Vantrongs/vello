@@ -12,11 +12,12 @@ pub(crate) mod context;
 mod drop_shadow;
 mod flood;
 mod gaussian_blur;
-mod offset;
 pub(crate) mod pixmap;
-mod shift;
+pub(crate) mod placed;
+pub(crate) mod plan;
 
 use crate::filter::pixmap::FilterPixmap;
+use crate::filter::placed::Bounds;
 use context::ScratchBuffer;
 use vello_common::filter::PreparedFilter;
 
@@ -68,9 +69,9 @@ pub(crate) fn filter_lowp(
         PreparedFilter::GaussianBlur(blur) => {
             blur.execute_lowp(pixmap, filter_scratch);
         }
-        PreparedFilter::Offset(offset) => {
-            offset.execute_lowp(pixmap, filter_scratch);
-        }
+        // An offset only moves pixels, which happens when the layer's output
+        // is assembled, see `plan`.
+        PreparedFilter::Offset(_) => {}
         PreparedFilter::DropShadow(drop_shadow) => {
             drop_shadow.execute_lowp(pixmap, filter_scratch);
         }
@@ -102,11 +103,53 @@ pub(crate) fn filter_highp(
         PreparedFilter::GaussianBlur(blur) => {
             blur.execute_highp(pixmap, filter_scratch);
         }
-        PreparedFilter::Offset(offset) => {
-            offset.execute_highp(pixmap, filter_scratch);
-        }
+        // An offset only moves pixels, which happens when the layer's output
+        // is assembled, see `plan`.
+        PreparedFilter::Offset(_) => {}
         PreparedFilter::DropShadow(drop_shadow) => {
             drop_shadow.execute_highp(pixmap, filter_scratch);
+        }
+    }
+}
+
+/// Apply a blur or drop shadow to `pixmap`, whose pixels each cover
+/// `2^levels` pixels of the output on both axes, and return the output inside
+/// `crop`, which is relative to the pixmap's origin in output pixels.
+///
+/// Both kernels apply blurs and drop shadows at low precision, so this serves both.
+pub(crate) fn filter_reduced(
+    filter: PreparedFilter,
+    pixmap: FilterPixmap,
+    levels: u32,
+    crop: Bounds,
+    filter_scratch: &mut ScratchBuffer,
+) -> FilterPixmap {
+    let scratch = filter_scratch.get_scratch_buffer(pixmap.width(), pixmap.height());
+    match filter {
+        PreparedFilter::GaussianBlur(blur) => gaussian_blur::apply_reduced_blur(
+            pixmap,
+            scratch,
+            blur.n_decimations,
+            &blur.kernel[..usize::from(blur.kernel_size)],
+            blur.edge_mode,
+            levels,
+            crop,
+        ),
+        PreparedFilter::DropShadow(shadow) => {
+            let mut output = gaussian_blur::apply_reduced_blur(
+                pixmap,
+                scratch,
+                shadow.n_decimations,
+                &shadow.kernel[..usize::from(shadow.kernel_size)],
+                shadow.edge_mode,
+                levels,
+                crop,
+            );
+            drop_shadow::colorize(&mut output, shadow.color);
+            output
+        }
+        PreparedFilter::Flood(_) | PreparedFilter::Offset(_) => {
+            unreachable!("only blurs read a reduced source")
         }
     }
 }

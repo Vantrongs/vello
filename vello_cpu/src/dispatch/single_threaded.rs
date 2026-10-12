@@ -5,20 +5,23 @@ use crate::RasterizerSettings;
 use crate::coarse::CommandBucketer;
 use crate::coarse::depth::DepthBuffer;
 use crate::dispatch::Dispatcher;
+use crate::dispatch::filter_graph::{Clip, FilterGraph, Layer, Recording, content_filter, crop};
 use crate::filter::context::FilterContext;
 use crate::filter::pixmap::FilterPixmap;
+use crate::filter::placed::{Bounds, PlacedPixmap};
 use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_region};
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
 use crate::record::RecordedFill;
 use crate::region::Regions;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use vello_common::TargetInit;
 use vello_common::color::AlphaColor;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd};
-use vello_common::filter::{FilterData, PreparedFilter};
+use vello_common::filter::{FilterData, FilterLayerPlacement};
 use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint, PremulColor};
@@ -41,11 +44,26 @@ pub(crate) struct SingleThreadedDispatcher {
     recorder: CommandRecorder<RecordedFill>,
     /// Storage for generated strips and alpha coverage data.
     strip_storage: StripStorage,
-    /// Translation from root target coordinates to each filter layer's source
-    /// viewport, in the order of `recorder.filter_layers`.
-    filter_source_shifts: Vec<(i64, i64)>,
+    /// How each filter layer is rendered, in the order of `recorder.filter_layers`.
+    filter_sources: Vec<FilterSource>,
+    /// Where the target starts in the pixel grid it belongs to: the root target
+    /// for the root dispatcher, the grid of its window for a window. Masks and
+    /// the outputs of nested filters are placed in that grid.
+    grid_origin: (i64, i64),
     /// SIMD level for fearless SIMD dispatch.
     level: Level,
+}
+
+/// How a filter layer is rendered.
+#[derive(Debug)]
+enum FilterSource {
+    /// From its source regions, see [`FilterGraph`].
+    Graph(Box<FilterGraph>),
+    /// By the enclosing filter graph, as the output of its node `node`.
+    Injected { node: usize },
+    /// Not filtered: the layer holds the content of a window and is returned
+    /// by [`SingleThreadedDispatcher::render_window`].
+    WindowContent,
 }
 
 impl SingleThreadedDispatcher {
@@ -61,9 +79,131 @@ impl SingleThreadedDispatcher {
             viewport: ViewportState::new(width, height, level),
             recorder: CommandRecorder::new(width, height),
             strip_storage: StripStorage::new(GenerationMode::Append),
-            filter_source_shifts: Vec::new(),
+            filter_sources: Vec::new(),
+            grid_origin: (0, 0),
             level,
         }
+    }
+
+    /// Create a dispatcher for a window that starts at `origin` in its pixel
+    /// grid and let `draw` replay the window's commands into it.
+    ///
+    /// Everything drawn goes into one filter layer that holds the window content.
+    pub(crate) fn window(
+        width: u16,
+        height: u16,
+        level: Level,
+        origin: (i64, i64),
+        draw: impl FnOnce(&mut Self),
+    ) -> Self {
+        let mut window = Self {
+            grid_origin: origin,
+            ..Self::new(width, height, level)
+        };
+        let content = content_filter();
+        window.viewport.push_root_viewport(&content);
+        window.filter_sources.push(FilterSource::WindowContent);
+        window.recorder.push_layer(
+            LayerProps {
+                blend_mode: BlendMode::default(),
+                opacity: 1.0,
+                mask: None,
+                clip_path: None,
+            },
+            Some(content),
+        );
+        draw(&mut window);
+        window.pop_layer();
+        window
+    }
+
+    #[cfg(test)]
+    pub(crate) fn strip_count(&self) -> usize {
+        self.strip_storage.strips.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn size(&self) -> (u16, u16) {
+        (self.viewport.width(), self.viewport.height())
+    }
+
+    /// Return the bounds of the window content in the window's grid.
+    pub(crate) fn window_content(&self) -> Bounds {
+        Bounds::of_rect(
+            self.window_content_placement().pixmap_bbox(),
+            self.grid_origin,
+        )
+    }
+
+    fn window_content_placement(&self) -> FilterLayerPlacement {
+        let RecordedLayerKind::Filter { placement, .. } =
+            &self.recorder.layers[self.recorder.filter_layers[0] as usize].kind
+        else {
+            unreachable!("a window starts with its content layer");
+        };
+        *placement
+    }
+
+    /// Render the window content, or return `None` if it is empty. `nested`
+    /// holds the outputs of the nodes of the enclosing filter graph.
+    pub(crate) fn render_window<S: Simd, F: FineKernel<S>>(
+        &self,
+        simd: S,
+        encoded_paints: &[EncodedPaint],
+        image_resolver: &dyn ImageResolver,
+        nested: &[Vec<PlacedPixmap>],
+    ) -> Option<PlacedPixmap> {
+        let bbox = self.window_content_placement().pixmap_bbox();
+        if bbox.is_empty() {
+            return None;
+        }
+        let filters =
+            self.rasterize_filter_layers::<S, F>(simd, encoded_paints, image_resolver, nested);
+        let pixmap = self.rasterize_layer::<S, F>(
+            simd,
+            self.recorder.filter_layers[0],
+            bbox,
+            &filters,
+            encoded_paints,
+            image_resolver,
+        );
+        Some(PlacedPixmap {
+            pixmap,
+            bounds: Bounds::of_rect(bbox, self.grid_origin),
+        })
+    }
+
+    /// Push and pop a nested filter layer whose output is the node `node` of
+    /// the enclosing filter graph, composited at `dest`.
+    pub(crate) fn push_rendered_filter_layer(
+        &mut self,
+        layer: &Layer,
+        mask: Option<Mask>,
+        to_window: Affine,
+        filter: FilterData,
+        dest: RectU16,
+        node: usize,
+    ) {
+        let clip_path = layer.clip_path.as_ref().map(|path| {
+            self.layer_clip(
+                path,
+                layer.fill_rule,
+                to_window * layer.clip_transform,
+                layer.aliasing_threshold,
+            )
+        });
+        self.recorder.push_layer(
+            LayerProps {
+                blend_mode: layer.blend_mode,
+                opacity: layer.opacity,
+                mask,
+                clip_path,
+            },
+            Some(filter),
+        );
+        self.recorder
+            .pop_rendered_filter_layer(FilterLayerPlacement::rendered_at(dest));
+        self.filter_sources.push(FilterSource::Injected { node });
     }
 
     /// Rasterizes the scene using f32 precision (high quality).
@@ -116,7 +256,8 @@ impl SingleThreadedDispatcher {
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
     ) {
-        let filters = self.rasterize_filter_layers::<S, F>(simd, encoded_paints, image_resolver);
+        let filters =
+            self.rasterize_filter_layers::<S, F>(simd, encoded_paints, image_resolver, &[]);
         let target_init = settings.target_init.map(PremulColor::from_alpha_color);
         let params = FineRenderParams {
             scene_size: (scene_width, scene_height),
@@ -130,7 +271,7 @@ impl SingleThreadedDispatcher {
             &filters,
             target,
             params,
-            (0, 0),
+            self.grid_origin,
             target_init,
             self.recorder.root_is_blend_target,
             encoded_paints,
@@ -259,81 +400,83 @@ impl SingleThreadedDispatcher {
             })
     }
 
+    /// Render and filter every filter layer. `nested` holds the outputs of the
+    /// nodes of the enclosing filter graph, for the layers injected into a window.
     fn rasterize_filter_layers<S: Simd, F: FineKernel<S>>(
         &self,
         simd: S,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
+        nested: &[Vec<PlacedPixmap>],
     ) -> FilterContext {
         // TODO: Reuse across frames so that pixmaps can be reused.
         let mut filter_ctx = FilterContext::new(self.recorder.layers.len());
-        // We record filter layers upon "push", so nested filter layers get added after their
-        // parents. Subsequent sibling filter layers also get added after the previous layer they
-        // are composited into. Therefore, iterating in reverse order is enough to ensure that all
-        // dependencies have been rendered before they are invoked.
-        for (&id, &source_shift) in self
-            .recorder
-            .filter_layers
-            .iter()
-            .zip(&self.filter_source_shifts)
-            .rev()
-        {
-            let RecordedLayerKind::Filter {
-                filter_data: filter_plan,
-                placement,
-            } = &self.recorder.layers[id as usize].kind
+        for (&id, source) in self.recorder.filter_layers.iter().zip(&self.filter_sources) {
+            let RecordedLayerKind::Filter { placement, .. } =
+                &self.recorder.layers[id as usize].kind
             else {
                 unreachable!("filter_layers only contains filter layers");
             };
-            let pixmap_bbox = placement.pixmap_bbox();
-            if pixmap_bbox.is_empty() {
+            if placement.pixmap_bbox().is_empty() {
                 continue;
             }
-
-            let width = pixmap_bbox.width();
-            let height = pixmap_bbox.height();
-            // TODO: See https://github.com/linebender/vello/pull/1701#discussion_r3400709986, explore
-            // using pools for more resources.
-            let mut pixmap = FilterPixmap::new(u32::from(width), u32::from(height));
-            let params = FineRenderParams {
-                scene_size: (width, height),
-                target_offset: (0, 0),
+            let dest = Bounds::of_rect(placement.dest_bbox(), self.grid_origin);
+            let pixmap = match source {
+                FilterSource::Graph(graph) => crop(
+                    &graph.render::<S, F>(simd, encoded_paints, image_resolver),
+                    dest,
+                ),
+                FilterSource::Injected { node } => crop(&nested[*node], dest),
+                FilterSource::WindowContent => continue,
             };
-            let mask_offset = (
-                i64::from(pixmap_bbox.x0) - source_shift.0,
-                i64::from(pixmap_bbox.y0) - source_shift.1,
-            );
-
-            self.bucket_and_rasterize::<S, F>(
-                simd,
-                &self.recorder.layers[id as usize].nodes,
-                pixmap_bbox,
-                &filter_ctx,
-                pixmap.as_target(),
-                params,
-                mask_offset,
-                TargetInit::Clear(PremulColor::from_alpha_color(AlphaColor::TRANSPARENT)),
-                false,
-                encoded_paints,
-                image_resolver,
-            );
-
-            F::filter_layer(
-                &mut pixmap,
-                PreparedFilter::new(&filter_plan.filter, &filter_plan.transform),
-                filter_ctx.scratch(),
-            );
-
-            let pixmap = pixmap.into_pixmap();
 
             // Save the filtered pixmap to disk for debugging.
             // #[cfg(all(debug_assertions, feature = "std", feature = "png"))]
             // save_filtered_layer_debug(&pixmap, id);
 
-            filter_ctx.set_layer(id as usize, pixmap);
+            filter_ctx.set_layer(id as usize, pixmap.pixmap.into_pixmap());
         }
 
         filter_ctx
+    }
+
+    /// Rasterize the commands of filter layer `id` inside `area`, unfiltered.
+    fn rasterize_layer<S: Simd, F: FineKernel<S>>(
+        &self,
+        simd: S,
+        id: u32,
+        area: RectU16,
+        filter_ctx: &FilterContext,
+        encoded_paints: &[EncodedPaint],
+        image_resolver: &dyn ImageResolver,
+    ) -> FilterPixmap {
+        let (width, height) = (area.width(), area.height());
+        // TODO: See https://github.com/linebender/vello/pull/1701#discussion_r3400709986, explore
+        // using pools for more resources.
+        let mut pixmap = FilterPixmap::new(u32::from(width), u32::from(height));
+        let params = FineRenderParams {
+            scene_size: (width, height),
+            target_offset: (0, 0),
+        };
+        let mask_offset = (
+            i64::from(area.x0) + self.grid_origin.0,
+            i64::from(area.y0) + self.grid_origin.1,
+        );
+
+        self.bucket_and_rasterize::<S, F>(
+            simd,
+            &self.recorder.layers[id as usize].nodes,
+            area,
+            filter_ctx,
+            pixmap.as_target(),
+            params,
+            mask_offset,
+            TargetInit::Clear(PremulColor::from_alpha_color(AlphaColor::TRANSPARENT)),
+            false,
+            encoded_paints,
+            image_resolver,
+        );
+        pixmap
     }
 }
 
@@ -425,10 +568,6 @@ impl Dispatcher for SingleThreadedDispatcher {
         let clip_path = clip_path.map(|clip_path| {
             self.layer_clip(clip_path, fill_rule, clip_transform, aliasing_threshold)
         });
-        if let Some(filter_data) = &filter_data {
-            self.viewport.push_root_viewport(filter_data);
-            self.filter_source_shifts.push(self.viewport.source_shift());
-        }
 
         self.recorder.push_layer(
             LayerProps {
@@ -454,7 +593,7 @@ impl Dispatcher for SingleThreadedDispatcher {
         // Bucketer will be reset on demand, so no need to reset it here.
         self.recorder.reset(width, height);
         self.strip_storage.clear();
-        self.filter_source_shifts.clear();
+        self.filter_sources.clear();
         self.viewport.reset(width, height);
     }
 
@@ -560,6 +699,26 @@ impl Dispatcher for SingleThreadedDispatcher {
 
     fn is_multi_threaded(&self) -> bool {
         false
+    }
+
+    fn record_filter_layer(&mut self, filter: FilterData) -> Recording {
+        Recording::new(
+            filter,
+            Bounds::of_viewport(self.viewport.width(), self.viewport.height()),
+            self.viewport.clips().map(Clip::from_pushed).collect(),
+        )
+    }
+
+    fn draw_recording(&mut self, recording: Recording) {
+        // Clips outlive the layers they are pushed in, so the clips recorded
+        // in the layer also apply after it.
+        recording.push_clips_into(self);
+        let graph = recording.finish(self.level);
+        let view = Bounds::of_viewport(self.viewport.width(), self.viewport.height());
+        self.recorder
+            .pop_rendered_filter_layer(FilterLayerPlacement::rendered_at(graph.placement_in(view)));
+        self.filter_sources
+            .push(FilterSource::Graph(Box::new(graph)));
     }
 }
 
