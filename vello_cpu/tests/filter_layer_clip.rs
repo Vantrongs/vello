@@ -93,3 +93,48 @@ fn filter_layer_clip_matches_an_enclosing_clip_layer() {
         }
     }
 }
+
+/// Render a red band in a filter layer that pops the clip pushed before it,
+/// or in a plain layer if `filter` is `None`.
+fn clip_popped_inside(filter: Option<Filter>, mode: RenderMode) -> Pixmap {
+    let mut ctx = RenderContext::new_with(
+        64,
+        16,
+        RenderSettings {
+            level: Level::baseline(),
+            num_threads: 0,
+        },
+    );
+    ctx.push_clip_rect(&Rect::new(0.0, 0.0, 24.0, 16.0));
+    ctx.push_clip_rect(&Rect::new(8.0, 0.0, 64.0, 16.0));
+    match filter {
+        Some(filter) => ctx.push_filter_layer(filter),
+        None => ctx.push_opacity_layer(1.0),
+    }
+    ctx.pop_clip();
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(0.0, 4.0, 64.0, 12.0));
+    ctx.pop_layer();
+    ctx.pop_clip();
+    ctx.flush();
+    let mut pixmap = Pixmap::new(64, 16);
+    ctx.render_with(
+        &mut pixmap,
+        &mut Resources::new(),
+        RasterizerSettings {
+            render_mode: mode,
+            ..Default::default()
+        },
+    );
+    pixmap
+}
+
+#[test]
+fn clip_pushed_outside_and_popped_inside_a_filter_layer() {
+    let identity = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
+    for mode in modes() {
+        let filtered = clip_popped_inside(Some(identity.clone()), mode);
+        let plain = clip_popped_inside(None, mode);
+        assert!(filtered.data() == plain.data(), "{mode:?}");
+    }
+}

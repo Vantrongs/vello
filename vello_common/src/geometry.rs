@@ -135,23 +135,23 @@ impl PaddingU16 {
 
 /// Padding for the four sides of a region in a coordinate domain wider than `u16`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct PaddingU32 {
+pub struct PaddingU64 {
     /// The left padding.
-    pub left: u32,
+    pub left: u64,
     /// The top padding.
-    pub top: u32,
+    pub top: u64,
     /// The right padding.
-    pub right: u32,
+    pub right: u64,
     /// The bottom padding.
-    pub bottom: u32,
+    pub bottom: u64,
 }
 
-impl PaddingU32 {
+impl PaddingU64 {
     /// Padding with all sides set to zero.
     pub const ZERO: Self = Self::new(0, 0, 0, 0);
 
     /// Create padding from its left, top, right, and bottom amounts.
-    pub const fn new(left: u32, top: u32, right: u32, bottom: u32) -> Self {
+    pub const fn new(left: u64, top: u64, right: u64, bottom: u64) -> Self {
         Self {
             left,
             top,

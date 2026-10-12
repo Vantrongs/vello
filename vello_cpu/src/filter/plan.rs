@@ -24,37 +24,165 @@ use crate::filter::context::ScratchBuffer;
 use crate::filter::drop_shadow::source_over;
 use crate::filter::filter_reduced;
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::{Bounds, PlacedPixmap, Regions};
+use crate::filter::placed::{Bounds, Index, Pieces, PlacedPixmap, Regions, pixel_size};
+use crate::kurbo::Affine;
 use alloc::vec::Vec;
-use vello_common::filter::{Displacement, FilterData, PreparedFilter};
-use vello_common::geometry::PaddingU32;
+use vello_common::filter::{FilterData, PreparedFilter};
+use vello_common::geometry::PaddingU64;
 
 /// The number of decimations a blur performs on a source rendered at full
 /// resolution. A blur that decimates more reads its source rendered so much
 /// coarser that this many decimations remain.
 pub(crate) const EXACT_DECIMATIONS: usize = 5;
 
-/// How a filter layer reads its source and writes its output, in the pixel
-/// grid of the output.
-#[derive(Debug)]
-pub(crate) struct FilterPlan {
+/// Return `filter` with its parameters in the grid of root target pixels
+/// `2^level` wide.
+pub(crate) fn filter_at(filter: &FilterData, level: u32) -> FilterData {
+    FilterData::new(
+        filter.filter.clone(),
+        Affine::scale(1.0 / pixel_size(level)) * filter.transform,
+    )
+}
+
+/// How a filter reads its source and writes its output in one pixel grid.
+#[derive(Clone, Debug)]
+pub(crate) struct Reach {
     /// The filter, with its parameters in the pixel grid of the output.
     filter: FilterData,
     effect: Effect,
     /// By how many steps of two the source the filter reads is coarser than the output.
     reduction: u32,
-    outputs: Vec<Output>,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Effect {
-    /// Filtered as a whole in a pixmap around the source it reads.
+    /// Filtered as a whole in a pixmap around the source it reads, with
+    /// paddings in the grid of that source.
     Whole {
-        source_padding: PaddingU32,
-        filter_padding: PaddingU32,
+        source_padding: PaddingU64,
+        filter_padding: PaddingU64,
     },
-    /// Moved, see the module documentation.
-    Displaced(Displacement),
+    /// Moved by `offset` in the output's grid, see the module documentation,
+    /// after a blur that reads `blur_padding` around each pixel in the grid of
+    /// the source it reads.
+    Displaced {
+        offset: (i64, i64),
+        blur_padding: PaddingU64,
+        keeps_source: bool,
+    },
+}
+
+impl Reach {
+    /// Return how `filter`, whose parameters are in the root grid, reads and
+    /// writes in the grid of root target pixels `2^level` wide.
+    pub(crate) fn new(filter: &FilterData, level: u32) -> Self {
+        let output = filter_at(filter, level);
+        let decimations = match PreparedFilter::new(&output.filter, &output.transform) {
+            PreparedFilter::GaussianBlur(blur) => blur.n_decimations,
+            PreparedFilter::DropShadow(shadow) => shadow.n_decimations,
+            PreparedFilter::Flood(_) | PreparedFilter::Offset(_) => 0,
+        };
+        let reduction = u32::try_from(decimations.saturating_sub(EXACT_DECIMATIONS)).unwrap();
+        // Paddings are taken in the grid they apply in, where they stay small
+        // however wide the blur is.
+        let source = if reduction == 0 {
+            output.clone()
+        } else {
+            filter_at(filter, level + reduction)
+        };
+        let effect = match (output.displacement(), source.displacement()) {
+            (Some(displacement), Some(coarse)) => Effect::Displaced {
+                offset: displacement.offset,
+                blur_padding: coarse.blur_padding,
+                keeps_source: displacement.keeps_source,
+            },
+            _ => Effect::Whole {
+                source_padding: source.source_padding,
+                filter_padding: source.filter_padding,
+            },
+        };
+        Self {
+            filter: output,
+            effect,
+            reduction,
+        }
+    }
+
+    /// Return by how many steps of two the source the filter reads is coarser
+    /// than its output.
+    pub(crate) fn reduction(&self) -> u32 {
+        self.reduction
+    }
+
+    /// Return the source that the output inside `output` reads: the part it
+    /// keeps, in the output's grid, and the part the filter reads,
+    /// [`Self::reduction`] steps coarser.
+    pub(crate) fn reads(&self, output: Bounds) -> (Bounds, Bounds) {
+        match self.effect {
+            Effect::Whole { source_padding, .. } => (
+                Bounds::EMPTY,
+                output.coarsen(self.reduction).expand(source_padding),
+            ),
+            Effect::Displaced {
+                offset: (dx, dy),
+                blur_padding,
+                keeps_source,
+            } => {
+                let moved = output
+                    .translate((-dx, -dy))
+                    .coarsen(self.reduction)
+                    .expand(blur_padding);
+                (if keeps_source { output } else { Bounds::EMPTY }, moved)
+            }
+        }
+    }
+
+    /// Return whether the output holds the source unmoved, where [`Self::reads`]
+    /// places the part it keeps.
+    pub(crate) fn keeps_source(&self) -> bool {
+        matches!(
+            self.effect,
+            Effect::Displaced {
+                keeps_source: true,
+                ..
+            }
+        )
+    }
+
+    /// Return where the filtered part of the output can have content, given
+    /// that the source the filter reads has content only inside `filtered`.
+    pub(crate) fn writes(&self, filtered: Bounds) -> Bounds {
+        filtered
+            .expand(self.padding())
+            .snap_to_tiles()
+            .refine(self.reduction)
+            .translate(self.offset())
+    }
+
+    /// Return by how much the filtered source is moved.
+    fn offset(&self) -> (i64, i64) {
+        match self.effect {
+            Effect::Whole { .. } => (0, 0),
+            Effect::Displaced { offset, .. } => offset,
+        }
+    }
+
+    /// Return how far the pixmap a filter runs on reaches around its content,
+    /// in the grid of the source it reads.
+    fn padding(&self) -> PaddingU64 {
+        match self.effect {
+            Effect::Whole { filter_padding, .. } => filter_padding,
+            Effect::Displaced { blur_padding, .. } => blur_padding,
+        }
+    }
+}
+
+/// How a filter layer reads its source and writes its output, in the pixel
+/// grid of the output.
+#[derive(Debug)]
+pub(crate) struct FilterPlan {
+    reach: Reach,
+    outputs: Vec<Output>,
 }
 
 /// A region of the output with the source it reads.
@@ -81,61 +209,26 @@ struct Layout {
 }
 
 impl FilterPlan {
-    /// Plan the output of `filter` inside `outputs`. Its parameters are in the
-    /// pixel grid of the output.
-    pub(crate) fn new(filter: FilterData, outputs: &Regions) -> Self {
-        let decimations = match PreparedFilter::new(&filter.filter, &filter.transform) {
-            PreparedFilter::GaussianBlur(blur) => blur.n_decimations,
-            PreparedFilter::DropShadow(shadow) => shadow.n_decimations,
-            PreparedFilter::Flood(_) | PreparedFilter::Offset(_) => 0,
-        };
-        let reduction = u32::try_from(decimations.saturating_sub(EXACT_DECIMATIONS)).unwrap();
-        let effect = match filter.displacement() {
-            Some(displacement) => Effect::Displaced(displacement),
-            None => Effect::Whole {
-                source_padding: filter.source_padding,
-                filter_padding: filter.filter_padding,
-            },
-        };
+    /// Plan the output of a filter that reads and writes as `reach` inside `outputs`.
+    pub(crate) fn new(reach: Reach, outputs: &Regions) -> Self {
         let outputs = outputs
             .iter()
             .map(|bounds| {
-                let (kept, filtered) = match effect {
-                    Effect::Whole { source_padding, .. } => {
-                        (Bounds::EMPTY, bounds.expand(source_padding))
-                    }
-                    Effect::Displaced(displacement) => {
-                        let (dx, dy) = displacement.offset;
-                        let moved = bounds
-                            .translate((-dx, -dy))
-                            .expand(displacement.blur_padding);
-                        let kept = if displacement.keeps_source {
-                            bounds
-                        } else {
-                            Bounds::EMPTY
-                        };
-                        (kept, moved)
-                    }
-                };
+                let (kept, filtered) = reach.reads(bounds);
                 Output {
                     bounds,
                     kept,
-                    filtered: filtered.coarsen(reduction),
+                    filtered,
                 }
             })
             .collect();
-        Self {
-            filter,
-            effect,
-            reduction,
-            outputs,
-        }
+        Self { reach, outputs }
     }
 
     /// Return by how many steps of two the source the filter reads is coarser
     /// than its output.
     pub(crate) fn reduction(&self) -> u32 {
-        self.reduction
+        self.reach.reduction
     }
 
     /// Return the regions of the source to render: those the output keeps, in
@@ -153,7 +246,7 @@ impl FilterPlan {
 
     /// Return where the output has content, given the bounds of the rendered
     /// source as in [`Self::render`].
-    pub(crate) fn extents(&self, kept: &[Bounds], filtered: &[Bounds]) -> Vec<Bounds> {
+    pub(crate) fn extents(&self, kept: &Index, filtered: &Index) -> Vec<Bounds> {
         self.outputs
             .iter()
             .map(|output| self.layout(output, kept, filtered).extent)
@@ -166,26 +259,22 @@ impl FilterPlan {
     /// in the output's grid. The pixmaps cover the extents of the output.
     pub(crate) fn render(
         &self,
-        kept: &[PlacedPixmap],
-        filtered: &[PlacedPixmap],
+        kept: &Pieces,
+        filtered: &Pieces,
         scratch: &mut ScratchBuffer,
         apply: &mut dyn FnMut(&mut FilterPixmap, PreparedFilter, &mut ScratchBuffer),
     ) -> Vec<PlacedPixmap> {
-        let bounds = |pieces: &[PlacedPixmap]| -> Vec<Bounds> {
-            pieces.iter().map(|piece| piece.bounds).collect()
-        };
-        let (kept_bounds, filtered_bounds) = (bounds(kept), bounds(filtered));
         self.outputs
             .iter()
             .map(|output| {
-                let layout = self.layout(output, &kept_bounds, &filtered_bounds);
+                let layout = self.layout(output, kept.index(), filtered.index());
                 let mut pixmap = PlacedPixmap::new(layout.extent);
                 if !layout.filtered.is_empty() {
                     let result = self.filter_source(&layout, filtered, scratch, apply);
-                    pixmap.copy_from(&result.translate(self.offset()), layout.extent);
+                    pixmap.copy_from(&result.translate(self.reach.offset()), layout.extent);
                 }
                 if !layout.kept.is_empty() {
-                    let kept = assemble(layout.kept, kept);
+                    let kept = kept.crop(layout.kept);
                     pixmap.combine(&kept, layout.kept, source_over);
                 }
                 pixmap
@@ -196,41 +285,27 @@ impl FilterPlan {
     /// Return the pixmaps the filter runs on, given the bounds of the rendered
     /// source as in [`Self::render`].
     #[cfg(test)]
-    pub(crate) fn pixmaps(&self, kept: &[Bounds], filtered: &[Bounds]) -> Vec<Bounds> {
+    pub(crate) fn pixmaps(&self, kept: &Index, filtered: &Index) -> Vec<Bounds> {
         self.outputs
             .iter()
             .map(|output| self.layout(output, kept, filtered).filtered)
             .collect()
     }
 
-    /// Return by how much the filtered source is moved.
-    fn offset(&self) -> (i64, i64) {
-        match self.effect {
-            Effect::Whole { .. } => (0, 0),
-            Effect::Displaced(displacement) => displacement.offset,
-        }
-    }
-
     /// Lay out `output`, given the bounds of the rendered pieces of the kept
     /// source and of the source the filter reads, which are tight around their
     /// content.
-    fn layout(&self, output: &Output, kept: &[Bounds], filtered: &[Bounds]) -> Layout {
-        let (dx, dy) = self.offset();
-        let padding = match self.effect {
-            Effect::Whole { filter_padding, .. } => filter_padding,
-            Effect::Displaced(displacement) => displacement.blur_padding,
-        };
+    fn layout(&self, output: &Output, kept: &Index, filtered: &Index) -> Layout {
+        let (dx, dy) = self.reach.offset();
         let source = content(filtered, output.filtered);
         let mut pixmap = Bounds::EMPTY;
         let mut result = Bounds::EMPTY;
         if !source.is_empty() {
             // The pixmap's origin anchors the blur's decimation, so it follows
             // the content wherever the source it reads holds all of it.
-            pixmap = source
-                .expand(coarsen(padding, self.reduction))
-                .snap_to_tiles();
+            pixmap = source.expand(self.reach.padding()).snap_to_tiles();
             result = pixmap
-                .refine(self.reduction)
+                .refine(self.reduction())
                 .intersect(output.bounds.translate((-dx, -dy)));
             if result.is_empty() {
                 pixmap = Bounds::EMPTY;
@@ -250,23 +325,25 @@ impl FilterPlan {
     fn filter_source(
         &self,
         layout: &Layout,
-        filtered: &[PlacedPixmap],
+        filtered: &Pieces,
         scratch: &mut ScratchBuffer,
         apply: &mut dyn FnMut(&mut FilterPixmap, PreparedFilter, &mut ScratchBuffer),
     ) -> PlacedPixmap {
-        let mut pixmap = assemble(layout.filtered, filtered);
-        let prepared = PreparedFilter::new(&self.filter.filter, &self.filter.transform);
-        if self.reduction == 0 {
+        let mut pixmap = filtered.crop(layout.filtered);
+        let filter = &self.reach.filter;
+        let prepared = PreparedFilter::new(&filter.filter, &filter.transform);
+        if self.reduction() == 0 {
             apply(&mut pixmap.pixmap, prepared, scratch);
             return pixmap.crop(layout.result);
         }
-        let origin = pixmap.bounds.refine(self.reduction);
+        let origin = (pixmap.bounds.x0, pixmap.bounds.y0);
         PlacedPixmap {
             pixmap: filter_reduced(
                 prepared,
                 pixmap.pixmap,
-                self.reduction,
-                layout.result.translate((-origin.x0, -origin.y0)),
+                self.reduction(),
+                origin,
+                layout.result,
                 scratch,
             ),
             bounds: layout.result,
@@ -276,28 +353,10 @@ impl FilterPlan {
 
 /// Return the bounds of the content inside `area`, given the bounds of the
 /// rendered pieces of a source, which are tight around their content.
-fn content(pieces: &[Bounds], area: Bounds) -> Bounds {
-    pieces.iter().fold(Bounds::EMPTY, |content, piece| {
-        content.union(piece.intersect(area))
-    })
-}
-
-/// Copy the pixels of `pieces` inside `bounds` into a new pixmap.
-fn assemble(bounds: Bounds, pieces: &[PlacedPixmap]) -> PlacedPixmap {
-    let mut pixmap = PlacedPixmap::new(bounds);
-    for piece in pieces {
-        pixmap.copy_from(piece, bounds);
-    }
-    pixmap
-}
-
-/// Return the padding that covers `padding` in a grid `levels` steps of two coarser.
-fn coarsen(padding: PaddingU32, levels: u32) -> PaddingU32 {
-    let side = |value: u32| value.div_ceil(1 << levels);
-    PaddingU32::new(
-        side(padding.left),
-        side(padding.top),
-        side(padding.right),
-        side(padding.bottom),
-    )
+fn content(pieces: &Index, area: Bounds) -> Bounds {
+    pieces
+        .touching(area)
+        .fold(Bounds::EMPTY, |content, (_, piece)| {
+            content.union(piece.intersect(area))
+        })
 }

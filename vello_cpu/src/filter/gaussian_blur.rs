@@ -111,8 +111,8 @@ pub(crate) fn apply_blur(
 }
 
 /// Blur `pixmap`, whose pixels each cover `2^levels` pixels of the output on
-/// both axes, and return the output inside `crop`, which is relative to the
-/// pixmap's origin in output pixels.
+/// both axes and which starts at `origin` in its grid, and return the output
+/// inside `crop`, in the grid of the output.
 ///
 /// The pixmap stands for the source after its first `levels` decimations, so
 /// only the remaining decimations run on it. The upscaling back to the output
@@ -125,6 +125,7 @@ pub(crate) fn apply_reduced_blur(
     kernel: &[f32],
     edge_mode: EdgeMode,
     levels: u32,
+    origin: (i64, i64),
     crop: Bounds,
 ) -> FilterPixmap {
     apply_blur(
@@ -136,114 +137,147 @@ pub(crate) fn apply_reduced_blur(
     );
     // The runs each level upscales into, from the output to the level below the pixmap.
     let mut runs = Vec::with_capacity(levels as usize);
-    let mut x = Run::new(crop.x0, crop.width(), pixmap.width() << levels);
-    let mut y = Run::new(crop.y0, crop.height(), pixmap.height() << levels);
+    let mut x = Run::new(crop.x0, crop.width(), origin.0, levels);
+    let mut y = Run::new(crop.y0, crop.height(), origin.1, levels);
     for _ in 0..levels {
         runs.push((x, y));
-        x = x.source(edge_mode);
-        y = y.source(edge_mode);
+        x = x.source();
+        y = y.source();
     }
-    let mut patch = Patch {
-        x: Run::new(0, i64::from(pixmap.width()), pixmap.width()),
-        y: Run::new(0, i64::from(pixmap.height()), pixmap.height()),
-        pixels: pixmap,
-    };
+    let mut patch = patch_of(&pixmap, x, y, edge_mode);
+    let size = (pixmap.width(), pixmap.height());
     for (x, y) in runs.into_iter().rev() {
-        patch = patch.upscale(x, y, edge_mode);
+        patch = upscale_patch(&patch, x, y, edge_mode, size);
     }
-    patch.pixels
+    patch
 }
 
-/// A run of pixel indices along one axis of a level of the blur's pyramid,
-/// which is `size` pixels long. With [`EdgeMode::Wrap`], a run that reaches
-/// the end of the level continues at its start.
+/// A run of pixels along one axis of a level of the blur's pyramid, `shift`
+/// levels finer than the pixmap. It starts at `coarse * 2^shift + sub` relative
+/// to the pixmap's origin, which takes more bits than `i128` holds for the
+/// widest blurs, and may extend past the level: each of its pixels holds the
+/// value the level's edge mode gives that position.
 #[derive(Clone, Copy, Debug)]
 struct Run {
-    start: i64,
+    coarse: i64,
+    /// Less than `2^shift`.
+    sub: u128,
+    shift: u32,
     len: u32,
-    size: u32,
 }
 
 impl Run {
-    fn new(start: i64, len: i64, size: u32) -> Self {
+    /// Return the run of `len` pixels from `start` in a grid `shift` levels
+    /// finer than a pixmap that starts at `origin` in its own grid.
+    fn new(start: i64, len: i64, origin: i64, shift: u32) -> Self {
+        let step = 1_i128 << shift;
         Self {
-            start,
+            coarse: (i128::from(start).div_euclid(step) - i128::from(origin)) as i64,
+            sub: i128::from(start).rem_euclid(step) as u128,
+            shift,
             len: u32::try_from(len).unwrap(),
-            size,
         }
     }
 
-    /// Return the run of the next coarser level that upscaling this run reads.
-    ///
-    /// Levels below the pixmap double in size, so an index past the end of a
-    /// level halves to the matching index past the end of the coarser one.
-    fn source(self, edge_mode: EdgeMode) -> Self {
-        let size = self.size / 2;
-        let first = self.start.div_euclid(2) - 1;
-        let last = (self.start + i64::from(self.len) - 1).div_euclid(2) + 1;
-        if edge_mode == EdgeMode::Wrap {
-            if last - first >= i64::from(size) {
-                return Self::new(0, i64::from(size), size);
-            }
-            return Self::new(first.rem_euclid(i64::from(size)), last - first + 1, size);
+    /// Return whether the start of the run is odd.
+    fn odd(self) -> bool {
+        if self.shift == 0 {
+            self.coarse & 1 == 1
+        } else {
+            self.sub & 1 == 1
         }
-        let (first, last) = (first.max(0), last.min(i64::from(size) - 1));
-        Self::new(first, last - first + 1, size)
     }
 
-    /// Return the pixel at level index `index` from `pixel`, which takes a position in this run.
-    fn sample(
-        self,
-        index: i64,
-        edge_mode: EdgeMode,
-        pixel: impl FnOnce(u32) -> PremulRgba8,
-    ) -> PremulRgba8 {
-        sample(index, self.size, edge_mode, |index| {
-            let position = (i64::from(index) - self.start).rem_euclid(i64::from(self.size));
-            debug_assert!(position < i64::from(self.len), "sample outside the run");
-            pixel(position as u32)
-        })
+    /// Return the run of the next coarser level that upscaling this run reads:
+    /// from the pixel before the one under its start to the one after the one
+    /// under its end.
+    fn source(self) -> Self {
+        let shift = self.shift - 1;
+        let (coarse, sub) = match self.sub >> 1 {
+            0 if shift == 0 => (self.coarse - 1, 0),
+            0 => (self.coarse - 1, (1 << shift) - 1),
+            sub => (self.coarse, sub - 1),
+        };
+        Self {
+            coarse,
+            sub,
+            shift,
+            len: (u32::from(self.odd()) + self.len - 1) / 2 + 3,
+        }
+    }
+
+    /// Return whether pixel `index` of the run lies outside its level, which is
+    /// `size` pixels of the pixmap wide.
+    fn outside(self, index: u32, size: u32) -> bool {
+        let coarse = self.coarse + ((self.sub + u128::from(index)) >> self.shift) as i64;
+        coarse < 0 || coarse >= i64::from(size)
     }
 }
 
-/// The pixels of one level of the blur's pyramid inside a run on each axis.
-struct Patch {
-    pixels: FilterPixmap,
+/// Return the pixels of `pixmap` in the runs `x` and `y` of its own level.
+fn patch_of(pixmap: &FilterPixmap, x: Run, y: Run, edge_mode: EdgeMode) -> FilterPixmap {
+    let mut pixels = FilterPixmap::new(x.len, y.len);
+    for row in 0..y.len {
+        let source_y = y.coarse + i64::from(row);
+        for column in 0..x.len {
+            let source_x = x.coarse + i64::from(column);
+            let pixel = sample(source_y, pixmap.height(), edge_mode, |source_y| {
+                sample(source_x, pixmap.width(), edge_mode, |source_x| {
+                    pixmap.sample(source_x, source_y)
+                })
+            });
+            pixels.set_pixel(column, row, pixel);
+        }
+    }
+    pixels
+}
+
+/// Upscale `coarse`, the pixels of a level of the blur's pyramid in the runs
+/// that [`Run::source`] gives for `x` and `y`, into the runs `x` and `y` of the
+/// next finer level, like [`upscale`]. The pixmap is `size` pixels large.
+fn upscale_patch(
+    coarse: &FilterPixmap,
     x: Run,
     y: Run,
-}
-
-impl Patch {
-    /// Upscale into the runs `x` and `y` of the next finer level, like [`upscale`].
-    fn upscale(&self, x: Run, y: Run, edge_mode: EdgeMode) -> Self {
-        let mut wide = FilterPixmap::new(x.len, self.y.len);
-        for row in 0..self.y.len {
-            for column in 0..x.len {
-                let pixel = upsample(x.start + i64::from(column), |index| {
-                    self.x
-                        .sample(index, edge_mode, |source| self.pixels.sample(source, row))
-                });
-                wide.set_pixel(column, row, pixel);
-            }
-        }
-        let mut pixels = FilterPixmap::new(x.len, y.len);
+    edge_mode: EdgeMode,
+    size: (u32, u32),
+) -> FilterPixmap {
+    let mut wide = FilterPixmap::new(x.len, coarse.height());
+    for row in 0..coarse.height() {
         for column in 0..x.len {
-            for row in 0..y.len {
-                let pixel = upsample(y.start + i64::from(row), |index| {
-                    self.y
-                        .sample(index, edge_mode, |source| wide.sample(column, source))
-                });
-                pixels.set_pixel(column, row, pixel);
-            }
+            let pixel = if edge_mode == EdgeMode::None && x.outside(column, size.0) {
+                TRANSPARENT_BLACK
+            } else {
+                upsample(x.odd(), column, |index| coarse.sample(index, row))
+            };
+            wide.set_pixel(column, row, pixel);
         }
-        Self { pixels, x, y }
     }
+    let mut pixels = FilterPixmap::new(x.len, y.len);
+    for column in 0..x.len {
+        for row in 0..y.len {
+            let pixel = if edge_mode == EdgeMode::None && y.outside(row, size.1) {
+                TRANSPARENT_BLACK
+            } else {
+                upsample(y.odd(), row, |index| wide.sample(column, index))
+            };
+            pixels.set_pixel(column, row, pixel);
+        }
+    }
+    pixels
 }
 
-/// Return the pixel at `index` of a level upscaled from `coarse`, see [`upscale`].
-fn upsample(index: i64, coarse: impl Fn(i64) -> PremulRgba8) -> PremulRgba8 {
-    let center = index.div_euclid(2);
-    if index.rem_euclid(2) == 0 {
+/// Return pixel `index` of a run upscaled from `coarse`, the run that
+/// [`Run::source`] gives for it, like [`upscale`]. `odd` tells whether the
+/// run starts at an odd position.
+///
+/// The coarse run holds what the edge mode gives past the edges of its level,
+/// and upscaling past them gives what the edge mode gives on the finer level
+/// for every mode but [`EdgeMode::None`], whose pixels there are transparent.
+fn upsample(odd: bool, index: u32, coarse: impl Fn(u32) -> PremulRgba8) -> PremulRgba8 {
+    let position = u32::from(odd) + index;
+    let center = position / 2 + 1;
+    if position.is_multiple_of(2) {
         interpolate_25_75(coarse(center - 1), coarse(center))
     } else {
         interpolate_75_25(coarse(center), coarse(center + 1))
@@ -1603,6 +1637,7 @@ mod tests {
             &kernel[..usize::from(count)],
             edge_mode,
             levels,
+            (0, 0),
             crop,
         )
     }

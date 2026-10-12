@@ -273,7 +273,7 @@ impl ClipState {
     /// Push a new root viewport.
     pub fn push_root_viewport(
         &mut self,
-        source_shift: (u32, u32),
+        source_shift: (u16, u16),
         strip_generator: &mut StripGenerator,
     ) {
         let parent_context = core::mem::replace(&mut self.context, self.context_pool.take());

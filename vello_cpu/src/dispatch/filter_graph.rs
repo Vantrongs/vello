@@ -27,13 +27,15 @@
 use super::Dispatcher;
 use super::single_threaded::SingleThreadedDispatcher;
 use crate::RasterizerSettings;
+use crate::filter::averaged_image::averaged;
 use crate::filter::context::ScratchBuffer;
-use crate::filter::placed::{Bounds, PlacedPixmap, Regions};
-use crate::filter::plan::FilterPlan;
+use crate::filter::placed::{Bounds, Index, Pieces, PlacedPixmap, Regions, pixel_size};
+use crate::filter::plan::{FilterPlan, Reach};
 use crate::fine::FineKernel;
-use crate::kurbo::{Affine, BezPath, Rect, Stroke};
+use crate::kurbo::{Affine, BezPath, Join, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 use vello_common::clip::PushedClip;
 use vello_common::encode::EncodedPaint;
@@ -42,7 +44,7 @@ use vello_common::filter::FilterData;
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
-use vello_common::paint::{ImageResolver, Paint};
+use vello_common::paint::{ImageResolver, ImageSource, Paint};
 use vello_common::pixmap::PixmapMut;
 use vello_common::tile::Tile;
 
@@ -76,6 +78,17 @@ impl Clip {
                 aliasing_threshold,
             },
             PushedClip::Rect(rect) => Self::Rect(rect),
+        }
+    }
+
+    /// Return a rectangle in root target coordinates outside of which the clip
+    /// hides everything.
+    fn bounds(&self) -> Rect {
+        match self {
+            Self::Path {
+                path, transform, ..
+            } => transform.transform_rect_bbox(path.control_box()),
+            Self::Rect(rect) => *rect,
         }
     }
 
@@ -152,8 +165,6 @@ pub(crate) struct Recording {
     filter: FilterData,
     /// Where the output is visible, in root target coordinates.
     view: Bounds,
-    /// Translation from root target coordinates to the filter's source space.
-    root_shift: (i64, i64),
     /// Clips active when the layer was pushed.
     clips: Vec<Clip>,
     commands: Vec<Command>,
@@ -164,11 +175,9 @@ pub(crate) struct Recording {
 impl Recording {
     /// Start recording a filter layer whose output is visible in `view`.
     pub(crate) fn new(filter: FilterData, view: Bounds, clips: Vec<Clip>) -> Self {
-        let shift = filter.source_shift();
         Self {
             filter,
             view,
-            root_shift: (i64::from(shift.0), i64::from(shift.1)),
             clips,
             commands: Vec::new(),
             depth: 1,
@@ -193,7 +202,6 @@ impl Recording {
             &self.commands,
             0..self.commands.len(),
             self.filter,
-            self.root_shift,
             self.clips,
             &mut layers,
         );
@@ -345,26 +353,23 @@ impl Dispatcher for Recording {
 #[derive(Debug)]
 struct GraphLayer {
     filter: FilterData,
-    /// Translation from root target coordinates to the layer's source space,
-    /// where its commands are given.
-    root_shift: (i64, i64),
     /// Clips active when the layer was pushed.
     clips: Vec<Clip>,
     steps: Vec<Step>,
     /// The filter layers nested directly in this one.
-    children: Vec<usize>,
+    children: Vec<Child>,
+    /// A rectangle in root target coordinates that holds everything the
+    /// layer's own commands draw, if they draw anything.
+    drawn: Option<Rect>,
 }
 
-impl GraphLayer {
-    /// Return the filter with its parameters in the grid of root target
-    /// pixels `2^level` wide.
-    fn filter_at(&self, level: u32) -> FilterData {
-        let scale = 1.0 / f64::from(1_u32 << level);
-        FilterData::new(
-            self.filter.filter.clone(),
-            Affine::scale(scale) * self.filter.transform,
-        )
-    }
+/// A filter layer nested directly in another.
+#[derive(Clone, Copy, Debug)]
+struct Child {
+    layer: usize,
+    /// A rectangle in root target coordinates outside of which the clip
+    /// paths of the layers it is composited through hide it.
+    clip: Rect,
 }
 
 /// A recorded command, or a nested filter layer rendered on its own.
@@ -384,40 +389,37 @@ fn parse(
     commands: &[Command],
     range: core::ops::Range<usize>,
     filter: FilterData,
-    root_shift: (i64, i64),
     clips: Vec<Clip>,
     layers: &mut Vec<GraphLayer>,
 ) -> usize {
     let index = layers.len();
     layers.push(GraphLayer {
         filter,
-        root_shift,
         clips: Vec::new(),
         steps: Vec::new(),
         children: Vec::new(),
+        drawn: None,
     });
     let mut active_clips = clips.clone();
+    let mut clip_bounds = ClipBounds::new(&clips);
     let mut steps = Vec::new();
     let mut children = Vec::new();
+    let mut drawn: Option<Rect> = None;
     let mut command = range.start;
     while command < range.end {
         if let Command::PushLayer(layer) = &commands[command]
             && let Some(filter) = &layer.filter
         {
             let end = matching_pop(commands, command);
-            let shift = filter.source_shift();
+            let clip = layer.clip_bounds().intersect(clip_bounds.composited());
             let child = parse(
                 commands,
                 command + 1..end,
                 filter.clone(),
-                (
-                    root_shift.0 + i64::from(shift.0),
-                    root_shift.1 + i64::from(shift.1),
-                ),
                 active_clips.clone(),
                 layers,
             );
-            children.push(child);
+            children.push(Child { layer: child, clip });
             steps.push(Step::Nested {
                 layer: child,
                 push: command,
@@ -425,6 +427,7 @@ fn parse(
             // Clips pushed or popped inside the filter layer stay in effect after it.
             for (inner, nested) in commands.iter().enumerate().take(end).skip(command + 1) {
                 if track_clips(nested, &mut active_clips) {
+                    clip_bounds.track(nested);
                     steps.push(Step::Command(inner));
                 }
             }
@@ -432,6 +435,11 @@ fn parse(
             continue;
         }
         track_clips(&commands[command], &mut active_clips);
+        clip_bounds.track(&commands[command]);
+        if let Some(bounds) = commands[command].bounds() {
+            let bounds = bounds.intersect(clip_bounds.drawn());
+            drawn = Some(drawn.map_or(bounds, |drawn| drawn.union(bounds)));
+        }
         steps.push(Step::Command(command));
         command += 1;
     }
@@ -439,6 +447,7 @@ fn parse(
     layer.clips = clips;
     layer.steps = steps;
     layer.children = children;
+    layer.drawn = drawn;
     index
 }
 
@@ -452,6 +461,143 @@ fn track_clips(command: &Command, clips: &mut Vec<Clip>) -> bool {
         _ => return false,
     }
     true
+}
+
+/// A rectangle in root target coordinates as wide as everything.
+const UNBOUNDED: Rect = Rect::new(
+    f64::NEG_INFINITY,
+    f64::NEG_INFINITY,
+    f64::INFINITY,
+    f64::INFINITY,
+);
+
+/// Return `rect`, or [`UNBOUNDED`] if it is not finite.
+fn finite_or_unbounded(rect: Rect) -> Rect {
+    if [rect.x0, rect.y0, rect.x1, rect.y1]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        rect
+    } else {
+        UNBOUNDED
+    }
+}
+
+/// Rectangles outside of which the clips in effect hide everything: those of
+/// clips, which are pushed and popped on their own, and those of the clip
+/// paths of layers. Each stack starts with everything, which is never popped.
+struct ClipBounds {
+    clips: Vec<Rect>,
+    layers: Vec<Rect>,
+}
+
+impl ClipBounds {
+    /// Start with `clips` in effect, which can be popped like the others.
+    fn new(clips: &[Clip]) -> Self {
+        let mut bounds = Self {
+            clips: vec![UNBOUNDED],
+            layers: vec![UNBOUNDED],
+        };
+        for clip in clips {
+            bounds.push_clip(clip);
+        }
+        bounds
+    }
+
+    fn push_clip(&mut self, clip: &Clip) {
+        let bounds = finite_or_unbounded(clip.bounds());
+        self.clips
+            .push(self.clips.last().unwrap().intersect(bounds));
+    }
+
+    /// Return the bounds of what is drawn.
+    fn drawn(&self) -> Rect {
+        self.clips.last().unwrap().intersect(self.composited())
+    }
+
+    /// Return the bounds of the output of a filter layer, which clips pushed
+    /// on their own leave as it is.
+    fn composited(&self) -> Rect {
+        *self.layers.last().unwrap()
+    }
+
+    fn track(&mut self, command: &Command) {
+        match command {
+            Command::PushClip(clip) => self.push_clip(clip),
+            Command::PopClip if self.clips.len() > 1 => {
+                self.clips.pop();
+            }
+            Command::PushLayer(layer) => {
+                let bounds = layer.clip_bounds();
+                self.layers
+                    .push(self.layers.last().unwrap().intersect(bounds));
+            }
+            Command::PopLayer if self.layers.len() > 1 => {
+                self.layers.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Layer {
+    /// Return a rectangle in root target coordinates outside of which the
+    /// layer's clip path hides it.
+    fn clip_bounds(&self) -> Rect {
+        self.clip_path.as_ref().map_or(UNBOUNDED, |path| {
+            finite_or_unbounded(self.clip_transform.transform_rect_bbox(path.control_box()))
+        })
+    }
+}
+
+impl Command {
+    /// Return the index of the encoded paint the command paints with, if any.
+    fn paint(&self) -> Option<usize> {
+        match self {
+            Self::FillPath { paint, .. }
+            | Self::StrokePath { paint, .. }
+            | Self::FillRect { paint, .. } => match paint {
+                Paint::Indexed(paint) => Some(paint.index()),
+                Paint::Solid(_) => None,
+            },
+            Self::PushLayer(_) | Self::PopLayer | Self::PushClip(_) | Self::PopClip => None,
+        }
+    }
+
+    /// Return a rectangle in root target coordinates that holds everything the
+    /// command draws, or `None` if it draws nothing itself.
+    fn bounds(&self) -> Option<Rect> {
+        let bounds = match self {
+            Self::FillPath {
+                path, transform, ..
+            } => transform.transform_rect_bbox(path.control_box()),
+            Self::StrokePath {
+                path,
+                stroke,
+                transform,
+                ..
+            } => {
+                // A miter reaches the miter limit times the half width from
+                // the path, a square cap the diagonal of the half width.
+                let reach = if stroke.join == Join::Miter {
+                    stroke.miter_limit.max(core::f64::consts::SQRT_2)
+                } else {
+                    core::f64::consts::SQRT_2
+                } * stroke.width.abs()
+                    / 2.0;
+                // At least the largest stretch of the transform.
+                let [a, b, c, d, _, _] = transform.as_coeffs();
+                let device = reach * (a.abs() + b.abs() + c.abs() + d.abs());
+                transform
+                    .transform_rect_bbox(path.control_box())
+                    .inflate(device, device)
+            }
+            Self::FillRect { rect, .. } => *rect,
+            _ => return None,
+        };
+        // Covers what anti-aliasing and rounding add around the geometry.
+        Some(finite_or_unbounded(bounds.inflate(1.0, 1.0)))
+    }
 }
 
 /// Return the index of the `PopLayer` that closes the layer pushed at `push`.
@@ -490,7 +636,7 @@ struct Node {
     /// Windows of the source the filter reads, if that is coarser than the output.
     coarse: Vec<Window>,
     /// Where the output has content, in the output's grid.
-    extents: Vec<Bounds>,
+    extents: Index,
 }
 
 /// The planned regions of a node, before its windows are replayed.
@@ -505,40 +651,178 @@ struct Planned {
     coarse: Regions,
 }
 
-/// Plan, from the parents down, the output regions of every layer in every
-/// grid it is needed in. The first layer is needed inside `view` in the root grid.
+/// A layer whose output is needed in one pixel grid, while it is planned.
+struct Need {
+    layer: usize,
+    level: u32,
+    reach: Reach,
+    /// A rectangle that holds every region of the output that is needed.
+    hull: Bounds,
+    /// Where the source the output keeps has content, in the output's grid,
+    /// and where the source the filter reads has content, in its grid. The
+    /// two are the same when the filter reads its source in the output's grid.
+    kept_content: Regions,
+    filtered_content: Regions,
+    /// Where the output can have content.
+    content: Regions,
+}
+
+/// Plan the output regions of every layer in every grid it is needed in. The
+/// first layer is needed inside `view` in the root grid.
+///
+/// A region of a source is rendered only where that source has content, so
+/// that the copies a drop shadow that keeps its source makes of every copy
+/// nested in it are read only where one is visible. Where the layers have
+/// content is first found from the children up, inside the regions the
+/// parents can read at most, so that it too stays within what is visible.
 fn plan(layers: &[GraphLayer], view: Bounds) -> Vec<Planned> {
-    let mut needed: Vec<BTreeMap<u32, Regions>> = layers.iter().map(|_| BTreeMap::new()).collect();
-    needed[0].entry(0).or_default().insert(view);
-    let mut planned = Vec::new();
-    for (index, layer) in layers.iter().enumerate() {
-        for (level, outputs) in core::mem::take(&mut needed[index]) {
-            let plan = FilterPlan::new(layer.filter_at(level), &outputs);
-            let (mut regions, coarse) = plan.source_regions();
-            let coarse = if plan.reduction() == 0 {
-                coarse.iter().for_each(|region| regions.insert(region));
-                Regions::default()
-            } else {
-                coarse
-            };
-            for &child in &layer.children {
-                for (level, regions) in [(level, &regions), (level + plan.reduction(), &coarse)] {
-                    if regions.len() != 0 {
-                        let outputs = needed[child].entry(level).or_default();
-                        regions.iter().for_each(|region| outputs.insert(region));
-                    }
+    // From the parents down: the grids each layer is needed in, and how far.
+    let mut hulls: Vec<BTreeMap<u32, Bounds>> = layers.iter().map(|_| BTreeMap::new()).collect();
+    hulls[0].insert(0, view);
+    let mut needs = Vec::new();
+    let mut index = BTreeMap::new();
+    for (layer_index, layer) in layers.iter().enumerate() {
+        for (level, hull) in core::mem::take(&mut hulls[layer_index]) {
+            let reach = Reach::new(&layer.filter, level);
+            for (level, source) in source_levels(&reach, level, hull) {
+                for child in &layer.children {
+                    let child_hull = hulls[child.layer].entry(level).or_insert(Bounds::EMPTY);
+                    *child_hull = child_hull.union(source);
                 }
             }
-            planned.push(Planned {
-                layer: index,
+            index.insert((layer_index, level), needs.len());
+            needs.push(Need {
+                layer: layer_index,
                 level,
-                plan,
-                regions,
-                coarse,
+                reach,
+                hull,
+                kept_content: Regions::default(),
+                filtered_content: Regions::default(),
+                content: Regions::default(),
             });
         }
     }
+    // From the children up: where each layer has content.
+    for node in (0..needs.len()).rev() {
+        let (level, hull) = (needs[node].level, needs[node].hull);
+        let layer = &layers[needs[node].layer];
+        let reach = &needs[node].reach;
+        let (kept_area, filtered_area) = reach.reads(hull);
+        let content_in = |level, area: Bounds| source_content(layer, level, area, &needs, &index);
+        let (kept, filtered) = if reach.reduction() == 0 {
+            let content = content_in(level, kept_area.union(filtered_area));
+            (content.clone(), content)
+        } else {
+            (
+                content_in(level, kept_area),
+                content_in(level + reach.reduction(), filtered_area),
+            )
+        };
+        let mut content = Regions::default();
+        for region in filtered.iter() {
+            content.insert(reach.writes(region).intersect(hull));
+        }
+        if reach.keeps_source() {
+            for region in kept.iter() {
+                content.insert(region);
+            }
+        }
+        let need = &mut needs[node];
+        need.kept_content = kept;
+        need.filtered_content = filtered;
+        need.content = content;
+    }
+    // From the parents down: the regions of each layer that are needed.
+    let mut outputs: Vec<Regions> = needs.iter().map(|_| Regions::default()).collect();
+    outputs[0].insert(view);
+    let mut planned = Vec::with_capacity(needs.len());
+    for (node, need) in needs.iter().enumerate() {
+        let plan = FilterPlan::new(need.reach.clone(), &core::mem::take(&mut outputs[node]));
+        let (kept, filtered) = plan.source_regions();
+        let reduction = plan.reduction();
+        let (fine, coarse) = if reduction == 0 {
+            let mut fine = kept;
+            filtered.iter().for_each(|region| fine.insert(region));
+            (fine, Regions::default())
+        } else {
+            (kept, filtered)
+        };
+        let layer = &layers[need.layer];
+        for (level, sources) in [(need.level, &fine), (need.level + reduction, &coarse)] {
+            for child in &layer.children {
+                if let Some(&child_node) = index.get(&(child.layer, level)) {
+                    let clip = Bounds::covering(child.clip, 1.0 / pixel_size(level));
+                    for content in needs[child_node].content.iter() {
+                        let content = content.intersect(clip);
+                        for source in sources.touching(content) {
+                            outputs[child_node].insert(source.intersect(content));
+                        }
+                    }
+                }
+            }
+        }
+        planned.push(Planned {
+            layer: need.layer,
+            level: need.level,
+            plan,
+            regions: intersection(&fine, &need.kept_content),
+            coarse: intersection(&coarse, &need.filtered_content),
+        });
+    }
     planned
+}
+
+/// Return the grids in which a layer that reads and writes as `reach` reads
+/// its source when its output is needed inside `hull` in the grid of `level`,
+/// with the bounds it reads there: the kept source in the output's grid and
+/// the source the filter reads in its own, one grid if they coincide.
+fn source_levels(reach: &Reach, level: u32, hull: Bounds) -> impl Iterator<Item = (u32, Bounds)> {
+    let (kept, filtered) = reach.reads(hull);
+    let reduction = reach.reduction();
+    let levels = if reduction == 0 {
+        [(level, kept.union(filtered)), (level, Bounds::EMPTY)]
+    } else {
+        [(level, kept), (level + reduction, filtered)]
+    };
+    levels.into_iter().filter(|(_, area)| !area.is_empty())
+}
+
+/// Return where the source of `layer` has content inside `area` in the grid of
+/// `level`: its own drawing and the outputs of the nodes of its children in
+/// that grid, inside their clips.
+fn source_content(
+    layer: &GraphLayer,
+    level: u32,
+    area: Bounds,
+    needs: &[Need],
+    index: &BTreeMap<(usize, u32), usize>,
+) -> Regions {
+    let scale = 1.0 / pixel_size(level);
+    let mut content = Regions::default();
+    if let Some(drawn) = layer.drawn {
+        content.insert(Bounds::covering(drawn, scale).intersect(area));
+    }
+    for child in &layer.children {
+        let Some(&node) = index.get(&(child.layer, level)) else {
+            continue;
+        };
+        let clip = Bounds::covering(child.clip, scale).intersect(area);
+        for region in needs[node].content.iter() {
+            content.insert(region.intersect(clip));
+        }
+    }
+    content
+}
+
+/// Return the parts of `regions` inside `content`.
+fn intersection(regions: &Regions, content: &Regions) -> Regions {
+    let mut parts = Regions::default();
+    for region in regions.iter() {
+        for content in content.touching(region) {
+            parts.insert(region.intersect(content));
+        }
+    }
+    parts
 }
 
 impl FilterGraph {
@@ -563,9 +847,7 @@ impl FilterGraph {
             };
             let windows = replay.windows(&planned.regions, planned.level);
             let coarse = replay.windows(&planned.coarse, planned.level + planned.plan.reduction());
-            let contents = |windows: &[Window]| -> Vec<Bounds> {
-                windows.iter().map(Window::content).collect()
-            };
+            let contents = |windows: &[Window]| Index::new(windows.iter().map(Window::content));
             let kept = contents(&windows);
             let filtered = if planned.plan.reduction() == 0 {
                 kept.clone()
@@ -577,7 +859,7 @@ impl FilterGraph {
                 plan: planned.plan,
                 windows,
                 coarse,
-                extents,
+                extents: Index::new(extents),
             });
         }
         Self {
@@ -586,7 +868,7 @@ impl FilterGraph {
     }
 
     /// Return where the output has content in the root grid.
-    fn extents(&self) -> &[Bounds] {
+    fn extents(&self) -> &Index {
         &self.nodes[0].extents
     }
 
@@ -607,17 +889,19 @@ impl FilterGraph {
         simd: S,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
-    ) -> Vec<PlacedPixmap> {
-        let mut outputs: Vec<Vec<PlacedPixmap>> = self.nodes.iter().map(|_| Vec::new()).collect();
+    ) -> Pieces {
+        let mut outputs: Vec<Pieces> = self.nodes.iter().map(|_| Pieces::default()).collect();
         let mut scratch = ScratchBuffer::new();
         for (index, node) in self.nodes.iter().enumerate().rev() {
-            let render = |windows: &[Window]| -> Vec<PlacedPixmap> {
-                windows
-                    .iter()
-                    .filter_map(|window| {
-                        window.render::<S, F>(simd, encoded_paints, image_resolver, &outputs)
-                    })
-                    .collect()
+            let render = |windows: &[Window]| {
+                Pieces::new(
+                    windows
+                        .iter()
+                        .filter_map(|window| {
+                            window.render::<S, F>(simd, encoded_paints, image_resolver, &outputs)
+                        })
+                        .collect(),
+                )
             };
             let kept = render(&node.windows);
             let filtered = if node.plan.reduction() == 0 {
@@ -625,24 +909,15 @@ impl FilterGraph {
             } else {
                 Some(render(&node.coarse))
             };
-            outputs[index] = node.plan.render(
+            outputs[index] = Pieces::new(node.plan.render(
                 &kept,
-                filtered.as_deref().unwrap_or(&kept),
+                filtered.as_ref().unwrap_or(&kept),
                 &mut scratch,
                 &mut |pixmap, filter, scratch| F::filter_layer(pixmap, filter, scratch),
-            );
+            ));
         }
         core::mem::take(&mut outputs[0])
     }
-}
-
-/// Return a copy of the pixels of `pieces` inside `area`, transparent where they do not cover it.
-pub(crate) fn crop(pieces: &[PlacedPixmap], area: Bounds) -> PlacedPixmap {
-    let mut crop = PlacedPixmap::new(area);
-    for piece in pieces {
-        crop.copy_from(piece, area);
-    }
-    crop
 }
 
 /// What replaying the windows of one layer needs.
@@ -671,23 +946,21 @@ impl Replay<'_> {
 
     fn window(&self, window: Bounds, level: u32, masks: &mut Masks) -> Window {
         let origin = (window.x0, window.y0);
-        let to_grid = Affine::translate((-origin.0 as f64, -origin.1 as f64))
-            * Affine::scale(1.0 / f64::from(1_u32 << level));
-        let shift = self.layer.root_shift;
-        let to_window = to_grid * Affine::translate((-shift.0 as f64, -shift.1 as f64));
-        let dispatcher = SingleThreadedDispatcher::window(
+        let size = (
             u16::try_from(window.width()).unwrap(),
             u16::try_from(window.height()).unwrap(),
-            self.simd_level,
-            origin,
-            |target| {
+        );
+        let to_window = Affine::translate((-origin.0 as f64, -origin.1 as f64))
+            * Affine::scale(1.0 / pixel_size(level));
+        let dispatcher =
+            SingleThreadedDispatcher::window(size.0, size.1, self.simd_level, origin, |target| {
                 for clip in &self.layer.clips {
-                    clip.push_into(target, to_grid);
+                    clip.push_into(target, to_window);
                 }
                 for step in &self.layer.steps {
                     match *step {
                         Step::Command(command) => {
-                            apply(target, &self.commands[command], to_window, to_grid, masks);
+                            apply(target, &self.commands[command], to_window, masks);
                         }
                         Step::Nested { layer, push } => {
                             let Command::PushLayer(pushed) = &self.commands[push] else {
@@ -708,12 +981,23 @@ impl Replay<'_> {
                         }
                     }
                 }
-            },
-        );
+            });
+        let mut paints: Vec<usize> = self
+            .layer
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Command(command) => self.commands[*command].paint(),
+                Step::Nested { .. } => None,
+            })
+            .collect();
+        paints.sort_unstable();
+        paints.dedup();
         Window {
             origin,
+            size,
             level,
-            root_shift: shift,
+            paints,
             dispatcher,
         }
     }
@@ -752,22 +1036,27 @@ impl Masks {
 /// Return `mask` with each pixel averaging a square of `2^levels` pixels of
 /// it; pixels outside the mask count as transparent, like when it is sampled.
 fn reduce_mask(mask: &Mask, levels: u32) -> Mask {
-    let step = 1_u32 << levels;
-    let width = u32::from(mask.width()).div_ceil(step);
-    let height = u32::from(mask.height()).div_ceil(step);
-    let mut data = Vec::with_capacity((width * height) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            let mut sum = 0_u64;
-            for sy in y * step..((y + 1) * step).min(u32::from(mask.height())) {
-                for sx in x * step..((x + 1) * step).min(u32::from(mask.width())) {
-                    sum += u64::from(mask.sample(sx as u16, sy as u16));
-                }
-            }
-            let count = u64::from(step) * u64::from(step);
-            data.push(((sum + count / 2) / count) as u8);
+    let coarse = |index: u16| usize::from(index).checked_shr(levels).unwrap_or(0);
+    let length = |length: u16| {
+        if length == 0 {
+            0
+        } else {
+            coarse(length - 1) + 1
+        }
+    };
+    let (width, height) = (length(mask.width()), length(mask.height()));
+    let mut sums = vec![0_u64; width * height];
+    for y in 0..mask.height() {
+        for x in 0..mask.width() {
+            sums[coarse(y) * width + coarse(x)] += u64::from(mask.sample(x, y));
         }
     }
+    // Divide by the `4^levels` pixels of each square, rounding to nearest.
+    let average = |sum: u64| match levels {
+        0 => sum,
+        _ => (sum.checked_shr(2 * levels - 1).unwrap_or(0) + 1) >> 1,
+    };
+    let data = sums.into_iter().map(|sum| average(sum) as u8).collect();
     Mask::from_parts(data, width as u16, height as u16)
 }
 
@@ -776,9 +1065,10 @@ fn reduce_mask(mask: &Mask, levels: u32) -> Mask {
 struct Window {
     /// The window's origin, in the grid of root target pixels `2^level` wide.
     origin: (i64, i64),
+    size: (u16, u16),
     level: u32,
-    /// Translation from root target coordinates to the layer's source space.
-    root_shift: (i64, i64),
+    /// The indices of the encoded paints the window's commands paint with.
+    paints: Vec<usize>,
     dispatcher: SingleThreadedDispatcher,
 }
 
@@ -795,18 +1085,34 @@ impl Window {
         simd: S,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
-        nested: &[Vec<PlacedPixmap>],
+        nested: &[Pieces],
     ) -> Option<PlacedPixmap> {
-        let encoded_paints = paints_at(encoded_paints, self.to_source());
+        let mut encoded_paints = paints_at(encoded_paints, self.to_source());
+        // In the root grid, images are sampled like without filters.
+        if self.level > 0 {
+            for &index in &self.paints {
+                let EncodedPaint::Image(image) = &encoded_paints[index] else {
+                    continue;
+                };
+                let pixmap = match &image.source {
+                    ImageSource::Pixmap(pixmap) => Some(pixmap.clone()),
+                    ImageSource::OpaqueId { id, .. } => image_resolver.resolve(*id),
+                    ImageSource::ExternalTexture { .. } => None,
+                };
+                if let Some(averaged) =
+                    pixmap.and_then(|pixmap| averaged(image, &pixmap, self.size.0, self.size.1))
+                {
+                    encoded_paints[index] = EncodedPaint::Image(averaged);
+                }
+            }
+        }
         self.dispatcher
             .render_window::<S, F>(simd, &encoded_paints, image_resolver, nested)
     }
 
-    /// Return the transform from the window's pixels to the layer's source space.
+    /// Return the transform from the window's pixels to root target coordinates.
     fn to_source(&self) -> Affine {
-        let scale = f64::from(1_u32 << self.level);
-        Affine::translate((self.root_shift.0 as f64, self.root_shift.1 as f64))
-            * Affine::scale(scale)
+        Affine::scale(pixel_size(self.level))
             * Affine::translate((self.origin.0 as f64, self.origin.1 as f64))
     }
 }
@@ -879,14 +1185,14 @@ fn inject(
     layer: &Layer,
     filter: &FilterData,
     node: usize,
-    extents: &[Bounds],
+    extents: &Index,
     window: Bounds,
     to_window: Affine,
     masks: &mut Masks,
 ) {
     let dest = extents
-        .iter()
-        .fold(Bounds::EMPTY, |dest, extent| {
+        .touching(window)
+        .fold(Bounds::EMPTY, |dest, (_, extent)| {
             dest.union(extent.intersect(window))
         })
         .snap_to_tiles()
@@ -899,7 +1205,6 @@ fn apply(
     target: &mut SingleThreadedDispatcher,
     command: &Command,
     to_window: Affine,
-    to_grid: Affine,
     masks: &mut Masks,
 ) {
     let mut mask = |mask: &Option<Mask>| mask.as_ref().map(|mask| masks.get(mask));
@@ -960,7 +1265,7 @@ fn apply(
             None,
         ),
         Command::PopLayer => target.pop_layer(),
-        Command::PushClip(clip) => clip.push_into(target, to_grid),
+        Command::PushClip(clip) => clip.push_into(target, to_window),
         Command::PopClip => target.pop_clip(),
     }
 }
@@ -968,7 +1273,6 @@ fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kurbo::Vec2;
     use alloc::vec;
     use vello_common::color::palette::css::BLUE;
     use vello_common::paint::PremulColor;
@@ -976,15 +1280,8 @@ mod tests {
     /// Record `filters`, each nested in the one before, around `rects` in root
     /// target coordinates, as `RenderContext` would, and plan them in `view`.
     fn graph(view: Bounds, filters: &[FilterPrimitive], rects: &[Rect]) -> FilterGraph {
-        let mut shift = (0.0, 0.0);
-        let mut filter_data = |primitive: &FilterPrimitive| {
-            let data = FilterData::new(
-                Filter::from_primitive(primitive.clone()),
-                Affine::translate(shift),
-            );
-            let (dx, dy) = data.source_shift();
-            shift = (shift.0 + f64::from(dx), shift.1 + f64::from(dy));
-            data
+        let filter_data = |primitive: &FilterPrimitive| {
+            FilterData::new(Filter::from_primitive(primitive.clone()), Affine::IDENTITY)
         };
         let mut recording = Recording::new(filter_data(&filters[0]), view, Vec::new());
         for primitive in &filters[1..] {
@@ -1001,7 +1298,7 @@ mod tests {
         }
         for rect in rects {
             recording.fill_rect_fast(
-                &(*rect + Vec2::from(shift)),
+                rect,
                 Paint::Solid(PremulColor::from_alpha_color(BLUE)),
                 BlendMode::default(),
                 None,
@@ -1019,10 +1316,10 @@ mod tests {
         nodes: usize,
         windows: usize,
         /// The pixels of the windows the source is rasterized in.
-        window_pixels: i64,
+        window_pixels: u128,
         strips: usize,
         /// The pixels of the pixmaps the filters run on.
-        pixmap_pixels: i64,
+        pixmap_pixels: u128,
     }
 
     fn work(graph: &FilterGraph) -> Work {
@@ -1036,11 +1333,11 @@ mod tests {
             .nodes
             .iter()
             .flat_map(|node| {
-                let kept: Vec<_> = node.windows.iter().map(Window::content).collect();
+                let kept = Index::new(node.windows.iter().map(Window::content));
                 let filtered = if node.plan.reduction() == 0 {
                     kept.clone()
                 } else {
-                    node.coarse.iter().map(Window::content).collect()
+                    Index::new(node.coarse.iter().map(Window::content))
                 };
                 node.plan.pixmaps(&kept, &filtered)
             })
@@ -1052,7 +1349,7 @@ mod tests {
             window_pixels: windows()
                 .map(|window| {
                     let (width, height) = window.dispatcher.size();
-                    i64::from(width) * i64::from(height)
+                    u128::from(width) * u128::from(height)
                 })
                 .sum(),
             strips: windows()
@@ -1087,9 +1384,42 @@ mod tests {
                 &[Rect::new(x, 16.0, x + 32.0, 48.0)],
             );
             let work = work(&graph);
-            // The layer nested `n` deep reads the view and `n + 1` shadowed copies.
+            // Each layer reads only the copy that its shadows move into the view.
             assert_eq!(work.nodes, depth, "depth {depth}");
-            assert_eq!(work.windows, depth * (depth + 3) / 2, "depth {depth}");
+            assert_eq!(work.windows, depth, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn nested_shadows_with_distinct_offsets_read_only_visible_copies() {
+        let shadow = |dx: f64, dy: f64| FilterPrimitive::DropShadow {
+            dx: dx as f32,
+            dy: dy as f32,
+            std_deviation: 0.0,
+            color: BLUE,
+            edge_mode: EdgeMode::None,
+        };
+        let square = Rect::new(16.0, 16.0, 48.0, 48.0);
+        let directions: [fn(f64) -> (f64, f64); 4] = [
+            |step| (step, 0.0),
+            |step| (-step, step),
+            |step| (step, -step),
+            |step| (-step, -step),
+        ];
+        for direction in directions {
+            for depth in 1..=16_usize {
+                // Every subset of the shadows moves the square to its own place,
+                // and only the square itself is visible.
+                let shadows: Vec<_> = (0..depth)
+                    .map(|level| {
+                        let (dx, dy) = direction(256.0 * f64::from(1_u32 << level));
+                        shadow(dx, dy)
+                    })
+                    .collect();
+                let work = work(&graph(VIEW, &shadows, &[square]));
+                assert_eq!(work.nodes, depth, "depth {depth}");
+                assert!(work.windows <= depth, "depth {depth}: {work:?}");
+            }
         }
     }
 

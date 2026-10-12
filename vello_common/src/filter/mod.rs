@@ -11,12 +11,13 @@ use crate::filter::drop_shadow::{DropShadow, transform_shadow_params};
 use crate::filter::flood::Flood;
 use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
 use crate::filter::offset::Offset;
-use crate::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use crate::geometry::{PaddingU16, PaddingU32, RectU16, SizeU16};
-use crate::kurbo::{Affine, Rect, Vec2};
+use crate::filter_effects::{EdgeMode, Filter, FilterGraph, FilterPrimitive};
+use crate::geometry::{PaddingU16, PaddingU64, RectU16, SizeU16};
+use crate::kurbo::{Affine, Rect};
 use crate::math::snap_up;
 use crate::tile::Tile;
 use crate::util::RectExt;
+use alloc::sync::Arc;
 
 pub mod drop_shadow;
 pub mod flood;
@@ -40,6 +41,7 @@ impl PreparedFilter {
     /// Build a new prepared filter for the given transform.
     pub fn new(filter: &Filter, transform: &Affine) -> Self {
         validate_filter_parameters(filter, transform);
+        let filter = &fitting_deviations(filter.clone(), transform);
         // Multi-primitive filter graphs are not yet implemented.
         if filter.graph.primitives.len() != 1 {
             unimplemented!("Multi-primitive filter graphs are not yet supported");
@@ -245,7 +247,7 @@ impl Default for FilterLayerPlacement {
 }
 
 /// Narrow a padding or shift of a filter that fits its `u16` viewport.
-fn narrow(value: u32) -> u16 {
+fn narrow(value: u64) -> u16 {
     u16::try_from(value).expect("a filter that fits its viewport has u16 paddings")
 }
 
@@ -259,13 +261,13 @@ pub struct FilterData {
     /// Padding that needs to be added for the area where the filter is applied.
     ///
     /// Covers [`Filter::filter_expansion`] and the device-space support of the
-    /// isotropic blur that is actually applied.
-    pub filter_padding: PaddingU32,
+    /// isotropic blur that is actually applied, saturated at `u64::MAX`.
+    pub filter_padding: PaddingU64,
     /// Padding that needs to be added to the source region for correct filter application.
     ///
     /// Covers [`Filter::source_expansion`] and the device-space support of the
-    /// isotropic blur that is actually applied.
-    pub source_padding: PaddingU32,
+    /// isotropic blur that is actually applied, saturated at `u64::MAX`.
+    pub source_padding: PaddingU64,
 }
 
 impl FilterData {
@@ -273,10 +275,11 @@ impl FilterData {
     ///
     /// # Panics
     ///
-    /// Panics if the filter parameters or the transform are not finite, a
-    /// standard deviation is negative, or a padding exceeds the `u32` domain.
+    /// Panics if the filter parameters or the transform are not finite, or a
+    /// standard deviation is negative.
     pub fn new(filter: Filter, transform: Affine) -> Self {
         validate_filter_parameters(&filter, &transform);
+        let filter = fitting_deviations(filter, &transform);
         let mut source_expansion = filter.source_expansion(&transform);
         let mut filter_expansion = filter.filter_expansion(&transform);
         if let Some(device_blur) = device_space_blur(&filter, &transform) {
@@ -298,8 +301,8 @@ impl FilterData {
     /// in a parent viewport of the given size, or `None` if it does not fit
     /// the `u16` coordinate domain.
     pub fn source_viewport_size(&self, width: u16, height: u16) -> Option<SizeU16> {
-        let expanded = |size: u16, before: u32, after: u32| {
-            let size = u64::from(size) + u64::from(before) + u64::from(after);
+        let expanded = |size: u16, before: u64, after: u64| {
+            let size = u64::from(size).checked_add(before)?.checked_add(after)?;
             u16::try_from(size).ok()
         };
         let padding = self.source_padding;
@@ -311,7 +314,7 @@ impl FilterData {
 
     /// By how much to shift all rendered contents to ensure that all rendered contents
     /// are visible in the viewport [0, 0, width, height].
-    pub fn source_shift(&self) -> (u32, u32) {
+    pub fn source_shift(&self) -> (u64, u64) {
         (self.source_padding.left, self.source_padding.top)
     }
 
@@ -359,22 +362,19 @@ impl FilterData {
 /// over it when `keeps_source` is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Displacement {
-    /// The translation of the moved copy, rounded half away from zero.
+    /// The translation of the moved copy, rounded half away from zero and
+    /// saturated at the bounds of `i64`.
     pub offset: (i64, i64),
     /// How far the blur of the moved copy reads around each pixel; zero for an offset.
-    pub blur_padding: PaddingU32,
+    pub blur_padding: PaddingU64,
     /// Whether the unmoved source is composited over the moved copy.
     pub keeps_source: bool,
 }
 
-fn snapped_padding(expansion: Rect) -> PaddingU32 {
-    fn padding(value: f64, step: u16) -> u32 {
-        let snapped = snap_up(value, step);
-        assert!(
-            snapped <= f64::from(u32::MAX),
-            "filter padding exceeds u32 coordinate domain"
-        );
-        snapped as u32
+fn snapped_padding(expansion: Rect) -> PaddingU64 {
+    // Saturates: no coordinate domain reaches `u64::MAX`.
+    fn padding(value: f64, step: u16) -> u64 {
+        snap_up(value, step) as u64
     }
 
     debug_assert!(
@@ -388,7 +388,7 @@ fn snapped_padding(expansion: Rect) -> PaddingU32 {
     // separately. However, not snapping here causes larger mismatches with Vello GPU
     // since the size of the final pixmap determines in which way we decimate for the
     // gaussian blur filter. Therefore, we keep this for compatibility.
-    PaddingU32::new(
+    PaddingU64::new(
         padding(-expansion.x0, Tile::WIDTH),
         padding(-expansion.y0, Tile::HEIGHT),
         padding(expansion.x1, Tile::WIDTH),
@@ -463,6 +463,54 @@ fn validate_filter_parameters(filter: &Filter, transform: &Affine) {
     }
 }
 
+/// Return `filter` with each standard deviation that exceeds `f32` in device
+/// space lowered to the largest that fits, which already spreads every pixel
+/// past every coordinate domain. Grids coarser than the device space then
+/// divide the same deviation.
+fn fitting_deviations(filter: Filter, transform: &Affine) -> Filter {
+    let fits = |std_deviation| transform_blur_params(std_deviation, transform).is_finite();
+    let mut primitives = filter.graph.primitives.clone();
+    let mut lowered = false;
+    for primitive in &mut primitives {
+        if let Some(std_deviation) = deviation_mut(primitive)
+            && !fits(*std_deviation)
+        {
+            // Deviations order like the bits of non-negative `f32`s, and zero fits.
+            let (mut low, mut high) = (0_u32, std_deviation.to_bits());
+            while high - low > 1 {
+                let middle = low + (high - low) / 2;
+                if fits(f32::from_bits(middle)) {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            *std_deviation = f32::from_bits(low);
+            lowered = true;
+        }
+    }
+    if !lowered {
+        return filter;
+    }
+    let mut graph = FilterGraph::new();
+    for primitive in primitives {
+        graph.add(primitive, None);
+    }
+    graph.set_output(filter.graph.output);
+    Filter {
+        graph: Arc::new(graph),
+    }
+}
+
+fn deviation_mut(primitive: &mut FilterPrimitive) -> Option<&mut f32> {
+    match primitive {
+        FilterPrimitive::GaussianBlur { std_deviation, .. }
+        | FilterPrimitive::DropShadow { std_deviation, .. }
+        | FilterPrimitive::DropShadowOnly { std_deviation, .. } => Some(std_deviation),
+        _ => None,
+    }
+}
+
 fn validate_offset(dx: f32, dy: f32) {
     assert!(
         dx.is_finite() && dy.is_finite(),
@@ -482,15 +530,25 @@ fn round(value: f32) -> f32 {
 
 /// Transform an offset's dx/dy using the affine transformation's linear part.
 ///
+/// An offset past the range of `f32` saturates at it, which already moves the
+/// source past every coordinate domain.
+///
 /// # Returns
 /// A tuple of (`scaled_dx`, `scaled_dy`) in device space.
 fn transform_offset_params(dx: f32, dy: f32, transform: &Affine) -> (f32, f32) {
-    let offset = Vec2::new(dx as f64, dy as f64);
+    let (dx, dy) = (f64::from(dx), f64::from(dy));
     let [a, b, c, d, _, _] = transform.as_coeffs();
-    let transformed_offset = Vec2::new(a * offset.x + c * offset.y, b * offset.x + d * offset.y);
-    let result = (transformed_offset.x as f32, transformed_offset.y as f32);
-    validate_offset(result.0, result.1);
-    result
+    let component = |x: f64, y: f64| {
+        let mut value = x * dx + y * dy;
+        if !value.is_finite() {
+            // Scaled down first, terms of opposite signs cancel instead of
+            // overflowing into NaN.
+            let magnitude = x.abs().max(y.abs());
+            value = (x / magnitude * dx + y / magnitude * dy) * magnitude;
+        }
+        value.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32
+    };
+    (component(a, c), component(b, d))
 }
 
 #[cfg(test)]
@@ -512,7 +570,7 @@ mod tests {
         })
     }
 
-    fn sides(padding: PaddingU32) -> (u32, u32, u32, u32) {
+    fn sides(padding: PaddingU64) -> (u64, u64, u64, u64) {
         (padding.left, padding.top, padding.right, padding.bottom)
     }
 
@@ -547,7 +605,7 @@ mod tests {
                 offset(amount, -amount).displacement(),
                 Some(Displacement {
                     offset: (rounded, -rounded),
-                    blur_padding: PaddingU32::ZERO,
+                    blur_padding: PaddingU64::ZERO,
                     keeps_source: false,
                 })
             );
@@ -592,7 +650,7 @@ mod tests {
                 data.displacement(),
                 Some(Displacement {
                     offset: (3, -140_000),
-                    blur_padding: PaddingU32::new(48, 48, 48, 48),
+                    blur_padding: PaddingU64::new(48, 48, 48, 48),
                     keeps_source,
                 })
             );
@@ -600,9 +658,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "filter padding exceeds u32 coordinate domain")]
-    fn rejects_padding_beyond_u32() {
-        offset(u32::MAX as f32, 0.0);
+    fn paddings_beyond_u64_saturate() {
+        let data = offset(f32::MAX, -f32::MAX);
+        assert_eq!(sides(data.source_padding), (u64::MAX, 0, 0, u64::MAX));
+        assert_eq!(sides(data.filter_padding), (0, u64::MAX, u64::MAX, 0));
+        assert_eq!(data.source_viewport_size(4, 4), None);
+        assert_eq!(data.displacement().unwrap().offset, (i64::MAX, i64::MIN));
     }
 
     #[test]
@@ -612,12 +673,49 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "filter offset must be finite")]
-    fn rejects_offset_that_overflows_in_device_space() {
-        PreparedFilter::new(
-            &Filter::from_primitive(FilterPrimitive::Offset { dx: 2.0, dy: 0.0 }),
-            &Affine::scale(f64::MAX),
-        );
+    fn deviations_past_f32_in_device_space_saturate() {
+        for scale in [4.0, 1.0e30, f64::MAX] {
+            let transform = Affine::scale(scale);
+            let data = FilterData::new(blur(f32::MAX), transform);
+            let FilterPrimitive::GaussianBlur { std_deviation, .. } =
+                data.filter.graph.primitives[0]
+            else {
+                panic!("a blur stays a blur");
+            };
+            let device = |std_deviation| transform_blur_params(std_deviation, &transform);
+            assert!(device(std_deviation).is_finite(), "{scale}");
+            assert!(device(std_deviation.next_up()).is_infinite(), "{scale}");
+            let PreparedFilter::GaussianBlur(prepared) =
+                PreparedFilter::new(&data.filter, &transform)
+            else {
+                panic!("a blur prepares a blur");
+            };
+            assert_eq!(prepared.std_deviation, device(std_deviation), "{scale}");
+        }
+    }
+
+    #[test]
+    fn offsets_past_f32_in_device_space_saturate() {
+        for (transform, expected) in [
+            (Affine::scale(4.0), (f32::MAX, -f32::MAX)),
+            (Affine::scale(f64::MAX), (f32::MAX, -f32::MAX)),
+            // Both terms of each coordinate overflow `f64` and cancel.
+            (
+                Affine::new([f64::MAX, f64::MAX, f64::MAX, f64::MAX, 0.0, 0.0]),
+                (0.0, 0.0),
+            ),
+        ] {
+            let offset = Filter::from_primitive(FilterPrimitive::Offset {
+                dx: f32::MAX,
+                dy: -f32::MAX,
+            });
+            let PreparedFilter::Offset(prepared) = PreparedFilter::new(&offset, &transform) else {
+                panic!("an offset prepares an offset");
+            };
+            assert_eq!((prepared.dx, prepared.dy), expected, "{transform:?}");
+            let data = FilterData::new(offset, transform);
+            assert!(data.displacement().is_some(), "{transform:?}");
+        }
     }
 
     #[test]

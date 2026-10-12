@@ -255,43 +255,33 @@ fn nested_filters_preserve_curved_clip_and_transform_beyond_u16() {
 #[test]
 fn invalid_filter_is_rejected_before_mutating_existing_layer() {
     for mode in modes() {
-        for (length, filter, reason) in [
-            (
-                12,
-                offset(f32::MAX, false),
-                "filter padding exceeds u32 coordinate domain",
-            ),
-            (
-                12,
-                Filter::from_primitive(FilterPrimitive::GaussianBlur {
-                    std_deviation: f32::INFINITY,
-                    edge_mode: EdgeMode::None,
-                }),
-                "filter standard deviation must be finite and non-negative",
-            ),
-        ] {
-            let mut ctx = context(length, false);
-            ctx.push_opacity_layer(0.5);
-            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ctx.push_filter_layer(filter);
-            }))
-            .expect_err("unrepresentable source domain must be rejected");
-            let message = error
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| error.downcast_ref::<&str>().copied());
-            assert_eq!(message, Some(reason));
-            ctx.set_paint(RED);
-            ctx.fill_rect(&rect(0.0, f64::from(length), false));
-            ctx.pop_layer();
-            let image = finish(ctx, length, false, mode);
-            assert!(
-                image
-                    .data_as_u8_slice()
-                    .chunks_exact(4)
-                    .all(|p| p == [128, 0, 0, 128])
-            );
-        }
+        let length = 12;
+        let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
+            std_deviation: f32::INFINITY,
+            edge_mode: EdgeMode::None,
+        });
+        let reason = "filter standard deviation must be finite and non-negative";
+        let mut ctx = context(length, false);
+        ctx.push_opacity_layer(0.5);
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.push_filter_layer(filter);
+        }))
+        .expect_err("unrepresentable source domain must be rejected");
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied());
+        assert_eq!(message, Some(reason));
+        ctx.set_paint(RED);
+        ctx.fill_rect(&rect(0.0, f64::from(length), false));
+        ctx.pop_layer();
+        let image = finish(ctx, length, false, mode);
+        assert!(
+            image
+                .data_as_u8_slice()
+                .chunks_exact(4)
+                .all(|p| p == [128, 0, 0, 128])
+        );
     }
 }
 

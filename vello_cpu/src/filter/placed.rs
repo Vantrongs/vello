@@ -4,12 +4,30 @@
 //! Filter pixmaps placed in a source space that can exceed the `u16` domain.
 
 use crate::filter::pixmap::FilterPixmap;
+use crate::kurbo::Rect;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use vello_common::geometry::{PaddingU32, RectU16};
+use vello_common::geometry::{PaddingU64, RectU16};
 use vello_common::peniko::color::PremulRgba8;
+#[cfg(not(feature = "std"))]
+use vello_common::peniko::kurbo::common::FloatFuncs as _;
 use vello_common::tile::Tile;
 
-/// A rectangle in a filter's source space. Empty rectangles are normalized to
+/// The bound of the coordinates of [`Bounds`] in each pixel grid. Lengths and
+/// sums of two coordinates fit `i64`, and areas fit `u128`.
+///
+/// It reaches far past the precision of the `f64` geometry drawn into the
+/// grid, so nothing is placed beyond it.
+const LIMIT: i64 = 1 << 61;
+
+/// Return the width of the pixels of the grid `level` steps of two coarser
+/// than the root target's, in root target pixels.
+pub(crate) fn pixel_size(level: u32) -> f64 {
+    (0..level).fold(1.0, |size, _| size * 2.0)
+}
+
+/// A rectangle in a pixel grid, with coordinates in `-LIMIT..=LIMIT`: whatever
+/// lies outside that domain is cut off. Empty rectangles are normalized to
 /// [`Bounds::EMPTY`], so their width and height are never negative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bounds {
@@ -27,11 +45,46 @@ impl Bounds {
         y1: 0,
     };
 
+    /// The whole domain of a grid.
+    pub(crate) const DOMAIN: Self = Self {
+        x0: -LIMIT,
+        y0: -LIMIT,
+        x1: LIMIT,
+        y1: LIMIT,
+    };
+
     pub(crate) fn new(x0: i64, y0: i64, x1: i64, y1: i64) -> Self {
+        Self::clamped(x0.into(), y0.into(), x1.into(), y1.into())
+    }
+
+    /// Return the part of the rectangle inside the domain.
+    fn clamped(x0: i128, y0: i128, x1: i128, y1: i128) -> Self {
+        let clamp = |value: i128| value.clamp(-i128::from(LIMIT), i128::from(LIMIT)) as i64;
+        let (x0, y0, x1, y1) = (clamp(x0), clamp(y0), clamp(x1), clamp(y1));
         if x0 >= x1 || y0 >= y1 {
             return Self::EMPTY;
         }
         Self { x0, y0, x1, y1 }
+    }
+
+    /// Return the bounds of the pixels that `rect` touches in the grid of
+    /// pixels `1 / scale` wide; all of the domain if `rect` is not finite.
+    pub(crate) fn covering(rect: Rect, scale: f64) -> Self {
+        let rect = rect.scale_from_origin(scale);
+        if !(rect.x0.is_finite()
+            && rect.y0.is_finite()
+            && rect.x1.is_finite()
+            && rect.y1.is_finite())
+        {
+            return Self::DOMAIN;
+        }
+        // Converting saturates, which the domain then clamps.
+        Self::new(
+            rect.x0.floor() as i64,
+            rect.y0.floor() as i64,
+            rect.x1.ceil() as i64,
+            rect.y1.ceil() as i64,
+        )
     }
 
     /// Return the bounds of a viewport of the given size.
@@ -61,26 +114,32 @@ impl Bounds {
         self.y1 - self.y0
     }
 
-    pub(crate) fn area(self) -> i64 {
-        self.width() * self.height()
+    pub(crate) fn area(self) -> u128 {
+        self.width() as u128 * self.height() as u128
     }
 
     pub(crate) fn translate(self, (dx, dy): (i64, i64)) -> Self {
         if self.is_empty() {
             return self;
         }
-        Self::new(self.x0 + dx, self.y0 + dy, self.x1 + dx, self.y1 + dy)
+        let (dx, dy) = (i128::from(dx), i128::from(dy));
+        Self::clamped(
+            i128::from(self.x0) + dx,
+            i128::from(self.y0) + dy,
+            i128::from(self.x1) + dx,
+            i128::from(self.y1) + dy,
+        )
     }
 
-    pub(crate) fn expand(self, padding: PaddingU32) -> Self {
+    pub(crate) fn expand(self, padding: PaddingU64) -> Self {
         if self.is_empty() {
             return self;
         }
-        Self::new(
-            self.x0 - i64::from(padding.left),
-            self.y0 - i64::from(padding.top),
-            self.x1 + i64::from(padding.right),
-            self.y1 + i64::from(padding.bottom),
+        Self::clamped(
+            i128::from(self.x0) - i128::from(padding.left),
+            i128::from(self.y0) - i128::from(padding.top),
+            i128::from(self.x1) + i128::from(padding.right),
+            i128::from(self.y1) + i128::from(padding.bottom),
         )
     }
 
@@ -128,22 +187,24 @@ impl Bounds {
         if self.is_empty() {
             return self;
         }
-        let step = 1_i64 << levels;
-        Self::new(
-            self.x0.div_euclid(step),
-            self.y0.div_euclid(step),
-            (self.x1 + step - 1).div_euclid(step),
-            (self.y1 + step - 1).div_euclid(step),
-        )
+        // Past 64 levels, every coordinate of the domain falls into the
+        // coarse pixels next to zero.
+        let step = 1_i128 << levels.min(64);
+        let start = |value: i64| i128::from(value).div_euclid(step);
+        let end = |value: i64| (i128::from(value) + step - 1).div_euclid(step);
+        Self::clamped(start(self.x0), start(self.y0), end(self.x1), end(self.y1))
     }
 
-    /// Return the bounds of these pixels on a grid `levels` times finer by a factor of two.
+    /// Return the bounds of these pixels on a grid `levels` times finer by a
+    /// factor of two, as far as that grid's domain reaches.
     pub(crate) fn refine(self, levels: u32) -> Self {
-        Self::new(
-            self.x0 << levels,
-            self.y0 << levels,
-            self.x1 << levels,
-            self.y1 << levels,
+        // Past 64 levels, every coordinate but zero leaves the domain.
+        let scale = |value: i64| i128::from(value) << levels.min(64);
+        Self::clamped(
+            scale(self.x0),
+            scale(self.y0),
+            scale(self.x1),
+            scale(self.y1),
         )
     }
 
@@ -164,33 +225,188 @@ impl Bounds {
     }
 }
 
+/// Bounds indexed by where they lie, so that the members touching a query
+/// are found without visiting the others.
+///
+/// A member whose longer side is at most `2^class` lies in the cell of that
+/// size holding its top left corner, so the members of a class that touch a
+/// query lie in the cells from the one before the query's start to the one at
+/// its end.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Index {
+    /// Each member by class, cell row, cell column and id.
+    members: BTreeMap<(u32, i64, i64, usize), Bounds>,
+    /// The classes that may hold members, as bits.
+    classes: u64,
+}
+
+impl Index {
+    /// Index `bounds` by their position in the sequence.
+    pub(crate) fn new(bounds: impl IntoIterator<Item = Bounds>) -> Self {
+        let mut index = Self::default();
+        for (id, bounds) in bounds.into_iter().enumerate() {
+            index.insert(id, bounds);
+        }
+        index
+    }
+
+    fn key(id: usize, bounds: Bounds) -> (u32, i64, i64, usize) {
+        let side = bounds.width().max(bounds.height()).max(1).unsigned_abs();
+        let class = u64::BITS - (side - 1).leading_zeros();
+        (class, bounds.y0 >> class, bounds.x0 >> class, id)
+    }
+
+    /// Add `bounds` with `id`, unless they are empty.
+    pub(crate) fn insert(&mut self, id: usize, bounds: Bounds) {
+        if bounds.is_empty() {
+            return;
+        }
+        let key = Self::key(id, bounds);
+        self.classes |= 1 << key.0;
+        self.members.insert(key, bounds);
+    }
+
+    /// Remove the member `bounds` with `id`.
+    pub(crate) fn remove(&mut self, id: usize, bounds: Bounds) {
+        self.members.remove(&Self::key(id, bounds));
+    }
+
+    /// Return the members, in no particular order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Bounds> + '_ {
+        self.members.values().copied()
+    }
+
+    /// Return the ids and bounds of the members that overlap `query` or share
+    /// an edge with it, in no particular order.
+    pub(crate) fn touching(&self, query: Bounds) -> impl Iterator<Item = (usize, Bounds)> + '_ {
+        let classes = (0..u64::BITS).filter(|class| self.classes & (1 << class) != 0);
+        let candidates = classes.flat_map(move |class| {
+            let cell = |value: i64| value >> class;
+            let first = |value: i64| ((i128::from(value) - (1_i128 << class)) >> class) as i64;
+            let (columns, rows) = (
+                first(query.x0)..=cell(query.x1),
+                first(query.y0)..=cell(query.y1),
+            );
+            // A tall query scans the members of its rows; a short one only
+            // the cells it can touch.
+            let short = rows.end() - rows.start() < 4;
+            let bands = if short {
+                (*rows.start()..=*rows.end())
+                    .map(|row| {
+                        (class, row, *columns.start(), 0)..=(class, row, *columns.end(), usize::MAX)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                alloc::vec![
+                    (class, *rows.start(), i64::MIN, 0)
+                        ..=(class, *rows.end(), i64::MAX, usize::MAX)
+                ]
+            };
+            bands.into_iter().flat_map(move |band| {
+                let columns = columns.clone();
+                self.members
+                    .range(band)
+                    .filter(move |((_, _, column, _), _)| columns.contains(column))
+            })
+        });
+        candidates
+            .filter(move |(_, bounds)| {
+                bounds.x0 <= query.x1
+                    && query.x0 <= bounds.x1
+                    && bounds.y0 <= query.y1
+                    && query.y0 <= bounds.y1
+            })
+            .map(|(&(_, _, _, id), &bounds)| (id, bounds))
+    }
+}
+
 /// Regions to render. A region that is added is merged with a member whose
 /// bounds together with it cover no more area than the two apart, so shared
 /// pixels are rendered once and no pixel neither needs is rendered.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Regions(Vec<Bounds>);
+pub(crate) struct Regions {
+    regions: Vec<Bounds>,
+    index: Index,
+}
 
 impl Regions {
     pub(crate) fn insert(&mut self, mut bounds: Bounds) {
         if bounds.is_empty() {
             return;
         }
+        // Regions merge only if they touch: a gap along either axis makes
+        // their bounds together larger than the two apart.
         while let Some(index) = self
-            .0
-            .iter()
-            .position(|region| region.union(bounds).area() <= region.area() + bounds.area())
+            .index
+            .touching(bounds)
+            .filter(|(_, region)| region.union(bounds).area() <= region.area() + bounds.area())
+            .map(|(index, _)| index)
+            .min()
         {
-            bounds = bounds.union(self.0.swap_remove(index));
+            bounds = bounds.union(self.swap_remove(index));
         }
-        self.0.push(bounds);
+        self.index.insert(self.regions.len(), bounds);
+        self.regions.push(bounds);
+    }
+
+    fn swap_remove(&mut self, index: usize) -> Bounds {
+        let last = self.regions.len() - 1;
+        self.index.remove(index, self.regions[index]);
+        if index != last {
+            self.index.remove(last, self.regions[last]);
+            self.index.insert(index, self.regions[last]);
+        }
+        self.regions.swap_remove(index)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = Bounds> + '_ {
-        self.0.iter().copied()
+        self.regions.iter().copied()
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
+    /// Return the regions that overlap `bounds` or share an edge with it, in
+    /// the order of [`Self::iter`].
+    pub(crate) fn touching(&self, bounds: Bounds) -> impl Iterator<Item = Bounds> + '_ {
+        let mut indices: Vec<usize> = self
+            .index
+            .touching(bounds)
+            .map(|(index, _)| index)
+            .collect();
+        indices.sort_unstable();
+        indices.into_iter().map(|index| self.regions[index])
+    }
+}
+
+/// Placed pixmaps, indexed by their bounds.
+#[derive(Debug, Default)]
+pub(crate) struct Pieces {
+    pieces: Vec<PlacedPixmap>,
+    index: Index,
+}
+
+impl Pieces {
+    pub(crate) fn new(pieces: Vec<PlacedPixmap>) -> Self {
+        Self {
+            index: Index::new(pieces.iter().map(|piece| piece.bounds)),
+            pieces,
+        }
+    }
+
+    /// Return the bounds of the pieces.
+    pub(crate) fn index(&self) -> &Index {
+        &self.index
+    }
+
+    /// Return a copy of the pixels of the pieces inside `area`, transparent
+    /// where they do not cover it.
+    pub(crate) fn crop(&self, area: Bounds) -> PlacedPixmap {
+        let mut crop = PlacedPixmap::new(area);
+        let mut touching: Vec<usize> = self.index.touching(area).map(|(index, _)| index).collect();
+        // The order of the pieces decides the pixels where they overlap.
+        touching.sort_unstable();
+        for index in touching {
+            crop.copy_from(&self.pieces[index], area);
+        }
+        crop
     }
 }
 
@@ -256,5 +472,55 @@ impl PlacedPixmap {
     fn index(&self, x: i64, y: i64) -> usize {
         let bounds = self.bounds;
         usize::try_from((y - bounds.y0) * bounds.width() + x - bounds.x0).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bounds, Regions};
+    use alloc::vec::Vec;
+
+    /// Merge like [`Regions::insert`], comparing with every member.
+    fn insert_scanning(regions: &mut Vec<Bounds>, mut bounds: Bounds) {
+        if bounds.is_empty() {
+            return;
+        }
+        while let Some(index) = regions
+            .iter()
+            .position(|region| region.union(bounds).area() <= region.area() + bounds.area())
+        {
+            bounds = bounds.union(regions.swap_remove(index));
+        }
+        regions.push(bounds);
+    }
+
+    #[test]
+    fn regions_merge_like_a_scan_of_every_member() {
+        let mut state = 0x2545_f491_u64;
+        let mut random = |range: i64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % range.unsigned_abs()) as i64
+        };
+        for round in 0..200 {
+            let spread = [16, 64, 256, 1 << 40][round % 4];
+            let mut regions = Regions::default();
+            let mut scanned = Vec::new();
+            for _ in 0..300 {
+                let bounds = if round % 5 == 4 {
+                    // Tiles, which merge where they share an edge.
+                    let (x, y) = (4 * random(16), 4 * random(16));
+                    Bounds::new(x, y, x + 4 + 4 * random(2), y + 4 + 4 * random(2))
+                } else {
+                    let (x, y) = (random(spread) - spread / 2, random(spread) - spread / 2);
+                    let size = [1, 4, 16, 64, 1 << 20][random(5) as usize];
+                    Bounds::new(x, y, x + 1 + random(size), y + 1 + random(size))
+                };
+                regions.insert(bounds);
+                insert_scanning(&mut scanned, bounds);
+            }
+            assert_eq!(regions.iter().collect::<Vec<_>>(), scanned, "round {round}");
+        }
     }
 }

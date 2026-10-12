@@ -117,8 +117,14 @@ impl ViewportState {
         let parent_generator = core::mem::replace(&mut self.strip_generator, filter_generator);
         self.strip_generator_stack.push(parent_generator);
 
-        self.clip_state
-            .push_root_viewport(filter_data.source_shift(), &mut self.strip_generator);
+        let (shift_x, shift_y) = filter_data.source_shift();
+        let narrow = |shift: u64| {
+            u16::try_from(shift).expect("a source viewport that fits u16 has u16 shifts")
+        };
+        self.clip_state.push_root_viewport(
+            (narrow(shift_x), narrow(shift_y)),
+            &mut self.strip_generator,
+        );
     }
 
     /// Pop the last root viewport.

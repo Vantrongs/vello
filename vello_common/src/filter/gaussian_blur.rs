@@ -22,7 +22,7 @@ use peniko::kurbo::common::FloatFuncs as _;
 /// * `transform` - The transformation matrix to extract scale from
 ///
 /// # Returns
-/// The scaled standard deviation in device space
+/// The scaled standard deviation in device space, infinite if it exceeds `f32`.
 pub(crate) fn transform_blur_params(std_deviation: f32, transform: &Affine) -> f32 {
     let (scale_x, scale_y) = extract_scales(transform);
     let uniform_scale = (scale_x + scale_y) / 2.0;
@@ -45,10 +45,6 @@ pub(crate) fn transform_blur_params(std_deviation: f32, transform: &Affine) -> f
             (f64::from(std_deviation) * magnitude * average) as f32
         }
     };
-    assert!(
-        scaled.is_finite(),
-        "transformed blur standard deviation must be finite"
-    );
     // TODO: Support separate standard deviations along the transformed axes.
     scaled
 }

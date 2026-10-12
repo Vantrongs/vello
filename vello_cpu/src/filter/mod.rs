@@ -8,6 +8,7 @@
 //! Filters are applied to rendered layer pixmaps and may use scratch storage for
 //! intermediate buffers.
 
+pub(crate) mod averaged_image;
 pub(crate) mod context;
 mod drop_shadow;
 mod flood;
@@ -113,14 +114,15 @@ pub(crate) fn filter_highp(
 }
 
 /// Apply a blur or drop shadow to `pixmap`, whose pixels each cover
-/// `2^levels` pixels of the output on both axes, and return the output inside
-/// `crop`, which is relative to the pixmap's origin in output pixels.
+/// `2^levels` pixels of the output on both axes and which starts at `origin`
+/// in its grid, and return the output inside `crop`, in the grid of the output.
 ///
 /// Both kernels apply blurs and drop shadows at low precision, so this serves both.
 pub(crate) fn filter_reduced(
     filter: PreparedFilter,
     pixmap: FilterPixmap,
     levels: u32,
+    origin: (i64, i64),
     crop: Bounds,
     filter_scratch: &mut ScratchBuffer,
 ) -> FilterPixmap {
@@ -133,6 +135,7 @@ pub(crate) fn filter_reduced(
             &blur.kernel[..usize::from(blur.kernel_size)],
             blur.edge_mode,
             levels,
+            origin,
             crop,
         ),
         PreparedFilter::DropShadow(shadow) => {
@@ -143,6 +146,7 @@ pub(crate) fn filter_reduced(
                 &shadow.kernel[..usize::from(shadow.kernel_size)],
                 shadow.edge_mode,
                 levels,
+                origin,
                 crop,
             );
             drop_shadow::colorize(&mut output, shadow.color);

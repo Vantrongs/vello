@@ -9,7 +9,7 @@ use std::cell::Cell;
 use vello_cpu::color::AlphaColor;
 use vello_cpu::color::palette::css::BLUE;
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_cpu::kurbo::Rect;
+use vello_cpu::kurbo::{Affine, Rect};
 use vello_cpu::{
     Level, Pixmap, RasterizerSettings, RenderContext, RenderMode, RenderSettings, Resources,
 };
@@ -248,29 +248,100 @@ fn offset_allocates_the_same_however_far_the_source_lies() {
 
 /// Render a blur of standard deviation `std_deviation` over a square that
 /// covers all it reaches of a 12 by 12 view.
-fn blurred_square(std_deviation: f32) -> Vec<u8> {
+/// Blur a square that covers the view and reaches four standard deviations
+/// past it, drawn and blurred in a space scaled by `scale`.
+fn blurred_square(std_deviation: f32, scale: f64) -> Vec<u8> {
     let mut context = context(12, 12);
+    context.set_transform(Affine::scale(scale));
     context.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation,
         edge_mode: EdgeMode::None,
     }));
     context.set_paint(BLUE);
-    let reach = 4.0 * f64::from(std_deviation);
-    context.fill_rect(&Rect::new(-reach, -reach, 12.0 + reach, 12.0 + reach));
+    let (reach, size) = (4.0 * f64::from(std_deviation), 12.0 / scale);
+    context.fill_rect(&Rect::new(-reach, -reach, size + reach, size + reach));
     context.pop_layer();
     render(context)
 }
 
 #[test]
 fn blur_allocates_a_bounded_amount_however_wide_it_is() {
-    for std_deviation in [4.0, 40.0, 400.0, 4_000.0, 20_000.0] {
-        let (usage, pixels) = measure(|| blurred_square(std_deviation));
-        for pixel in pixels.chunks_exact(4) {
+    // At larger scales, the largest standard deviations exceed `f32` in the
+    // target's space.
+    for scale in [1.0, 4.0, 1.0e30] {
+        for std_deviation in [4.0, 40.0, 400.0, 4_000.0, 20_000.0, 1.0e9, 1.0e30, f32::MAX] {
+            let (usage, pixels) = measure(|| blurred_square(std_deviation, scale));
+            // The blur reads three standard deviations around each pixel, which
+            // hold 99.7% of its weight.
+            for pixel in pixels.chunks_exact(4) {
+                assert!(
+                    pixel[0] == 0 && pixel[1] == 0 && pixel[2] >= 253 && pixel[3] >= 253,
+                    "sigma {std_deviation} at scale {scale}: {pixel:?}"
+                );
+            }
             assert!(
-                pixel[0] == 0 && pixel[1] == 0 && pixel[2] >= 254 && pixel[3] >= 254,
-                "sigma {std_deviation}: {pixel:?}"
+                usage.peak <= 32 << 20,
+                "sigma {std_deviation} at scale {scale}: {usage:?}"
             );
         }
-        assert!(usage.peak <= 32 << 20, "sigma {std_deviation}: {usage:?}");
+    }
+}
+
+/// Render a square in a 64 by 64 view under `primitive`, whose moved copy lands
+/// `distance` times `scale` pixels right of and below it, far outside the view.
+fn moved_far(primitive: impl Fn(f32) -> FilterPrimitive, distance: f32, scale: f64) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.set_transform(Affine::scale(scale));
+    context.push_filter_layer(Filter::from_primitive(primitive(distance)));
+    context.set_paint(BLUE);
+    context.fill_rect(&Rect::new(16.0, 16.0, 48.0, 48.0).scale_from_origin(1.0 / scale));
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn copies_moved_past_any_coordinate_domain_leave_the_view_as_it_is() {
+    let shadow = |std_deviation| {
+        move |distance| FilterPrimitive::DropShadow {
+            dx: distance,
+            dy: distance,
+            std_deviation,
+            color: AlphaColor::from_rgba8(255, 0, 0, 255),
+            edge_mode: EdgeMode::None,
+        }
+    };
+    let offset = |distance| FilterPrimitive::Offset {
+        dx: distance,
+        dy: distance,
+    };
+    let (near, source) = measure(|| moved_far(shadow(0.0), 64.0, 1.0));
+    let mut square = context(64, 64);
+    square.set_paint(BLUE);
+    square.fill_rect(&Rect::new(16.0, 16.0, 48.0, 48.0));
+    assert!(source == render(square));
+    // At larger scales, the largest distance exceeds `f32` in the target's space.
+    for (distance, scale) in [
+        (3.2e9, 1.0),
+        (1.0e19, 1.0),
+        (f32::MAX, 1.0),
+        (f32::MAX, 4.0),
+        (f32::MAX, 1.0e30),
+    ] {
+        for std_deviation in [0.0, 2.0] {
+            let (usage, pixels) = measure(|| moved_far(shadow(std_deviation), distance, scale));
+            assert!(
+                pixels == source,
+                "shadow {std_deviation} at {distance}, {scale}"
+            );
+            assert!(
+                usage.peak <= 2 * near.peak && usage.total <= 2 * near.total,
+                "shadow {std_deviation} at {distance}, {scale}: {usage:?}, near: {near:?}"
+            );
+        }
+        let pixels = moved_far(offset, distance, scale);
+        assert!(
+            pixels.iter().all(|&value| value == 0),
+            "offset {distance}, {scale}"
+        );
     }
 }

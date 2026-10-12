@@ -654,7 +654,7 @@ impl Scene {
                 .as_ref()
                 .map_or(Affine::IDENTITY, |filter_data| {
                     let (shift_x, shift_y) = filter_data.source_shift();
-                    Affine::translate((f64::from(shift_x), f64::from(shift_y)))
+                    Affine::translate((shift_x as f64, shift_y as f64))
                 });
         if let Some(filter_plan) = &filter_data {
             self.viewport_state.push_root_viewport(filter_plan);

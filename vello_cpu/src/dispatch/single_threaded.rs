@@ -5,10 +5,10 @@ use crate::RasterizerSettings;
 use crate::coarse::CommandBucketer;
 use crate::coarse::depth::DepthBuffer;
 use crate::dispatch::Dispatcher;
-use crate::dispatch::filter_graph::{Clip, FilterGraph, Layer, Recording, content_filter, crop};
+use crate::dispatch::filter_graph::{Clip, FilterGraph, Layer, Recording, content_filter};
 use crate::filter::context::FilterContext;
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::{Bounds, PlacedPixmap};
+use crate::filter::placed::{Bounds, Pieces, PlacedPixmap};
 use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_region};
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
@@ -151,7 +151,7 @@ impl SingleThreadedDispatcher {
         simd: S,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
-        nested: &[Vec<PlacedPixmap>],
+        nested: &[Pieces],
     ) -> Option<PlacedPixmap> {
         let bbox = self.window_content_placement().pixmap_bbox();
         if bbox.is_empty() {
@@ -407,7 +407,7 @@ impl SingleThreadedDispatcher {
         simd: S,
         encoded_paints: &[EncodedPaint],
         image_resolver: &dyn ImageResolver,
-        nested: &[Vec<PlacedPixmap>],
+        nested: &[Pieces],
     ) -> FilterContext {
         // TODO: Reuse across frames so that pixmaps can be reused.
         let mut filter_ctx = FilterContext::new(self.recorder.layers.len());
@@ -422,11 +422,10 @@ impl SingleThreadedDispatcher {
             }
             let dest = Bounds::of_rect(placement.dest_bbox(), self.grid_origin);
             let pixmap = match source {
-                FilterSource::Graph(graph) => crop(
-                    &graph.render::<S, F>(simd, encoded_paints, image_resolver),
-                    dest,
-                ),
-                FilterSource::Injected { node } => crop(&nested[*node], dest),
+                FilterSource::Graph(graph) => graph
+                    .render::<S, F>(simd, encoded_paints, image_resolver)
+                    .crop(dest),
+                FilterSource::Injected { node } => nested[*node].crop(dest),
                 FilterSource::WindowContent => continue,
             };
 
