@@ -35,6 +35,7 @@ fn offset(distance: f32, vertical: bool) -> Filter {
 fn render(
     vertical: bool,
     layer_mask: bool,
+    nested: bool,
     outside: Option<f32>,
     indexed: bool,
     mode: RenderMode,
@@ -61,7 +62,12 @@ fn render(
         })
         .collect();
     let mask = Mask::from_parts(data, width, height);
-    ctx.push_filter_layer(offset(outside.map_or(0.0, |start| 4.0 - start), vertical));
+    if nested {
+        ctx.push_filter_layer(offset(-70_000.0, vertical));
+        ctx.push_filter_layer(offset(70_000.0, vertical));
+    } else {
+        ctx.push_filter_layer(offset(outside.map_or(0.0, |start| 4.0 - start), vertical));
+    }
     if layer_mask {
         ctx.push_mask_layer(mask);
     } else {
@@ -91,6 +97,9 @@ fn render(
         ctx.reset_mask();
     }
     ctx.pop_layer();
+    if nested {
+        ctx.pop_layer();
+    }
     finish(&mut ctx, mode)
 }
 
@@ -108,10 +117,10 @@ fn finish(ctx: &mut RenderContext, mode: RenderMode) -> Pixmap {
     pixmap
 }
 
-fn verify(layer_mask: bool, outside: Option<f32>) {
+fn verify(layer_mask: bool, nested: bool, outside: Option<f32>) {
     for mode in modes() {
         for (vertical, indexed) in [(false, false), (true, false), (false, true), (true, true)] {
-            let pixmap = render(vertical, layer_mask, outside, indexed, mode);
+            let pixmap = render(vertical, layer_mask, nested, outside, indexed, mode);
             for y in 0..pixmap.height() {
                 for x in 0..pixmap.width() {
                     let major = if vertical { y } else { x };
@@ -123,7 +132,7 @@ fn verify(layer_mask: bool, outside: Option<f32>) {
                     assert_eq!(
                         pixmap.sample(x, y).to_u8_array(),
                         expected,
-                        "layer={layer_mask} outside={outside:?} indexed={indexed} mode={mode:?} vertical={vertical} pixel=({x},{y})"
+                        "layer={layer_mask} nested={nested} outside={outside:?} indexed={indexed} mode={mode:?} vertical={vertical} pixel=({x},{y})"
                     );
                 }
             }
@@ -133,19 +142,25 @@ fn verify(layer_mask: bool, outside: Option<f32>) {
 
 #[test]
 fn draw_mask_uses_root_coordinates_in_tight_filter_buffer() {
-    verify(false, None);
+    verify(false, false, None);
 }
 
 #[test]
 fn layer_mask_uses_root_coordinates_in_tight_filter_buffer() {
-    verify(true, None);
+    verify(true, false, None);
+}
+
+#[test]
+fn nested_filter_masks_compensate_cumulative_source_shifts() {
+    verify(false, true, None);
+    verify(true, true, None);
 }
 
 #[test]
 fn filter_source_outside_root_mask_is_transparent() {
     for outside in [Some(20.0), Some(-12.0)] {
-        verify(false, outside);
-        verify(true, outside);
+        verify(false, false, outside);
+        verify(true, false, outside);
     }
 }
 

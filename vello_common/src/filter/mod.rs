@@ -197,6 +197,23 @@ impl FilterLayerPlacement {
         }
     }
 
+    /// Place a filtered pixmap that was rendered elsewhere and already covers
+    /// exactly `dest` in the parent layer.
+    ///
+    /// `dest` must start on a tile boundary.
+    pub fn rendered_at(dest: RectU16) -> Self {
+        assert!(
+            dest.x0.is_multiple_of(Tile::WIDTH) && dest.y0.is_multiple_of(Tile::HEIGHT),
+            "filter destination origin must be tile-aligned"
+        );
+        Self {
+            pixmap_bbox: dest,
+            dest_bbox: dest,
+            src_x: 0,
+            src_y: 0,
+        }
+    }
+
     /// Return the bounds of the pixmap allocated for the filter layer.
     ///
     /// The origin is tile-aligned. The exclusive edge can cut the final tile

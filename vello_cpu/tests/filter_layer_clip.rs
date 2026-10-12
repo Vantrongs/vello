@@ -20,7 +20,7 @@ fn modes() -> impl Iterator<Item = RenderMode> {
     .into_iter()
 }
 
-fn render(filter: &Filter, combined: bool, mode: RenderMode) -> Pixmap {
+fn render(filter: &Filter, distance: f64, combined: bool, mode: RenderMode) -> Pixmap {
     // Filters currently use the single-threaded dispatcher.
     let mut ctx = RenderContext::new_with(
         64,
@@ -35,6 +35,8 @@ fn render(filter: &Filter, combined: bool, mode: RenderMode) -> Pixmap {
     active.line_to((56.0, 0.0));
     active.line_to((0.0, 16.0));
     active.close_path();
+    // Keep a far source visible, so only the triangle shapes the result.
+    active.extend(Rect::new(69_000.0, 0.0, 71_000.0, 16.0).path_elements(0.1));
     ctx.push_clip_path(&active);
     let layer = Rect::new(8.0, 0.0, 40.0, 4.0).to_path(0.1);
     if combined {
@@ -44,7 +46,7 @@ fn render(filter: &Filter, combined: bool, mode: RenderMode) -> Pixmap {
         ctx.push_filter_layer(filter.clone());
     }
     ctx.set_paint(RED);
-    ctx.fill_rect(&Rect::new(4.0, 0.0, 60.0, 4.0));
+    ctx.fill_rect(&Rect::new(4.0 + distance, 0.0, 60.0 + distance, 4.0));
     ctx.pop_layer();
     if !combined {
         ctx.pop_layer();
@@ -65,22 +67,29 @@ fn render(filter: &Filter, combined: bool, mode: RenderMode) -> Pixmap {
 
 #[test]
 fn filter_layer_clip_matches_an_enclosing_clip_layer() {
-    // A blur shifts its source viewport away from the parent's.
     let blur = Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 2.0,
         edge_mode: EdgeMode::None,
     });
+    let far_offset = Filter::from_primitive(FilterPrimitive::Offset {
+        dx: -70_000.0,
+        dy: 0.0,
+    });
     for mode in modes() {
-        let combined = render(&blur, true, mode);
-        let separate = render(&blur, false, mode);
-        assert!(
-            combined.data().iter().any(|p| p.a != 0),
-            "{mode:?}: empty result"
-        );
-        assert_eq!(
-            combined.data_as_u8_slice(),
-            separate.data_as_u8_slice(),
-            "{mode:?}"
-        );
+        // A blur shifts its source viewport away from the parent's; a far
+        // offset needs a source beyond the u16 domain.
+        for (filter, distance) in [(&blur, 0.0), (&far_offset, 70_000.0)] {
+            let combined = render(filter, distance, true, mode);
+            let separate = render(filter, distance, false, mode);
+            assert!(
+                combined.data().iter().any(|p| p.a != 0),
+                "{mode:?} distance={distance}: empty result"
+            );
+            assert_eq!(
+                combined.data_as_u8_slice(),
+                separate.data_as_u8_slice(),
+                "{mode:?} distance={distance}"
+            );
+        }
     }
 }

@@ -555,6 +555,8 @@ pub struct Fine<S: Simd, T: FineKernel<S>> {
     origin: (u16, u16),
     /// Translation from target pixels to the root target, where masks are sampled.
     mask_offset: (i64, i64),
+    /// Position of the dispatcher's root target in the space paints are encoded in.
+    paint_origin: (u32, u32),
 }
 
 impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
@@ -582,7 +584,13 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             row_y: 0,
             origin: (0, 0),
             mask_offset: (0, 0),
+            paint_origin: (0, 0),
         }
+    }
+
+    /// Set the position of the dispatcher's root target in the space paints are encoded in.
+    pub(crate) fn set_paint_origin(&mut self, paint_origin: (u32, u32)) {
+        self.paint_origin = paint_origin;
     }
 
     /// Set the translation from target pixels to the root target.
@@ -966,15 +974,17 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         let start = x * TILE_HEIGHT_COMPONENTS;
         let dest = &mut self.blend_buffers.last_mut().unwrap()[start..start + len];
         let color_buf = &mut self.paint_buf[..len];
-        let encoded_paint = resources
-            .encoded_paints
-            .get(paint_index)
-            .unwrap_or_else(|| {
-                &resources.filter_paints[paint_index - resources.encoded_paints.len()]
-            });
+        let (encoded_paint, paint_origin) = match resources.encoded_paints.get(paint_index) {
+            Some(paint) => (paint, self.paint_origin),
+            // Filter layers are encoded in the pixels of the target they are composited into.
+            None => (
+                &resources.filter_paints[paint_index - resources.encoded_paints.len()],
+                (0, 0),
+            ),
+        };
 
-        let sampler_x = sample_x as f64 + PIXEL_CENTER_OFFSET;
-        let sampler_y = f64::from(sample_y) + PIXEL_CENTER_OFFSET;
+        let sampler_x = sample_x as f64 + f64::from(paint_origin.0) + PIXEL_CENTER_OFFSET;
+        let sampler_y = f64::from(sample_y) + f64::from(paint_origin.1) + PIXEL_CENTER_OFFSET;
         let default_blend = attrs.blend_mode == BlendMode::default();
 
         // We need to have this as a macro because closures cannot take generic arguments, and

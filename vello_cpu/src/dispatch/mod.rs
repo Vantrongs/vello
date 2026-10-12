@@ -4,6 +4,7 @@
 #[cfg(feature = "multithreading")]
 pub(crate) mod multi_threaded;
 pub(crate) mod single_threaded;
+mod windowed_filter;
 
 use crate::RasterizerSettings;
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
