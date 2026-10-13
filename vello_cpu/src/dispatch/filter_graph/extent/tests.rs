@@ -666,19 +666,29 @@ fn rectangles_without_bounds_are_cut_as_the_recorder_cuts_them() {
     ] {
         let origin = viewport.origin();
         let to_viewport = Affine::translate((origin.0.to_f64(), origin.1.to_f64()));
-        // Clips inside the viewport, beyond which the recorder draws nothing
-        // to compare with.
-        let clip = to_viewport.transform_rect_bbox(Rect::new(5.0, 15.0, 90.0, 70.0));
-        let clips = [
-            alloc::vec![],
-            alloc::vec![Clip::Rect(clip)],
-            alloc::vec![Clip::Path {
-                path: clip.to_path(0.1),
-                fill_rule: Fill::NonZero,
-                transform: to_viewport * Affine::rotate(0.1) * to_viewport.inverse(),
-                aliasing_threshold: None,
-            }],
-        ];
+        // Clips inside the viewport and reaching out of it, where the viewport
+        // cuts a rectangle without bounds as the recorder does: a rectangle, a
+        // path that is one, which covers whole tiles, the path turned, and a
+        // rectangle under the path.
+        let path = |clip: Rect, turn: f64| Clip::Path {
+            path: clip.to_path(0.1),
+            fill_rule: Fill::NonZero,
+            transform: to_viewport * Affine::rotate(turn) * to_viewport.inverse(),
+            aliasing_threshold: None,
+        };
+        let mut clips = alloc::vec![alloc::vec![]];
+        for clip in [
+            Rect::new(5.0, 15.0, 90.0, 70.0),
+            Rect::new(-60.0, -2000.0, 90.0, 70.0),
+        ] {
+            let clip = to_viewport.transform_rect_bbox(clip);
+            clips.extend([
+                alloc::vec![Clip::Rect(clip)],
+                alloc::vec![path(clip, 0.0)],
+                alloc::vec![path(clip, 0.1)],
+                alloc::vec![path(clip, 0.0), Clip::Rect(clip.inflate(-2.0, -2.0))],
+            ]);
+        }
         for rect in rects {
             for transform in transforms {
                 for clips in &clips {

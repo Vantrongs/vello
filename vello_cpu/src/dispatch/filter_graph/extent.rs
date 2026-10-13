@@ -951,10 +951,10 @@ impl<'a> Extents<'a> {
                 .rect_tiles(self.unbounded_cut(rect.abs()))
                 .intersect(piece),
             (Some(rect), Cover::Rect(clip)) => self
-                .rect_tiles(rect.abs().intersect(*clip))
+                .rect_tiles(self.unbounded_cut(rect.abs()).intersect(*clip))
                 .intersect(piece),
             (Some(rect), Cover::Tiles(tiles)) => self
-                .rect_tiles(rect.abs().intersect(to_rect(tiles)))
+                .rect_tiles(self.unbounded_cut(rect.abs()).intersect(to_rect(tiles)))
                 .intersect(tiles)
                 .intersect(piece),
             (None, Cover::All) => self.path(item, Some(piece), None),
