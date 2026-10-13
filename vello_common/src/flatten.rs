@@ -481,9 +481,16 @@ impl HairlineSink<'_> {
         let (n0, n1) = (self.normal(d0), self.normal(d1));
         let cos = d0.u.dot(d1.u);
         let turn = d0.u.cross(d1.u);
-        let tan_half = turn.abs() / (1.0 + cos);
+        // Where a join nearly reverses, `1 + cos` is lost to rounding and disagrees with
+        // `turn`; the sum and difference of the directions keep both consistent.
+        let (one_plus_cos, tan_half) = if cos >= 0.0 {
+            (1.0 + cos, turn.abs() / (1.0 + cos))
+        } else {
+            let (sum, difference) = (d0.u + d1.u, d1.u - d0.u);
+            (0.5 * sum.hypot2(), difference.hypot() / sum.hypot())
+        };
         // Where the two offset lines on either side meet, relative to `p`, on the left.
-        let miter = (n0 + n1) / (1.0 + cos);
+        let miter = (n0 + n1) / one_plus_cos;
         // Turning left (positive cross product, y up) puts the left side inside.
         let (inner, outer) = if turn > 0.0 {
             (&mut *self.left, &mut *self.right)
@@ -502,7 +509,7 @@ impl HairlineSink<'_> {
         // The outer side.
         let negligible = tan_half.is_nan()
             || (tan_half <= 1.0 && self.device_half_width2 * tan_half < MIN_JOIN_AREA);
-        let within_limit = (0.5 * (1.0 + cos)).sqrt() * self.miter_limit >= 1.0;
+        let within_limit = (0.5 * one_plus_cos).sqrt() * self.miter_limit >= 1.0;
         match self.join {
             _ if negligible && reach.is_finite() => outer.push(p - miter),
             kurbo::Join::Miter if within_limit => outer.push(p - miter),
@@ -793,6 +800,40 @@ mod hairline_tests {
         let reach = (SQRT_2 * hw) as f32 + 1e-4;
         assert!(x1 <= 50.0 + reach && x0 >= -reach, "{x0} {x1}");
         assert!(y0 >= 50.0 - reach && y1 <= 50.000_002 + reach, "{y0} {y1}");
+    }
+
+    /// Joins that nearly reverse, whose `1 + cos` is lost to rounding, stay within
+    /// √2 half widths of the path, whatever the join.
+    #[test]
+    fn nearly_reversing_joins_stay_near_the_path() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let hw = 0.5;
+        for _ in 0..10_000 {
+            let start = kurbo::Point::new(1000.0 + 500.0 * next(), 1000.0 + 500.0 * next());
+            let turn = kurbo::Point::new(1000.0 + 500.0 * next(), 1000.0 + 500.0 * next());
+            let mut p = kurbo::BezPath::new();
+            p.move_to(start);
+            p.line_to(turn);
+            // Back to the start, off by a rounding error.
+            p.line_to(kurbo::Point::new(start.x, start.y + (next() - 0.5) * 1e-12));
+            let reach = (SQRT_2 * hw) as f32 + 1e-2;
+            for join in [kurbo::Join::Miter, kurbo::Join::Round, kurbo::Join::Bevel] {
+                let style = Stroke::new(2.0 * hw).with_join(join).with_miter_limit(1.0);
+                let view = RectU16::new(0, 0, 4096, 4096);
+                let (x0, y0, x1, y1) = bounds(&lines(&p, &style, Affine::IDENTITY, view));
+                let near = x0 >= start.x.min(turn.x) as f32 - reach
+                    && y0 >= start.y.min(turn.y) as f32 - reach
+                    && x1 <= start.x.max(turn.x) as f32 + reach
+                    && y1 <= start.y.max(turn.y) as f32 + reach;
+                assert!(near, "{join:?} {p:?}: {x0} {y0} {x1} {y1}");
+            }
+        }
     }
 
     #[test]
