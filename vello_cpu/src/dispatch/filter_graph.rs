@@ -600,6 +600,22 @@ impl Layer {
     }
 }
 
+/// Return how far the outline of a stroke reaches from its path in device
+/// pixels under `transform`.
+fn stroke_reach(stroke: &Stroke, transform: &Affine) -> f64 {
+    // A miter reaches the miter limit times the half width from the path, a
+    // square cap the diagonal of the half width.
+    let reach = if stroke.join == Join::Miter {
+        stroke.miter_limit.max(core::f64::consts::SQRT_2)
+    } else {
+        core::f64::consts::SQRT_2
+    } * stroke.width.abs()
+        / 2.0;
+    // At least the largest stretch of the transform.
+    let [a, b, c, d, _, _] = transform.as_coeffs();
+    reach * (a.abs() + b.abs() + c.abs() + d.abs())
+}
+
 impl Command {
     /// Return a rectangle in root target coordinates that holds everything the
     /// command draws, or `None` if it draws nothing itself.
@@ -614,20 +630,10 @@ impl Command {
                 transform,
                 ..
             } => {
-                // A miter reaches the miter limit times the half width from
-                // the path, a square cap the diagonal of the half width.
-                let reach = if stroke.join == Join::Miter {
-                    stroke.miter_limit.max(core::f64::consts::SQRT_2)
-                } else {
-                    core::f64::consts::SQRT_2
-                } * stroke.width.abs()
-                    / 2.0;
-                // At least the largest stretch of the transform.
-                let [a, b, c, d, _, _] = transform.as_coeffs();
-                let device = reach * (a.abs() + b.abs() + c.abs() + d.abs());
+                let reach = stroke_reach(stroke, transform);
                 transform
                     .transform_rect_bbox(path.control_box())
-                    .inflate(device, device)
+                    .inflate(reach, reach)
             }
             Self::FillRect {
                 rect, transform, ..

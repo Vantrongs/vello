@@ -25,11 +25,11 @@
 //! A path larger than a frame is flattened in frames placed where its
 //! segments reach furthest on each side, see [`Extents::far_path`].
 
-use super::{Clip, Command, FilterGraph, Layer, Step, WINDOW_SIZE};
+use super::{Clip, Command, FilterGraph, Layer, Step, WINDOW_SIZE, stroke_reach};
 use crate::filter::placed::{Bounds, Coord, Padding, Position};
 use crate::kurbo::{
-    Affine, BezPath, Join, Line as Segment, ParamCurve, ParamCurveArclen, ParamCurveExtrema,
-    PathSeg, Point, Rect, Stroke, StrokeCtx,
+    Affine, BezPath, Line as Segment, ParamCurve, ParamCurveArclen, ParamCurveExtrema, PathSeg,
+    Point, Rect, Stroke, StrokeCtx,
 };
 use crate::peniko::Fill;
 #[cfg(not(feature = "std"))]
@@ -177,20 +177,12 @@ impl<'a> Item<'a> {
     }
 
     /// Return how far a stroke's outline reaches from its path in device
-    /// pixels, as [`Command::bounds`] counts it, and zero for fills.
+    /// pixels, and zero for fills.
     fn reach(&self) -> f64 {
         match self {
             Self::Stroke {
                 stroke, transform, ..
-            } => {
-                let miter = if stroke.join == Join::Miter {
-                    stroke.miter_limit.max(core::f64::consts::SQRT_2)
-                } else {
-                    core::f64::consts::SQRT_2
-                };
-                let [a, b, c, d, _, _] = transform.as_coeffs();
-                miter * stroke.width.abs() / 2.0 * (a.abs() + b.abs() + c.abs() + d.abs())
-            }
+            } => stroke_reach(stroke, transform),
             Self::Rect(..) | Self::Fill { .. } => 0.0,
         }
     }
