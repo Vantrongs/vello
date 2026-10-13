@@ -76,7 +76,7 @@ impl Cull {
 
     /// The device bounding box of the control points of `seg` (left, top, right,
     /// bottom); NaN coordinates are left out.
-    fn device_box(&self, seg: &PathSeg) -> [f64; 4] {
+    pub(crate) fn device_box(&self, seg: &PathSeg) -> [f64; 4] {
         let mut b = [
             f64::INFINITY,
             f64::INFINITY,
@@ -95,13 +95,13 @@ impl Cull {
         b
     }
 
-    fn misses(&self, b: [f64; 4]) -> bool {
+    pub(crate) fn misses(&self, b: [f64; 4]) -> bool {
         let r = self.rect;
         b[2] < r[0] || b[3] < r[1] || b[0] > r[2] || b[1] > r[3]
     }
 
     /// The size pieces of a split segment are reduced to: the view's larger side.
-    fn piece_extent(&self) -> f64 {
+    pub(crate) fn piece_extent(&self) -> f64 {
         let r = self.rect;
         (r[2] - r[0]).max(r[3] - r[1]).max(1.0)
     }
@@ -147,7 +147,7 @@ impl Cull {
     }
 }
 
-fn exceeds(b: [f64; 4], extent: f64) -> bool {
+pub(crate) fn exceeds(b: [f64; 4], extent: f64) -> bool {
     (b[2] - b[0]).max(b[3] - b[1]) > extent
 }
 

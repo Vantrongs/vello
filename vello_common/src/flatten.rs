@@ -233,6 +233,59 @@ pub fn stroke(
     stroke_ctx: &mut StrokeCtx,
     cull_bbox: RectU16,
 ) {
+    stroke_impl(
+        level,
+        path,
+        style,
+        affine,
+        line_buf,
+        flatten_ctx,
+        stroke_ctx,
+        cull_bbox,
+        None,
+    );
+}
+
+/// Flatten a stroked Bézier path into line segments as [`stroke`] does, for the lines
+/// that can reach `near`: a dashed stroke draws only the dashes that can, with the
+/// pattern walked past the others in work that follows `near`, see `dash`; elsewhere
+/// the lines are those of [`stroke`] (where dashes start, up to rounding).
+pub fn stroke_near(
+    level: Level,
+    path: impl IntoIterator<Item = PathEl>,
+    style: &Stroke,
+    affine: Affine,
+    line_buf: &mut Vec<Line>,
+    flatten_ctx: &mut FlattenCtx,
+    stroke_ctx: &mut StrokeCtx,
+    cull_bbox: RectU16,
+    near: RectU16,
+) {
+    stroke_impl(
+        level,
+        path,
+        style,
+        affine,
+        line_buf,
+        flatten_ctx,
+        stroke_ctx,
+        cull_bbox,
+        Some(near),
+    );
+}
+
+#[inline(always)]
+fn stroke_impl(
+    level: Level,
+    path: impl IntoIterator<Item = PathEl>,
+    style: &Stroke,
+    affine: Affine,
+    line_buf: &mut Vec<Line>,
+    flatten_ctx: &mut FlattenCtx,
+    stroke_ctx: &mut StrokeCtx,
+    cull_bbox: RectU16,
+    near: Option<RectU16>,
+) {
     let scale = max_scale(affine);
     if scale.is_nan() || scale <= 0.0 {
         line_buf.clear();
@@ -241,6 +294,8 @@ pub fn stroke(
     // Thin strokes are flattened and dashes measured in path space, with a tolerance
     // divided by `scale`.
     let cull = Cull::in_path_space(affine, stroke_cull_rect(cull_bbox, style, scale), scale);
+    let near =
+        near.map(|near| Cull::in_path_space(affine, stroke_cull_rect(near, style, scale), scale));
     if style.width * scale <= HAIRLINE_MAX_WIDTH {
         hairline(
             path,
@@ -251,6 +306,7 @@ pub fn stroke(
             flatten_ctx,
             cull_bbox,
             cull,
+            near,
         );
         return;
     }
@@ -266,7 +322,7 @@ pub fn stroke(
         expand_stroke(path, style, tolerance, stroke_ctx);
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine);
+        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, near);
         let solid = Stroke {
             dash_pattern: kurbo::Dashes::new(),
             ..style.clone()
@@ -346,6 +402,7 @@ fn hairline(
     flatten_ctx: &mut FlattenCtx,
     cull_bbox: RectU16,
     cull: Cull,
+    near: Option<Cull>,
 ) {
     line_buf.clear();
     let [left, right] = &mut flatten_ctx.hairline_sides;
@@ -379,7 +436,7 @@ fn hairline(
         crate::cull::flatten(path, tolerance, cull, |el| sink.push(el));
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine);
+        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, near);
         kurbo::flatten(dashed, tolerance, |el| sink.push(el));
     }
     sink.end_subpath(false);
@@ -658,6 +715,7 @@ mod hairline_tests {
             &mut FlattenCtx::default(),
             cull,
             Cull::in_path_space(affine, stroke_cull_rect(cull, style, scale), scale),
+            None,
         );
         buf
     }

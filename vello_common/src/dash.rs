@@ -17,8 +17,14 @@
 //!   solid too, below half a pixel per period at the transform's largest stretch
 //!   (1.28 `draw-path.c`, `do_flatten_stroke`).
 //!
-//! Every other segment is dashed exactly as kurbo does.
+//! Every other segment is dashed exactly as kurbo does, unless dashing is asked only
+//! for what can reach an area (`flatten::stroke_near`): then the entries of a segment
+//! that cannot reach it are walked past in one step, with whole periods taken off, so
+//! the work follows the area. A dash that can reach it is drawn as kurbo draws it, up
+//! to the rounding of the arc length walked to its start, from its start or, if it
+//! runs on from a segment walked past, from that segment's end.
 
+use crate::cull::{Cull, exceeds};
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
 use crate::kurbo::{
@@ -164,16 +170,32 @@ impl<'a> Pattern<'a> {
     /// starts and ends, as lengths along from `phase`, and whether it is drawn; it
     /// starts before `phase` if `phase` is inside it.
     pub fn entry_around(&self, mut phase: Phase, at: f64) -> (f64, f64, bool) {
-        let mut left = self.less_whole_periods(&phase, at);
+        let (start, walked) = self.walk_to_entry(&mut phase, at);
+        (start, walked + phase.remaining, phase.active)
+    }
+
+    /// Return where the entry dashing from `phase` reaches the point `at` along in
+    /// starts, as a length along from `phase`, and the phase at its start.
+    fn entry_start(&self, mut phase: Phase, at: f64) -> (f64, Phase) {
+        let (start, _) = self.walk_to_entry(&mut phase, at);
+        phase.remaining = self.dashes[phase.ix];
+        (start, phase)
+    }
+
+    /// Move `phase` to the entry dashing from it reaches the point `at` along in, and
+    /// return where that entry starts and where the walk is in it, as lengths along
+    /// from `phase`.
+    fn walk_to_entry(&self, phase: &mut Phase, at: f64) -> (f64, f64) {
+        let mut left = self.less_whole_periods(phase, at);
         let mut walked = at - left;
         let mut start = walked - (self.dashes[phase.ix] - phase.remaining);
         while phase.remaining < left {
             walked += phase.remaining;
             left -= phase.remaining;
             start = walked;
-            self.next(&mut phase);
+            self.next(phase);
         }
-        (start, walked + phase.remaining, phase.active)
+        (start, walked)
     }
 }
 
@@ -274,12 +296,14 @@ pub fn phases<'a>(
 }
 
 /// Dashes `inner` like `kurbo::dash`, skipping the dash periods of the segments
-/// flagged `true`; `affine` maps the path to device space.
+/// flagged `true`, and if there is `near`, the entries that cannot reach its rect;
+/// `affine` maps the path to device space.
 pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
     inner: T,
     dash_offset: f64,
     dashes: &'a [f64],
     affine: Affine,
+    near: Option<Cull>,
 ) -> DashIterator<'a, T> {
     let pattern = Pattern::new(dash_offset, dashes);
     DashIterator {
@@ -299,6 +323,8 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
         dense: None,
         affine,
         entries_left: PATH_ENTRIES,
+        near,
+        at_entry: false,
     }
 }
 
@@ -323,6 +349,10 @@ pub(crate) struct DashIterator<'a, T> {
     affine: Affine,
     /// Pattern entries the path may still walk (`PATH_ENTRIES`).
     entries_left: f64,
+    /// What the dashes drawn must be able to reach, if not everywhere.
+    near: Option<Cull>,
+    /// Whether `t` is where an entry of `current_seg` starts, after the one before.
+    at_entry: bool,
 }
 
 /// How far a segment drawn solid is out.
@@ -434,6 +464,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
     /// dense (see the module) keeps its length less whole periods too, and is drawn
     /// solid.
     fn set_segment(&mut self, seg: PathSeg, skip: bool) {
+        self.at_entry = false;
         if skip {
             // Relative accuracy: kurbo's absolute 1e-6 on a huge segment recurses to
             // its depth limit for nothing.
@@ -497,6 +528,12 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             } else {
                 self.get_input();
             }
+        } else if let Some(near) = self.near
+            && core::mem::take(&mut self.at_entry)
+            && self.state == DashState::Working
+            && let Some(moved) = self.walk_past(near)
+        {
+            result = moved;
         } else if self.phase.remaining < self.seg_remaining {
             // next transition is a dash transition
             let seg = self.current_seg.subsegment(self.t..1.0);
@@ -512,6 +549,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             self.t += t1 * (1.0 - self.t);
             self.seg_remaining -= self.phase.remaining;
             self.pattern.next(&mut self.phase);
+            self.at_entry = true;
         } else {
             if self.phase.active {
                 let seg = self.current_seg.subsegment(self.t..1.0);
@@ -521,6 +559,82 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             self.get_input();
         }
         result
+    }
+
+    /// Walk past the entries from `t`, where one starts, that cannot reach `near`, to
+    /// the start of the first that can, or past the rest of the segment; return the
+    /// move to where walking them entry by entry leaves the pen, or `None` if the next
+    /// entry can reach `near`.
+    ///
+    /// The pen matters as a closing that walks no line joins what it draws to what was
+    /// drawn last.
+    fn walk_past(&mut self, near: Cull) -> Option<Option<PathEl>> {
+        let rest = || self.current_seg.subsegment(self.t..1.0);
+        let Some(reach) = self.first_near(near) else {
+            let (length, entry) = (self.seg_remaining, self.phase.remaining);
+            // Left with what is walked of the last entry, as walking the segment entry
+            // by entry leaves it: a closing that walks no line walks that much again.
+            self.seg_remaining = self.pattern.less_whole_periods(&self.phase, length);
+            self.pattern.walk(&mut self.phase, &mut self.seg_remaining);
+            let pen = if self.phase.active {
+                // A dash running on into the next segment starts at this one's end.
+                Some(self.current_seg.end())
+            } else if entry < length {
+                // Where the last entry, a gap, starts.
+                let (rest, start) = (rest(), length - self.seg_remaining);
+                Some(rest.eval(rest.inv_arclen(start, DASH_ACCURACY)))
+            } else {
+                None
+            };
+            self.get_input();
+            return Some(pen.map(PathEl::MoveTo));
+        };
+        if reach <= self.t {
+            return None;
+        }
+        let along = self
+            .current_seg
+            .subsegment(self.t..reach)
+            .arclen(DASH_ACCURACY);
+        let (start, phase) = self.pattern.entry_start(self.phase, along);
+        if !(start > 0.0 && start < self.seg_remaining) {
+            return None;
+        }
+        // As walking the entries moves along the segment.
+        let rest = rest();
+        let t1 = rest.inv_arclen(start, DASH_ACCURACY);
+        self.t += t1 * (1.0 - self.t);
+        self.seg_remaining -= start;
+        self.phase = phase;
+        Some(Some(PathEl::MoveTo(rest.eval(t1))))
+    }
+
+    /// Return the first parameter of `current_seg` from `t` on where it can reach
+    /// `near`: the start of the first piece, halving it, whose control box meets
+    /// `near` and is no larger than it.
+    fn first_near(&self, near: Cull) -> Option<f64> {
+        // Halvings after which a piece is as small as `f64` parameters tell apart.
+        const DEPTH: usize = 64;
+        let mut pieces = [(0.0, 0.0); DEPTH + 1];
+        pieces[0] = (self.t, 1.0);
+        let mut count = 1;
+        while count > 0 {
+            count -= 1;
+            let (from, to) = pieces[count];
+            let piece = self.current_seg.subsegment(from..to);
+            let device = near.device_box(&piece);
+            if near.misses(device) {
+                continue;
+            }
+            if !exceeds(device, near.piece_extent()) || count + 2 > DEPTH {
+                return Some(from);
+            }
+            let middle = 0.5 * (from + to);
+            pieces[count] = (middle, to);
+            pieces[count + 1] = (from, middle);
+            count += 2;
+        }
+        None
     }
 
     fn handle_closepath(&mut self) {
@@ -555,12 +669,13 @@ mod tests {
     use super::*;
     use crate::cull::{Cull, SplitHuge};
     use crate::kurbo::{Affine, BezPath, ParamCurveNearest};
+    use alloc::vec;
 
     const VIEW: [f64; 4] = [0.0, 0.0, 100.0, 100.0];
 
     fn mine(path: &BezPath, offset: f64, dashes: &[f64], rect: [f64; 4]) -> Vec<PathEl> {
         let split = SplitHuge::new(path.iter(), Cull::new(Affine::IDENTITY, rect), true);
-        starts_with_a_move(dash(split, offset, dashes, Affine::IDENTITY).collect())
+        starts_with_a_move(dash(split, offset, dashes, Affine::IDENTITY, None).collect())
     }
 
     /// A stroker starts a line out first from the origin.
@@ -766,8 +881,9 @@ mod tests {
             (PathEl::LineTo(Point::new(-200.0, 50.0)), true),
             (PathEl::LineTo(Point::new(100.0, 50.0)), false),
         ];
-        let a =
-            starts_with_a_move(dash(input.into_iter(), 0.0, &dashes, Affine::IDENTITY).collect());
+        let a = starts_with_a_move(
+            dash(input.into_iter(), 0.0, &dashes, Affine::IDENTITY, None).collect(),
+        );
         let mut short = BezPath::new();
         short.move_to((-200.0, 50.0));
         short.line_to((100.0, 50.0));
@@ -796,7 +912,7 @@ mod tests {
         p.line_to((0.0, 100.0));
         let wide = Cull::new(affine, [-1e6, -1e6, 1e6, 1e6]);
         let split = SplitHuge::new(p.iter(), wide, true);
-        let a = starts_with_a_move(dash(split, 1.5, &dashes, affine).collect());
+        let a = starts_with_a_move(dash(split, 1.5, &dashes, affine, None).collect());
         // Starting inside a dash (offset 1.5 < 3), the first line is one stroke (out
         // last: kurbo holds a subpath's first dash back to join a closing one).
         let whole = [
@@ -810,7 +926,7 @@ mod tests {
         same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
         // Starting in a gap (offset 4), the first line still is one stroke.
         let split = SplitHuge::new(p.iter(), wide, true);
-        let a = starts_with_a_move(dash(split, 4.0, &dashes, affine).collect());
+        let a = starts_with_a_move(dash(split, 4.0, &dashes, affine, None).collect());
         assert!(a.windows(2).any(|w| w == whole), "{a:?}");
         let b = kurbo(&p, 4.0, &dashes);
         same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
@@ -918,6 +1034,7 @@ mod tests {
                 offset,
                 &entries,
                 Affine::IDENTITY,
+                None,
             );
             let mut flat = Vec::new();
             crate::kurbo::flatten(out, 1e-5, |el| flat.push(el));
@@ -978,6 +1095,7 @@ mod tests {
                 offset,
                 &entries,
                 Affine::IDENTITY,
+                None,
             );
             for el in out {
                 let (PathEl::MoveTo(q) | PathEl::LineTo(q)) = el else {
@@ -1005,6 +1123,169 @@ mod tests {
         assert!(
             checked > 20_000 && again > 100,
             "{checked} ends, {again} paths walked again"
+        );
+    }
+
+    /// The dashes of `out`: each a start and the elements drawn from it.
+    fn dashes_of(out: impl Iterator<Item = PathEl>) -> Vec<(Point, Vec<PathEl>)> {
+        let mut dashes: Vec<(Point, Vec<PathEl>)> = Vec::new();
+        for el in out {
+            match el {
+                PathEl::MoveTo(p) => dashes.push((p, Vec::new())),
+                // As kurbo, dashing a closing that walks no line can draw before any
+                // move, which strokers leave out.
+                el => {
+                    if let Some(dash) = dashes.last_mut() {
+                        dash.1.push(el);
+                    }
+                }
+            }
+        }
+        dashes.retain(|(_, drawn)| !drawn.is_empty());
+        dashes
+    }
+
+    fn el_points(el: &PathEl) -> Vec<Point> {
+        match *el {
+            PathEl::MoveTo(p) | PathEl::LineTo(p) => vec![p],
+            PathEl::QuadTo(p1, p2) => vec![p1, p2],
+            PathEl::CurveTo(p1, p2, p3) => vec![p1, p2, p3],
+            PathEl::ClosePath => Vec::new(),
+        }
+    }
+
+    fn same_el(a: &PathEl, b: &PathEl, tol: f64) -> bool {
+        core::mem::discriminant(a) == core::mem::discriminant(b)
+            && el_points(a)
+                .iter()
+                .zip(el_points(b))
+                .all(|(p, q)| p.distance(q) < tol)
+    }
+
+    /// Whether `part` is `whole` from one of its element ends on, up to `tol`.
+    fn is_tail_of(part: &(Point, Vec<PathEl>), whole: &(Point, Vec<PathEl>), tol: f64) -> bool {
+        let (start, drawn) = part;
+        let Some(skipped) = whole.1.len().checked_sub(drawn.len()) else {
+            return false;
+        };
+        let from = match skipped {
+            0 => whole.0,
+            _ => *el_points(&whole.1[skipped - 1]).last().unwrap_or(&whole.0),
+        };
+        from.distance(*start) < tol
+            && drawn
+                .iter()
+                .zip(&whole.1[skipped..])
+                .all(|(a, b)| same_el(a, b, tol))
+    }
+
+    /// Whether `line` meets `rect` (left, top, right, bottom).
+    fn line_meets(line: Line, rect: [f64; 4]) -> bool {
+        let (mut from, mut to) = (0.0_f64, 1.0_f64);
+        let d = line.p1 - line.p0;
+        for (delta, low, high) in [
+            (d.x, rect[0] - line.p0.x, rect[2] - line.p0.x),
+            (d.y, rect[1] - line.p0.y, rect[3] - line.p0.y),
+        ] {
+            if delta == 0.0 {
+                if low > 0.0 || high < 0.0 {
+                    return false;
+                }
+                continue;
+            }
+            let (a, b) = (low / delta, high / delta);
+            from = from.max(a.min(b));
+            to = to.min(a.max(b));
+        }
+        from <= to
+    }
+
+    /// Dashing only for what can reach an area draws each dash dashing everything
+    /// draws that comes within it, from where it starts or from the start of a segment
+    /// it reaches the area from, up to rounding, and nothing else; on paths of lines
+    /// and curves whose patterns walk many entries past the area.
+    #[test]
+    fn dashes_near_an_area_are_those_drawn_there() {
+        let mut random = Random(0x6a09_e667_f3bc_c909);
+        let (mut compared, mut walked_past) = (0, 0);
+        for case in 0..2000 {
+            let path = random_path(&mut random, false);
+            let (entries, offset) = random_pattern(&mut random);
+            if entries.iter().sum::<f64>() < 1.0 {
+                continue;
+            }
+            let (x, y) = (random.number(-20.0, 400.0), random.number(-20.0, 400.0));
+            let area = [
+                x,
+                y,
+                x + random.number(0.5, 150.0),
+                y + random.number(0.5, 150.0),
+            ];
+            let view = [-10.0, -10.0, 410.0, 410.0];
+            let dashed = |near: Option<Cull>| {
+                let split = SplitHuge::new(path.iter(), Cull::new(Affine::IDENTITY, view), true);
+                dashes_of(dash(split, offset, &entries, Affine::IDENTITY, near))
+            };
+            let near = Cull::new(Affine::IDENTITY, area);
+            // Inside the area by more than the flattening below is out.
+            let inside = [
+                area[0] + 1e-3,
+                area[1] + 1e-3,
+                area[2] - 1e-3,
+                area[3] - 1e-3,
+            ];
+            let (whole, part) = (dashed(None), dashed(Some(near)));
+            walked_past += usize::from(part.len() < whole.len());
+            for dash in &part {
+                assert!(
+                    whole.iter().any(|whole| is_tail_of(dash, whole, 1e-4)),
+                    "case {case}: {dash:?} of {} {entries:?} {offset} {area:?}",
+                    path.to_svg()
+                );
+            }
+            for dash in &whole {
+                let mut from = dash.0;
+                let reaches = dash.1.iter().position(|el| {
+                    let seg = match *el {
+                        PathEl::LineTo(p) => PathSeg::Line(Line::new(from, p)),
+                        PathEl::QuadTo(p1, p2) => PathSeg::Quad(QuadBez::new(from, p1, p2)),
+                        PathEl::CurveTo(p1, p2, p3) => {
+                            PathSeg::Cubic(CubicBez::new(from, p1, p2, p3))
+                        }
+                        PathEl::ClosePath => PathSeg::Line(Line::new(from, dash.0)),
+                        PathEl::MoveTo(_) => unreachable!("a dash moves only at its start"),
+                    };
+                    from = seg.end();
+                    let mut last = seg.start();
+                    let mut meets = false;
+                    crate::kurbo::flatten(
+                        [PathEl::MoveTo(last), crate::cull::seg_to_el(&seg)],
+                        1e-4,
+                        |el| {
+                            if let PathEl::LineTo(p) = el {
+                                meets |= line_meets(Line::new(last, p), inside);
+                                last = p;
+                            }
+                        },
+                    );
+                    meets
+                });
+                let Some(reaches) = reaches else {
+                    continue;
+                };
+                compared += 1;
+                assert!(
+                    part.iter().any(|part| {
+                        is_tail_of(part, dash, 1e-4) && dash.1.len() - part.1.len() <= reaches
+                    }),
+                    "case {case}: {dash:?} of {} {entries:?} {offset} {area:?}",
+                    path.to_svg()
+                );
+            }
+        }
+        assert!(
+            compared > 2000 && walked_past > 1000,
+            "{compared} dashes compared, {walked_past} paths walked past"
         );
     }
 

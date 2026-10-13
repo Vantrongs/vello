@@ -9,7 +9,7 @@ use std::cell::Cell;
 use vello_cpu::color::AlphaColor;
 use vello_cpu::color::palette::css::BLUE;
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_cpu::kurbo::{Affine, BezPath, Rect, Shape};
+use vello_cpu::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
 use vello_cpu::peniko::Fill;
 use vello_cpu::{
     Level, Pixmap, RasterizerSettings, RenderContext, RenderMode, RenderSettings, Resources,
@@ -885,4 +885,53 @@ fn erf(x: f64) -> f64 {
             + t * (-0.284_496_736
                 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     1.0 - poly * (-x * x).exp()
+}
+
+/// Flood, in a 64 by 64 view, a vertical line dashed by a pixel, `width`
+/// pixels wide, that runs from the view `distance` pixels down, after an
+/// offset moves it up by `distance` pixels: the source viewport reaches that
+/// far down, and its dashes along all of it reach as far as those in view.
+fn dashed_and_moved_into_view(distance: f32, width: f64) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::Flood {
+        color: AlphaColor::from_rgba8(200, 30, 60, 255),
+    }));
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+        dx: 0.0,
+        dy: -distance,
+    }));
+    let mut line = BezPath::new();
+    line.move_to((32.0, 16.0));
+    line.line_to((32.0, f64::from(distance) + 48.0));
+    context.set_stroke(Stroke::new(width).with_dashes(0.0, [1.0, 1.0]));
+    context.set_paint(BLUE);
+    context.stroke_path(&line);
+    context.pop_layer();
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn a_dashed_stroke_far_into_the_source_viewport_costs_the_same() {
+    for width in [1.0, 4.0] {
+        // The source viewport holds the first two distances, not the others.
+        for distances in [[4_096.0, 60_000.0], [262_144.0, 4_194_304.0]] {
+            let (near, expected) = measure(|| dashed_and_moved_into_view(distances[0], width));
+            assert!(
+                expected
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] != 0)
+            );
+            let (usage, pixels) = measure(|| dashed_and_moved_into_view(distances[1], width));
+            let case = format!("width {width} at {distances:?}");
+            assert!(pixels == expected, "{case}");
+            assert!(
+                usage.peak <= near.peak + near.peak / 4
+                    && usage.total <= near.total + near.total / 4,
+                "{case}: {usage:?}, near: {near:?}"
+            );
+        }
+    }
 }

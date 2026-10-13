@@ -115,7 +115,8 @@ impl StripGenerator {
     ///
     /// Paths and rectangles are given, culled and rounded in the viewport's
     /// coordinates, and so are the bounds of clip paths, whose strips are those of the
-    /// window.
+    /// window. A dashed stroke draws only the dashes that can reach the window, see
+    /// [`flatten::stroke_near`].
     pub fn new_window(width: u16, height: u16, window: RectU16, level: Level) -> Self {
         Self {
             level,
@@ -180,16 +181,30 @@ impl StripGenerator {
         let cull_bbox = clip_path
             .map(|clip_path| clip_path.bbox)
             .unwrap_or(RectU16::new(0, 0, self.width, self.height));
-        flatten::stroke(
-            self.level,
-            path,
-            stroke,
-            transform,
-            &mut self.line_buf,
-            &mut self.flatten_ctx,
-            &mut self.stroke_ctx,
-            cull_bbox,
-        );
+        match self.window {
+            None => flatten::stroke(
+                self.level,
+                path,
+                stroke,
+                transform,
+                &mut self.line_buf,
+                &mut self.flatten_ctx,
+                &mut self.stroke_ctx,
+                cull_bbox,
+            ),
+            // What lies outside the window is closed outlines, whose winding cancels in it.
+            Some(window) => flatten::stroke_near(
+                self.level,
+                path,
+                stroke,
+                transform,
+                &mut self.line_buf,
+                &mut self.flatten_ctx,
+                &mut self.stroke_ctx,
+                cull_bbox,
+                window,
+            ),
+        }
         self.generate_with_clip(aliasing_threshold, strip_storage, Fill::NonZero, clip_path);
     }
 

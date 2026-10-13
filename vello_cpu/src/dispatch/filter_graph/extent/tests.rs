@@ -379,6 +379,36 @@ fn extents_are_those_of_the_strips_drawn_in_the_viewport() {
     }
 }
 
+/// Dashed strokes across most of the viewport, which are drawn in pieces of it
+/// around the dashes that reach each, see `Extents::far_path`.
+#[test]
+fn extents_of_dashed_strokes_across_the_viewport_are_those_drawn() {
+    let viewport = Bounds::new(0, 0, 4096, 4096);
+    let mut random = Random(0x6a09_e667_f3bc_c909);
+    let mut cases = 0;
+    while cases < 600 {
+        let bits = random.pick(&[Some(0), Some(3), None]);
+        let coordinate = within(100.0, 4000.0, bits);
+        let long = random.pick(&[8.0, 64.0, 512.0, 2048.0]);
+        let stroke = random_stroke(&mut random, long);
+        if stroke.dash_pattern.is_empty() {
+            continue;
+        }
+        cases += 1;
+        let transform = random.pick(&[Affine::IDENTITY, Affine::scale(0.5)]);
+        let drawn = Drawn::Stroke(random_path(&mut random, &coordinate), stroke, transform);
+        let clips = random_clips(&mut random, &within(-100.0, 4200.0, bits));
+        let mut extents = Extents::new(Level::baseline(), &viewport);
+        let (found, _) = found(&mut extents, &drawn, &clips);
+        assert_eq!(
+            found,
+            recorded(&viewport, &drawn, &clips),
+            "case {cases}: {}",
+            describe(&drawn, &clips)
+        );
+    }
+}
+
 #[test]
 fn extents_near_the_viewport_origin_are_those_the_recorder_draws() {
     let mut random = Random(0x2545_f491_4f6c_dd1d);
@@ -524,6 +554,17 @@ fn dashes_between_gaps_longer_than_a_frame_are_found() {
                 path
             },
             Stroke::new(3.0).with_dashes(0.0, [70_000.0, 400_000.0]),
+        ),
+        // A curve that starts in a gap, whose end is the start of the only dash
+        // beyond.
+        (
+            {
+                let mut path = BezPath::new();
+                path.move_to((0.0, 0.0));
+                path.quad_to((200_000.0, -400_000.0), (400_000.0, 0.0));
+                path
+            },
+            Stroke::new(1.0).with_dashes(9_950_020.0, [10.0, 50_000.0, 10.0, 10_000_000.0]),
         ),
     ];
     for (path, stroke) in cases {

@@ -54,6 +54,11 @@ const FRAME: i64 = WINDOW_SIZE;
 /// edges are tiled as a window would not, so tiles there are not counted.
 const MARGIN: i64 = 64;
 
+/// The side of the frames a dashed stroke is looked at in, outside of which it
+/// draws no dash, so that the dashes drawn follow the frame rather than the
+/// stroke's length, see [`Extents::flatten`].
+const DASHED_FRAME: i64 = DRAWN + 2 * MARGIN;
+
 /// The width of a tile in pixels.
 const TILE: i64 = Tile::WIDTH as i64;
 
@@ -204,6 +209,12 @@ impl<'a> Item<'a> {
         transform
             .transform_rect_bbox(path.control_box())
             .inflate(reach, reach)
+    }
+
+    /// Return whether the item is a stroke that dashing draws, which walks
+    /// every dash inside the cull it is flattened with, see `flatten::stroke`.
+    fn dashed(&self) -> bool {
+        matches!(self, Self::Stroke { stroke, .. } if !stroke.dash_pattern.is_empty())
     }
 
     /// Return the dash pattern of a dashed stroke, unless dashing draws it
@@ -678,6 +689,9 @@ pub(super) struct Extents<'a> {
     lines: Vec<Line>,
     flatten: FlattenCtx,
     stroke: StrokeCtx,
+    /// The regions [`Self::far_path`] flattened, in the frame at each origin,
+    /// and the tiles found there.
+    regions: Vec<(Bounds, Position, Option<Bounds>)>,
 }
 
 impl<'a> Extents<'a> {
@@ -689,6 +703,7 @@ impl<'a> Extents<'a> {
             lines: Vec::new(),
             flatten: FlattenCtx::default(),
             stroke: StrokeCtx::default(),
+            regions: Vec::new(),
         }
     }
 
@@ -885,23 +900,8 @@ impl<'a> Extents<'a> {
                 _ => tiles,
             };
         }
-        let cut = match cover {
-            Cover::All => None,
-            Cover::Rect(_) | Cover::Tiles(_) | Cover::Paths { .. } => cull.clone(),
-        };
-        if cut.as_ref().is_some_and(Bounds::is_empty) {
-            return Bounds::EMPTY;
-        }
-        self.flatten(item, &origin, cull.as_ref());
-        let area = cut
-            .as_ref()
-            .map_or(reach.clone(), |cut| reach.intersect(cut));
-        let Some(region) = Tiles::of_bounds(&area, &origin) else {
-            return Bounds::EMPTY;
-        };
-        let cut = cut.and_then(|cut| Tiles::of_bounds(&cut, &origin));
-        frame_tiles(&self.lines, region, cut, item.fill_rule())
-            .map_or(Bounds::EMPTY, |tiles| tiles.to_bounds(&origin))
+        // Lies in the viewport, so it is found in the viewport's frame.
+        self.path(item, cull.as_ref(), cull.as_ref())
     }
 
     /// Return bounds holding the tiles `item` can cover, flattened with the
@@ -1035,11 +1035,12 @@ impl<'a> Extents<'a> {
         if area.is_empty() {
             return Bounds::EMPTY;
         }
-        if !fits(&area) && self.home_holding(&area).is_none() {
+        let far = !fits(&area, FRAME) && self.home_holding(&area).is_none();
+        if far || item.dashed() && !fits(&area, DASHED_FRAME) {
             return self.far_path(item, &area, cut, cull);
         }
         let origin = self.frame_at(&area);
-        self.flatten(item, &origin, cull);
+        self.flatten(item, &origin, cull, &area);
         let region = Tiles::of_bounds(&area, &origin).unwrap();
         let cut = cut.and_then(|cut| Tiles::of_bounds(cut, &origin));
         frame_tiles(&self.lines, region, cut, item.fill_rule())
@@ -1076,10 +1077,19 @@ impl<'a> Extents<'a> {
 
     /// Flatten `item` into `self.lines` in the frame at `origin`, as the
     /// recorder flattens it in a viewport there under clips whose strips lie
-    /// in `cull`, see `StripGenerator`.
-    fn flatten(&mut self, item: &Item<'_>, origin: &Position, cull: Option<&Bounds>) {
+    /// in `cull`, see `StripGenerator`, for what is found in `area`: a dashed
+    /// stroke draws only the dashes that can reach `area` and a margin around
+    /// it, see `flatten::stroke_near`.
+    fn flatten(
+        &mut self,
+        item: &Item<'_>,
+        origin: &Position,
+        cull: Option<&Bounds>,
+        area: &Bounds,
+    ) {
         let level = self.level;
         let to_frame = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
+        let near = frame_cull(Some(&area.expand(&Padding::uniform(MARGIN.into()))), origin);
         let cull = frame_cull(cull, origin);
         match item {
             Item::Fill {
@@ -1097,7 +1107,7 @@ impl<'a> Extents<'a> {
                 stroke,
                 transform,
                 ..
-            } => flatten::stroke(
+            } => flatten::stroke_near(
                 level,
                 path.iter(),
                 stroke,
@@ -1106,6 +1116,7 @@ impl<'a> Extents<'a> {
                 &mut self.flatten,
                 &mut self.stroke,
                 cull,
+                near,
             ),
             Item::Rect(..) => unreachable!("rectangles are not flattened"),
         }
@@ -1124,7 +1135,7 @@ impl<'a> Extents<'a> {
         cull: Option<&Bounds>,
     ) -> Bounds {
         let origin = self.viewport.origin();
-        self.flatten(item, &origin, cull);
+        self.flatten(item, &origin, cull, self.viewport);
         if self.lines.is_empty() {
             return Bounds::EMPTY;
         }
@@ -1149,7 +1160,10 @@ impl<'a> Extents<'a> {
     /// From the furthest,
     /// the path is flattened in a frame around each point not yet in one,
     /// with that side of the frame beyond the point by a stroke's reach,
-    /// until no point is left that reaches further than the tiles found.
+    /// until no point is left that reaches further than the tiles found. A
+    /// dashed stroke is looked at in a smaller part of each frame, see
+    /// [`DASHED_FRAME`], and in the recorder's viewport, it is flattened in the
+    /// viewport's frame.
     fn far_path(
         &mut self,
         item: &Item<'_>,
@@ -1158,6 +1172,7 @@ impl<'a> Extents<'a> {
         cull: Option<&Bounds>,
     ) -> Bounds {
         let reach = item.reach();
+        let size = if item.dashed() { DASHED_FRAME } else { FRAME };
         let limits = to_rect(area);
         let reached = limits.inflate(reach, reach);
         let corners = [
@@ -1220,7 +1235,12 @@ impl<'a> Extents<'a> {
                 let (Some(dashes), Some(phase)) = (&dashes, phase) else {
                     continue;
                 };
-                let at = segment.subsegment(0.0..t).arclen(DASH_ACCURACY);
+                // The length of a quadratic of no length is NaN.
+                let at = if t == 0.0 {
+                    0.0
+                } else {
+                    segment.subsegment(0.0..t).arclen(DASH_ACCURACY)
+                };
                 let (start, end, _) = dashes.entry_around(phase, at);
                 for stop in [start, end] {
                     if (0.0..=length).contains(&stop) {
@@ -1234,6 +1254,8 @@ impl<'a> Extents<'a> {
             points.extend(corners);
         }
         let mut found: [Option<Coord>; 4] = [None, None, None, None];
+        let mut drawn = core::mem::take(&mut self.regions);
+        drawn.clear();
         for (side, found) in found.iter_mut().enumerate() {
             // The coordinate on the side, smaller the further it reaches, and
             // the one across it.
@@ -1267,32 +1289,51 @@ impl<'a> Extents<'a> {
                 if regions.iter().any(holds) {
                     continue;
                 }
-                let origin = far_frame(side, value - reach, across, &limits);
+                let frame = far_frame(side, value - reach, across, &limits, FRAME);
+                // Inside the frame, a dashed stroke is looked at in a smaller one.
+                let place = far_frame(side, value - reach, across, &limits, size);
                 let region = Bounds::new(
-                    &origin.0 + MARGIN,
-                    &origin.1 + MARGIN,
-                    &origin.0 + (FRAME - MARGIN),
-                    &origin.1 + (FRAME - MARGIN),
+                    &place.0 + MARGIN,
+                    &place.1 + MARGIN,
+                    &place.0 + (size - MARGIN),
+                    &place.1 + (size - MARGIN),
                 )
                 .intersect(area);
                 regions.push(region.clone());
-                let Some(tiles) = Tiles::of_bounds(&region, &origin) else {
-                    continue;
+                // The recorder rounds coordinates in its viewport.
+                let origin = self
+                    .home_holding(&region)
+                    .map_or(frame, |home| home.origin.clone());
+                // Another side can come to the same region in the same frame.
+                let known = drawn
+                    .iter()
+                    .position(|(known, at, _)| *known == region && *at == origin);
+                let index = match known {
+                    Some(index) => index,
+                    None => {
+                        let Some(tiles) = Tiles::of_bounds(&region, &origin) else {
+                            continue;
+                        };
+                        self.flatten(item, &origin, cull, &region);
+                        let cut = cut.and_then(|cut| Tiles::of_bounds(cut, &origin));
+                        let bounds = frame_tiles(&self.lines, tiles, cut, item.fill_rule())
+                            .map(|tiles| tiles.to_bounds(&origin));
+                        drawn.push((region, origin, bounds));
+                        drawn.len() - 1
+                    }
                 };
-                self.flatten(item, &origin, cull);
-                let cut = cut.and_then(|cut| Tiles::of_bounds(cut, &origin));
-                if let Some(tiles) = frame_tiles(&self.lines, tiles, cut, item.fill_rule()) {
-                    let bounds = tiles.to_bounds(&origin);
+                if let Some(bounds) = &drawn[index].2 {
                     let value = match side {
-                        0 => bounds.x0,
-                        1 => bounds.y0,
-                        2 => -bounds.x1,
-                        _ => -bounds.y1,
+                        0 => bounds.x0.clone(),
+                        1 => bounds.y0.clone(),
+                        2 => -bounds.x1.clone(),
+                        _ => -bounds.y1.clone(),
                     };
                     *found = Some(found.take().map_or(value.clone(), |found| found.min(value)));
                 }
             }
         }
+        self.regions = drawn;
         match found {
             [Some(x0), Some(y0), Some(x1), Some(y1)] => Bounds::new(x0, y0, -x1, -y1),
             [None, None, None, None] => Bounds::EMPTY,
@@ -1695,9 +1736,9 @@ fn halves(area: &Bounds) -> [Bounds; 2] {
     [low, high]
 }
 
-/// Return whether a frame holds `area` inside its margin.
-fn fits(area: &Bounds) -> bool {
-    let side = Coord::from(FRAME - 2 * MARGIN);
+/// Return whether a frame of side `size` holds `area` inside its margin.
+fn fits(area: &Bounds, size: i64) -> bool {
+    let side = Coord::from(size - 2 * MARGIN);
     area.width() <= side && area.height() <= side
 }
 
@@ -1763,20 +1804,20 @@ fn frame_tiles(
 /// around a point whose coordinate on that side, smaller the further it
 /// reaches and less a stroke's reach, is `value`, and whose coordinate across
 /// it is `across`, inside `limits`: the frame's edge on that side lies a
-/// margin beyond the point.
-fn far_frame(side: usize, value: f64, across: f64, limits: &Rect) -> Position {
+/// margin beyond the point, and its sides are `size` long.
+fn far_frame(side: usize, value: f64, across: f64, limits: &Rect, size: i64) -> Position {
     let tile = |value: f64| tile_floor(&Coord::floor_of(value));
-    let across = tile(across) - (FRAME / 2 / TILE * TILE);
+    let across = tile(across) - (size / 2 / TILE * TILE);
     match side {
         0 => (tile(value.max(limits.x0)) - MARGIN, across),
         1 => (across, tile(value.max(limits.y0)) - MARGIN),
         2 => (
-            tile((-value).min(limits.x1)) + (MARGIN + TILE - FRAME),
+            tile((-value).min(limits.x1)) + (MARGIN + TILE - size),
             across,
         ),
         _ => (
             across,
-            tile((-value).min(limits.y1)) + (MARGIN + TILE - FRAME),
+            tile((-value).min(limits.y1)) + (MARGIN + TILE - size),
         ),
     }
 }
