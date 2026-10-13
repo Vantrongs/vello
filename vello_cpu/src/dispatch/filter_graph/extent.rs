@@ -37,6 +37,7 @@ use crate::peniko::kurbo::common::FloatFuncs as _;
 use alloc::collections::BinaryHeap;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use vello_common::clip::{ClipRef, ClipShape, PathDataRef};
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{self, FlattenCtx, Line};
@@ -1408,7 +1409,7 @@ impl<'a> Extents<'a> {
     /// halving it. Where their edges run within a tile or two of each other
     /// along a run without covering a tile together, which only drawing
     /// tells, every part along it that reaches further than what is found is
-    /// drawn.
+    /// drawn, and a part drawn for one side can be drawn again for the next.
     fn search(
         &mut self,
         item: &Item<'_>,
@@ -1418,7 +1419,6 @@ impl<'a> Extents<'a> {
     ) -> Bounds {
         let cull = self.clip_bounds(covers.last().unwrap());
         let mut found = Bounds::EMPTY;
-        let mut drawn: Vec<Bounds> = Vec::new();
         for side in 0..4 {
             // How far a part reaches on the side, larger the further.
             let reach = |part: &Bounds| match side {
@@ -1429,17 +1429,22 @@ impl<'a> Extents<'a> {
             };
             let beyond =
                 |part: &Bounds, found: &Bounds| found.is_empty() || reach(part) > reach(found);
-            let mut parts = vec![area.clone()];
-            let mut queue = BinaryHeap::from([(reach(&area), 0)]);
+            let mut queue = BinaryHeap::from([Part {
+                reach: reach(&area),
+                halvings: 0,
+                bounds: area.clone(),
+            }]);
             // Whether every part was drawn or found to hold no tiles drawn.
             let mut complete = true;
-            while let Some((_, index)) = queue.pop() {
-                let part = core::mem::replace(&mut parts[index], Bounds::EMPTY);
-                if !beyond(&part, &found) {
+            while let Some(Part {
+                halvings, bounds, ..
+            }) = queue.pop()
+            {
+                if !beyond(&bounds, &found) {
                     complete = false;
                     break;
                 }
-                let part = self.shrink(item, covers, clips, cull.as_ref(), part);
+                let part = self.shrink(item, covers, clips, cull.as_ref(), bounds);
                 if part.is_empty() || found.contains(&part) {
                     continue;
                 }
@@ -1448,15 +1453,15 @@ impl<'a> Extents<'a> {
                     continue;
                 }
                 if drawn_side(&part) <= DRAWN {
-                    if !drawn.iter().any(|drawn| drawn.contains(&part)) {
-                        found = found.union(&self.draw(item, covers, clips, &part));
-                        drawn.push(part);
-                    }
+                    found = found.union(&self.draw(item, covers, clips, &part));
                     continue;
                 }
                 for half in halves(&part) {
-                    queue.push((reach(&half), parts.len()));
-                    parts.push(half);
+                    queue.push(Part {
+                        reach: reach(&half),
+                        halvings: halvings + 1,
+                        bounds: half,
+                    });
                 }
             }
             if complete {
@@ -1762,6 +1767,37 @@ fn culled(bounds: Bounds, cull: Option<&Bounds>) -> Bounds {
         _ => bounds,
     }
 }
+
+/// A part [`Extents::search`] has yet to look at, which it takes from those
+/// reaching furthest on the side it searches, and of those from the most
+/// often halved: the halves of a part are then taken before the parts that
+/// were waiting, so that those waiting are about one for each halving rather
+/// than one for each part drawn along a run.
+struct Part {
+    reach: Coord,
+    halvings: u32,
+    bounds: Bounds,
+}
+
+impl Ord for Part {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (&self.reach, self.halvings).cmp(&(&other.reach, other.halvings))
+    }
+}
+
+impl PartialOrd for Part {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Part {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Part {}
 
 /// The longest side of the parts [`Extents::search`] draws, which bounds
 /// what drawing one costs.

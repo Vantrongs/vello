@@ -10,6 +10,7 @@ use vello_cpu::color::AlphaColor;
 use vello_cpu::color::palette::css::BLUE;
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_cpu::kurbo::{Affine, BezPath, Rect, Shape};
+use vello_cpu::peniko::Fill;
 use vello_cpu::{
     Level, Pixmap, RasterizerSettings, RenderContext, RenderMode, RenderSettings, Resources,
 };
@@ -389,6 +390,60 @@ fn blur_of_a_band_under_a_leaning_clip_costs_the_same_however_long_it_is() {
                 "{case}: {usage:?}, at 4096: {short:?}"
             );
         }
+    }
+}
+
+/// Blur, in a 64 by 64 view, a fill with a hole leaning right by a pixel
+/// every 64 pixels down its `length`, under a clip path that runs inside the
+/// hole 6 pixels from its sides: the fill and the clip cover no tile
+/// together, which only drawing them tells, as the fill covers tiles on both
+/// sides of the clip over any 384 pixels of its length.
+fn blurred_fill_around_a_leaning_clip(length: f64) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
+        std_deviation: 4.0,
+        edge_mode: EdgeMode::None,
+    }));
+    let lean = length / 64.0;
+    let band = |path: &mut BezPath, left: f64, right: f64| {
+        path.move_to((left, 0.0));
+        path.line_to((right, 0.0));
+        path.line_to((right + lean, length));
+        path.line_to((left + lean, length));
+        path.close_path();
+    };
+    let mut clip = BezPath::new();
+    band(&mut clip, 26.0, 34.0);
+    context.push_clip_path(&clip);
+    let mut fill = Rect::new(-100.0, 0.0, lean + 200.0, length).to_path(0.1);
+    band(&mut fill, 20.0, 40.0);
+    context.set_fill_rule(Fill::EvenOdd);
+    context.set_paint(BLUE);
+    context.fill_path(&fill);
+    context.pop_clip();
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn a_fill_around_a_clip_holds_the_same_memory_however_long_they_are() {
+    let (short, expected) = measure(|| blurred_fill_around_a_leaning_clip(262_144.0));
+    assert!(expected.iter().all(|value| *value == 0));
+    let mut totals = vec![short.total];
+    for length in [1_048_576.0, 4_194_304.0] {
+        let (usage, pixels) = measure(|| blurred_fill_around_a_leaning_clip(length));
+        let case = format!("at length {length}");
+        assert!(pixels == expected, "{case}");
+        assert!(
+            usage.peak <= short.peak + short.peak / 4,
+            "{case}: {usage:?}, at 262144: {short:?}"
+        );
+        totals.push(usage.total);
+    }
+    // Every part along the hole is drawn, which a total four times as large
+    // for each length four times as long counts.
+    for pair in totals.windows(2) {
+        assert!(pair[1] <= 5 * pair[0], "{totals:?}");
     }
 }
 
