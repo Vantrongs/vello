@@ -3,6 +3,7 @@
 
 //! Fast pixel-aligned rectangle rendering directly into strips.
 
+use crate::geometry::RectU16;
 use crate::kurbo::Rect;
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
@@ -20,7 +21,22 @@ use fearless_simd::*;
 ///
 /// The rect bounds should already be clamped to the viewport.
 pub fn render(level: Level, rect: Rect, strip_buf: &mut Vec<Strip>, alpha_buf: &mut Vec<u8>) {
-    dispatch!(level, simd => render_impl(simd, rect, strip_buf, alpha_buf));
+    dispatch!(level, simd => render_impl(simd, rect, None, strip_buf, alpha_buf));
+}
+
+/// Render the strips [`render`] renders for `rect` in `window`, a part of the viewport
+/// whose top left lies on a tile corner, at the window's origin: the sides are rounded
+/// as `render` rounds them and then moved, and the strips are cut past the window's last
+/// tiles; left of the window, its first column of tiles is covered as `render` covers
+/// it there.
+pub fn render_window(
+    level: Level,
+    rect: Rect,
+    window: RectU16,
+    strip_buf: &mut Vec<Strip>,
+    alpha_buf: &mut Vec<u8>,
+) {
+    dispatch!(level, simd => render_impl(simd, rect, Some(window), strip_buf, alpha_buf));
 }
 
 /// Generates strip data for an axis-aligned rectangle.
@@ -43,15 +59,38 @@ pub fn render(level: Level, rect: Rect, strip_buf: &mut Vec<Strip>, alpha_buf: &
 /// The x-alpha masks for the left/right edge tiles are y-independent, so they
 /// are precomputed once and reused across all interior rows.
 #[inline(always)]
-fn render_impl<S: Simd>(s: S, rect: Rect, strip_buf: &mut Vec<Strip>, alpha_buf: &mut Vec<u8>) {
+fn render_impl<S: Simd>(
+    s: S,
+    rect: Rect,
+    window: Option<RectU16>,
+    strip_buf: &mut Vec<Strip>,
+    alpha_buf: &mut Vec<u8>,
+) {
     if rect.is_zero_area() {
         return;
     }
 
-    let rect_x0 = rect.x0 as f32;
-    let rect_y0 = rect.y0 as f32;
-    let rect_x1 = rect.x1 as f32;
-    let rect_y1 = rect.y1 as f32;
+    let mut rect_x0 = rect.x0 as f32;
+    let mut rect_y0 = rect.y0 as f32;
+    let mut rect_x1 = rect.x1 as f32;
+    let mut rect_y1 = rect.y1 as f32;
+
+    if let Some(window) = window {
+        let (x0, y0) = (f32::from(window.x0), f32::from(window.y0));
+        let end = |end: u16, step: u16| u32::from(end).next_multiple_of(u32::from(step)) as f32;
+        let (x1, y1) = (end(window.x1, Tile::WIDTH), end(window.y1, Tile::HEIGHT));
+        // The tile holding the right edge is covered, so a right edge left of the window
+        // would be moved into its first tile.
+        if rect_x1 < x0 || rect_x0 >= x1 || rect_y1 <= y0 || rect_y0 >= y1 {
+            return;
+        }
+        // Exact for sides in the window, which are whole multiples of the `f32` spacing
+        // there; sides left of or above it only need to stay there.
+        rect_x0 -= x0;
+        rect_y0 -= y0;
+        rect_x1 = rect_x1.min(x1) - x0;
+        rect_y1 = rect_y1.min(y1) - y0;
+    }
 
     // Integer pixel bounds.
     let px_x0 = rect_x0.floor() as u16;

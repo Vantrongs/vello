@@ -310,6 +310,55 @@ fn offset_allocates_the_same_however_far_the_source_lies() {
     }
 }
 
+/// Flood, in a 64 by 64 view, where a rectangle under a triangular clip path
+/// lies after an offset moves it up by `distance` pixels: the source
+/// viewport of the offset reaches that far down, and where the flood ends
+/// follows the strips the rectangle has under the clip.
+fn clipped_and_moved_into_view(distance: f32) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::Flood {
+        color: AlphaColor::from_rgba8(200, 30, 60, 255),
+    }));
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+        dx: 0.0,
+        dy: -distance,
+    }));
+    let distance = f64::from(distance);
+    let mut triangle = BezPath::new();
+    triangle.move_to((16.0, distance + 16.0));
+    triangle.line_to((48.0, distance + 16.0));
+    triangle.line_to((32.0, distance + 48.0));
+    triangle.close_path();
+    context.push_clip_path(&triangle);
+    context.set_paint(BLUE);
+    context.fill_rect(&Rect::new(8.0, distance + 8.0, 56.0, distance + 40.0));
+    context.pop_clip();
+    context.pop_layer();
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn content_under_a_clip_path_far_into_the_source_viewport_costs_the_same() {
+    // The source viewport holds every distance but the last.
+    let (near, expected) = measure(|| clipped_and_moved_into_view(96.0));
+    assert!(
+        expected
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0)
+    );
+    for distance in [4_096.0, 60_000.0, 262_144.0] {
+        let (usage, pixels) = measure(|| clipped_and_moved_into_view(distance));
+        assert!(pixels == expected, "pixels at distance {distance}");
+        assert!(
+            usage.peak <= near.peak + near.peak / 4 && usage.total <= near.total + near.total / 4,
+            "distance {distance}: {usage:?}, at 96: {near:?}"
+        );
+    }
+}
+
 /// Blur, in a 64 by 64 view, a band reaching `length` pixels down from its
 /// top, whose end the blur's edges depend on, drawn as a rectangle or, if
 /// `as_path` is set, as a path.

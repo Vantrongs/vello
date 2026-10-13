@@ -4,6 +4,7 @@
 //! Primitives for creating tiles.
 
 use crate::flatten::Line;
+use crate::geometry::RectU16;
 use alloc::vec;
 use alloc::vec::Vec;
 use fearless_simd::*;
@@ -425,6 +426,71 @@ impl PartialOrd for Tile {
 
 impl Eq for Tile {}
 
+/// The tiles of a viewport a tiler keeps, in tile units: columns `x0` to `x_last` of
+/// rows `y0` to before `y1`, see [`Tiles::make_window_tiles_analytic_aa`].
+#[derive(Clone, Copy, Debug)]
+struct Kept {
+    x0: u16,
+    y0: u16,
+    x_last: u16,
+    y1: u16,
+}
+
+impl Kept {
+    /// Return the index of the kept row `y` among those kept.
+    #[inline(always)]
+    fn row(self, y: u16) -> usize {
+        usize::from(y - self.y0)
+    }
+
+    /// Push the tile at `x`, `y`, a kept row, moved to where the kept tiles start, if its
+    /// column is kept, or count its winding in `windings` if it lies left of them, as the
+    /// strip renderer would count it there.
+    #[inline(always)]
+    fn push(
+        self,
+        tiles: &mut Vec<Tile>,
+        windings: &mut CulledWindings,
+        (x, y): (u16, u16),
+        line_idx: u32,
+        intersection_mask: u32,
+        dir: i32,
+    ) {
+        if x < self.x0 {
+            if intersection_mask & W != 0 {
+                windings.coarse[self.row(y)] += dir;
+                windings.mark_row_active(self.row(y));
+                windings.culled = true;
+            }
+        } else if x <= self.x_last {
+            tiles.push(Tile::new(
+                x - self.x0,
+                y - self.y0,
+                line_idx,
+                intersection_mask,
+            ));
+        }
+    }
+
+    /// Push the tile [`Tile::new_clamped`] makes at `x`, `y`, as [`Self::push`] does.
+    #[inline(always)]
+    fn push_clamped(
+        self,
+        tiles: &mut Vec<Tile>,
+        windings: &mut CulledWindings,
+        (x, y): (u16, u16),
+        line_idx: u32,
+        intersection_mask: u32,
+        dir: i32,
+    ) {
+        let (x, y) = (
+            x.min(u16::MAX / Tile::WIDTH),
+            y.min(u16::MAX / Tile::HEIGHT),
+        );
+        self.push(tiles, windings, (x, y), line_idx, intersection_mask, dir);
+    }
+}
+
 /// Handles the tiling of paths.
 #[derive(Clone, Debug)]
 pub struct Tiles {
@@ -433,6 +499,9 @@ pub struct Tiles {
     sorted: bool,
     width: u16,
     height: u16,
+    /// The top left tile of the window the tiles were last made for, see
+    /// [`Self::make_window_tiles_analytic_aa`].
+    origin: (u16, u16),
     /// Auxiliary data tracking row windings and active rows for early culling.
     pub windings: CulledWindings,
 }
@@ -446,6 +515,7 @@ impl Tiles {
             sorted: false,
             width,
             height,
+            origin: (0, 0),
             windings: CulledWindings::new(height),
         }
     }
@@ -463,6 +533,12 @@ impl Tiles {
     /// Get the viewport width used for this tile buffer.
     pub(crate) fn width(&self) -> u16 {
         self.width
+    }
+
+    /// The top left tile of the window the tiles were last made for, see
+    /// [`Self::make_window_tiles_analytic_aa`].
+    pub(crate) fn origin(&self) -> (u16, u16) {
+        self.origin
     }
 
     /// Returns `true` if any geometry was early-culled outside the viewport.
@@ -528,6 +604,34 @@ impl Tiles {
             lines,
             width,
             height,
+            None,
+        ))
+    }
+
+    /// Generates the tiles [`Self::make_tiles_analytic_aa`] generates for a viewport of
+    /// `width` by `height`, of those in `window`, a part of it whose top left lies on a
+    /// tile corner, moved to the window's origin, with the work and memory of the window.
+    ///
+    /// Tiles right of the window are dropped, unless it reaches the right edge of the
+    /// viewport, and the coarse winding of those left of it is counted as that of lines
+    /// left of the viewport. [`crate::strip::render_window`] then renders the strips and
+    /// fills of the viewport in the window, but not their alphas right of what lies left
+    /// of it in the same row of tiles.
+    pub fn make_window_tiles_analytic_aa(
+        &mut self,
+        level: Level,
+        lines: &[Line],
+        width: u16,
+        height: u16,
+        window: RectU16,
+    ) -> bool {
+        self.origin = (window.x0 / Tile::WIDTH, window.y0 / Tile::HEIGHT);
+        dispatch!(level, simd => self.make_tiles_analytic_aa_impl::<_>(
+            simd,
+            lines,
+            width,
+            height,
+            Some(window),
         ))
     }
 
@@ -538,8 +642,12 @@ impl Tiles {
         lines: &[Line],
         width: u16,
         height: u16,
+        window: Option<RectU16>,
     ) -> bool {
-        self.reset(width, height);
+        match window {
+            None => self.reset(width, height),
+            Some(window) => self.reset(window.width(), window.height()),
+        }
 
         if width == 0 || height == 0 {
             return self.windings.culled;
@@ -554,6 +662,34 @@ impl Tiles {
 
         let tile_columns = width.div_ceil(Tile::WIDTH);
         let tile_rows = height.div_ceil(Tile::HEIGHT);
+        let kept = match window {
+            None => Kept {
+                x0: 0,
+                y0: 0,
+                x_last: u16::MAX,
+                y1: tile_rows,
+            },
+            Some(window) => {
+                debug_assert!(
+                    !window.is_empty()
+                        && window.x0 % Tile::WIDTH == 0
+                        && window.y0 % Tile::HEIGHT == 0
+                        && window.x1 <= width
+                        && window.y1 <= height,
+                    "a window is a part of the viewport that starts on a tile corner"
+                );
+                Kept {
+                    x0: window.x0 / Tile::WIDTH,
+                    y0: window.y0 / Tile::HEIGHT,
+                    x_last: if window.x1 == width {
+                        u16::MAX
+                    } else {
+                        window.x1.div_ceil(Tile::WIDTH).saturating_sub(1)
+                    },
+                    y1: window.y1.div_ceil(Tile::HEIGHT),
+                }
+            }
+        };
 
         let px_top = f32x4::from_slice(s, &[0.0, 1.0, 2.0, 3.0]);
         let px_bottom = px_top + f32x4::splat(s, 1.0);
@@ -586,9 +722,9 @@ impl Tiles {
             };
 
             // The `as u16` casts here intentionally clamp negative coordinates to 0.
-            let y_top_tiles = (line_top_y as u16).min(tile_rows);
+            let y_top_tiles = (line_top_y as u16).max(kept.y0).min(kept.y1);
             let line_bottom_y_ceil = line_bottom_y.ceil();
-            let y_bottom_tiles = (line_bottom_y_ceil as u16).min(tile_rows);
+            let y_bottom_tiles = (line_bottom_y_ceil as u16).min(kept.y1);
 
             // If y_top_tiles == y_bottom_tiles, then the line is either completely above or below
             // the viewport OR it is perfectly horizontal and aligned to the tile grid, contributing
@@ -619,25 +755,25 @@ impl Tiles {
             // Lines fully to the left of the viewport are not visible but still produce winding
             // which we record here and forward to the rendering stage.
             if line_right_x < 0.0 {
-                let is_start_culled = line_top_y < 0.0;
+                let is_start_culled = line_top_y < f32::from(kept.y0);
 
                 // This branch is for handling the "start" of the line. In case
                 // the line reaches above the viewport, we are already in the
                 // middle so we can skip that part.
                 if !is_start_culled {
-                    self.windings.mark_row_active(y_top_tiles as usize);
+                    self.windings.mark_row_active(kept.row(y_top_tiles));
 
                     // Note: In theory, == should be enough, but just as
                     // additional safety against numerical precision errors we
                     // use <=.
                     let at_top_of_tile = line_top_y <= f32::from(y_top_tiles);
                     if at_top_of_tile {
-                        self.windings.coarse[y_top_tiles as usize] += dir;
+                        self.windings.coarse[kept.row(y_top_tiles)] += dir;
                     }
 
                     let fractional_coverage =
                         calc_fractional_coverage!(y_top_tiles, line_top_y, line_bottom_y);
-                    let target_row = &mut self.windings.partial[y_top_tiles as usize];
+                    let target_row = &mut self.windings.partial[kept.row(y_top_tiles)];
                     let current = f32x4::from_slice(s, target_row);
 
                     // See comment below on the double counting risk!
@@ -653,26 +789,26 @@ impl Tiles {
                     y_top_tiles + 1
                 };
                 let line_bottom_floor = line_bottom_y.floor();
-                let y_end_middle = (line_bottom_floor as u16).min(tile_rows);
+                let y_end_middle = (line_bottom_floor as u16).min(kept.y1);
 
                 for y_idx in y_start_middle..y_end_middle {
-                    self.windings.coarse[y_idx as usize] += dir;
+                    self.windings.coarse[kept.row(y_idx)] += dir;
                 }
                 self.windings
-                    .mark_row_range_active(y_start_middle as usize, y_end_middle as usize);
+                    .mark_row_range_active(kept.row(y_start_middle), kept.row(y_end_middle));
 
                 if line_bottom_y != line_bottom_floor
-                    && y_end_middle < tile_rows
+                    && y_end_middle < kept.y1
                     // Prevent double-processing, unless the start was off-screen and hasn't been
                     // handled yet.
                     && (is_start_culled || y_end_middle != y_top_tiles)
                 {
-                    self.windings.mark_row_active(y_end_middle as usize);
+                    self.windings.mark_row_active(kept.row(y_end_middle));
                     // Ends implicitly cross the top.
-                    self.windings.coarse[y_end_middle as usize] += dir;
+                    self.windings.coarse[kept.row(y_end_middle)] += dir;
                     let fractional_coverage =
                         calc_fractional_coverage!(y_end_middle, line_top_y, line_bottom_y);
-                    let target_row = &mut self.windings.partial[y_end_middle as usize];
+                    let target_row = &mut self.windings.partial[kept.row(y_end_middle)];
                     let current = f32x4::from_slice(s, target_row);
                     // Subtract the inverse direction to avoid double counting with the coarse winding.
                     let next = fractional_coverage.mul_add(f_dir_v, current - f_dir_v);
@@ -698,12 +834,18 @@ impl Tiles {
                     let x = (line_left_x as u16).min(tile_columns.saturating_sub(1));
 
                     // Row Start, not culled.
-                    let is_start_culled = line_top_y < 0.0;
+                    let is_start_culled = line_top_y < f32::from(kept.y0);
                     if !is_start_culled {
                         let winding =
                             ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
-                        let tile = Tile::new_clamped(x, y_top_tiles, line_idx, winding);
-                        self.tile_buf.push(tile);
+                        kept.push_clamped(
+                            &mut self.tile_buf,
+                            &mut self.windings,
+                            (x, y_top_tiles),
+                            line_idx,
+                            winding,
+                            dir,
+                        );
                     }
 
                     // Middle
@@ -715,8 +857,14 @@ impl Tiles {
                     };
 
                     for y_idx in y_start..y_bottom_tiles {
-                        let tile = Tile::new_clamped(x, y_idx, line_idx, W);
-                        self.tile_buf.push(tile);
+                        kept.push_clamped(
+                            &mut self.tile_buf,
+                            &mut self.windings,
+                            (x, y_idx),
+                            line_idx,
+                            W,
+                            dir,
+                        );
                     }
                 } else {
                     // General case, any line which crosses more than one tile and is not vertical.
@@ -732,6 +880,7 @@ impl Tiles {
                     let push_row_extents = {
                         #[inline(always)]
                         |tile_buf: &mut Vec<Tile>,
+                         windings: &mut CulledWindings,
                          y_idx: u16,
                          row_left_x: f32,
                          row_right_x: f32,
@@ -744,14 +893,36 @@ impl Tiles {
                             if x_start <= x_end {
                                 let winding = if x_start == x_end { w_single } else { w_start };
 
-                                tile_buf.push(Tile::new(x_start, y_idx, line_idx, winding));
+                                kept.push(
+                                    tile_buf,
+                                    windings,
+                                    (x_start, y_idx),
+                                    line_idx,
+                                    winding,
+                                    dir,
+                                );
 
-                                for x_idx in x_start.saturating_add(1)..x_end {
-                                    tile_buf.push(Tile::new(x_idx, y_idx, line_idx, 0));
+                                // Those between carry no winding, so only those kept are made.
+                                for x_idx in x_start.saturating_add(1).max(kept.x0)
+                                    ..x_end.min(kept.x_last.saturating_add(1))
+                                {
+                                    tile_buf.push(Tile::new(
+                                        x_idx - kept.x0,
+                                        y_idx - kept.y0,
+                                        line_idx,
+                                        0,
+                                    ));
                                 }
 
                                 if x_start < x_end {
-                                    tile_buf.push(Tile::new(x_end, y_idx, line_idx, w_end));
+                                    kept.push(
+                                        tile_buf,
+                                        windings,
+                                        (x_end, y_idx),
+                                        line_idx,
+                                        w_end,
+                                        dir,
+                                    );
                                 }
                             }
                         }
@@ -779,16 +950,16 @@ impl Tiles {
                                     // Although the line may cross the left edge, the rightmost point in
                                     // this row may still be fully left of the viewport. In this case,
                                     // record the winding and emit no tiles.
-                                    self.windings.mark_row_active(y_idx as usize);
+                                    self.windings.mark_row_active(kept.row(y_idx));
 
                                     let crosses_top = (w_single & W) != 0;
                                     if crosses_top {
-                                        self.windings.coarse[y_idx as usize] += dir;
+                                        self.windings.coarse[kept.row(y_idx)] += dir;
                                     }
 
                                     let fractional_coverage =
                                         calc_fractional_coverage!(y_idx, row_top_y, row_bottom_y);
-                                    let target_row = &mut self.windings.partial[y_idx as usize];
+                                    let target_row = &mut self.windings.partial[kept.row(y_idx)];
                                     let current = f32x4::from_slice(s, target_row);
 
                                     let double_count = mask32x4::splat(s, crosses_top)
@@ -813,13 +984,14 @@ impl Tiles {
                                     };
 
                                     if off_screen_top_y < off_screen_bottom_y {
-                                        self.windings.mark_row_active(y_idx as usize);
+                                        self.windings.mark_row_active(kept.row(y_idx));
                                         let fractional_coverage = calc_fractional_coverage!(
                                             y_idx,
                                             off_screen_top_y,
                                             off_screen_bottom_y
                                         );
-                                        let target_row = &mut self.windings.partial[y_idx as usize];
+                                        let target_row =
+                                            &mut self.windings.partial[kept.row(y_idx)];
                                         let current = f32x4::from_slice(s, target_row);
                                         let next = fractional_coverage.mul_add(f_dir_v, current);
                                         next.store_slice(target_row);
@@ -829,6 +1001,7 @@ impl Tiles {
 
                             push_row_extents(
                                 &mut self.tile_buf,
+                                &mut self.windings,
                                 y_idx,
                                 row_left_x,
                                 row_right_x,
@@ -839,7 +1012,7 @@ impl Tiles {
                         }
                     };
 
-                    let is_start_culled = line_top_y < 0.0;
+                    let is_start_culled = line_top_y < f32::from(kept.y0);
                     // This branch is taken in case the line is completely inside
                     // the viewport, allowing us to save many calculations that
                     // otherwise would need to be made viewport culling work.
@@ -855,6 +1028,7 @@ impl Tiles {
                             let mask = ((y >= line_top_y) as u32) << WINDING_SHIFT;
                             push_row_extents(
                                 &mut self.tile_buf,
+                                &mut self.windings,
                                 y_top_tiles,
                                 f32::min(line_top_x, row_bottom_x),
                                 f32::max(line_top_x, row_bottom_x),
@@ -884,6 +1058,7 @@ impl Tiles {
                                 };
                                 push_row_extents(
                                     &mut self.tile_buf,
+                                    &mut self.windings,
                                     y_idx,
                                     f32::min(row_top_x, row_bottom_x),
                                     f32::max(row_top_x, row_bottom_x),
@@ -924,13 +1099,14 @@ impl Tiles {
                 }
             } else {
                 // Case line is fully contained within a single tile: These also cannot cross edges!
-                let tile = Tile::new_clamped(
-                    (line_left_x as u16).min(tile_columns + 1),
-                    y_top_tiles,
+                kept.push_clamped(
+                    &mut self.tile_buf,
+                    &mut self.windings,
+                    ((line_left_x as u16).min(tile_columns + 1), y_top_tiles),
                     line_idx,
                     ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT,
+                    dir,
                 );
-                self.tile_buf.push(tile);
             }
         }
 

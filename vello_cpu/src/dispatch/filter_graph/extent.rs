@@ -46,8 +46,6 @@ use vello_common::geometry::RectU16;
 use vello_common::strip::{StripFillSegment, visit_strip_fill_segments};
 use vello_common::strip_generator::{StripGenerator, StripStorage};
 use vello_common::tile::{MAX_LINES_PER_PATH, Tile};
-use vello_common::util::strip_bbox;
-use vello_common::viewport::ViewportState;
 
 /// The side of the square frames paths are flattened in, which windows draw.
 const FRAME: i64 = WINDOW_SIZE;
@@ -596,8 +594,12 @@ enum Cover {
     /// Clips covering every tile of the bounds, which is not known to be a
     /// rectangle, so a rectangle drawn under them is cut to the bounds.
     Tiles(Bounds),
-    /// Clips of other shapes, whose strips lie in the bounds.
-    Paths(Bounds),
+    /// Clips of other shapes, whose strips lie in `all`, and in the
+    /// recorder's viewport in `home`.
+    Paths {
+        all: Bounds,
+        home: Bounds,
+    },
 }
 
 /// The viewport the recorder draws a filter layer in, see
@@ -607,19 +609,20 @@ enum Cover {
 ///
 /// What lies inside it a tile away from its edges is found from its geometry
 /// there; anything else, which the recorder cuts at its edges, and what clip
-/// paths cut, is drawn as the recorder draws it, under its clips, which
-/// holds memory that follows the size of the viewport rather than the view.
+/// paths cut, is searched for as outside of it, flattened in its frame, which
+/// holds any part of it, and drawn in windows of it, see
+/// `StripGenerator::new_window`.
 struct Home {
     origin: Position,
     /// The width and height of the viewport.
     size: (u16, u16),
+    /// The viewport, which culls what is drawn in it without clips.
+    viewport: Bounds,
     /// The tiles of the viewport, outside of which nothing is drawn in it.
     tiles: Bounds,
     /// The tiles a tile away from its edges.
     inside: Bounds,
     to_frame: Affine,
-    /// The recorder's state, once something is drawn as it draws it.
-    recorder: Option<(ViewportState, StripStorage)>,
 }
 
 impl Home {
@@ -635,13 +638,13 @@ impl Home {
         };
         let size = (side(viewport.width()), side(viewport.height()));
         let origin = viewport.origin();
-        let tiles = Bounds::new(
+        let viewport = Bounds::new(
             origin.0.clone(),
             origin.1.clone(),
             &origin.0 + i64::from(size.0),
             &origin.1 + i64::from(size.1),
-        )
-        .snap_to_tiles();
+        );
+        let tiles = viewport.snap_to_tiles();
         let inside = Bounds::new(
             &tiles.x0 + TILE,
             &tiles.y0 + TILE,
@@ -652,93 +655,25 @@ impl Home {
             to_frame: Affine::translate((-origin.0.to_f64(), -origin.1.to_f64())),
             origin,
             size,
+            viewport,
             tiles,
             inside,
-            recorder: None,
         })
     }
 
-    /// Return the recorder's state, with `clips` pushed if it is new.
-    fn recorder(&mut self, level: Level, clips: &[&Clip]) -> &mut (ViewportState, StripStorage) {
-        if self.recorder.is_none() {
-            let state = ViewportState::new(self.size.0, self.size.1, level);
-            self.recorder = Some((state, StripStorage::default()));
-            for clip in clips {
-                self.push_clip(clip);
-            }
-        }
-        self.recorder.as_mut().unwrap()
-    }
-
-    /// Push `clip` as `ClipState::push_clip_path` and `push_clip_rect` push
-    /// it, if the recorder's state is kept, and return the bounds of its
-    /// strips, which are cut to the clips under it.
-    fn push_clip(&mut self, clip: &Clip) -> Option<Bounds> {
-        let (state, _) = self.recorder.as_mut()?;
-        match clip {
-            Clip::Path {
-                path,
-                fill_rule,
-                transform,
-                aliasing_threshold,
-            } => state.push_clip_path(
-                path,
-                *fill_rule,
-                self.to_frame * *transform,
-                *aliasing_threshold,
-            ),
-            Clip::Rect(rect) => state.push_clip_rect(&self.to_frame.transform_rect_bbox(*rect)),
-        }
-        let bbox = state.clip().map_or(RectU16::ZERO, |clip| clip.path.bbox);
-        Some(Bounds::of_rect(bbox, &self.origin))
-    }
-
-    fn pop_clip(&mut self) {
-        if let Some((state, _)) = &mut self.recorder {
-            state.pop_clip();
-        }
-    }
-
-    /// Return the bounds of the strips `item` draws under `clips`, as
-    /// `SingleThreadedDispatcher::fill_path`, `stroke_path`, `fill_rect_fast`
-    /// and `layer_clip` draw it.
-    fn draw(&mut self, level: Level, clips: &[&Clip], item: &Item<'_>) -> Bounds {
-        let to_frame = self.to_frame;
-        let (state, storage) = self.recorder(level, clips);
-        state.with_generator_and_clip(|generator, clip| match *item {
-            Item::Rect(..) => {
-                let rect = item.frame_rect(to_frame).unwrap();
-                generator.generate_filled_rect_fast(&rect, storage, clip);
-            }
-            Item::Fill {
-                path,
-                fill_rule,
-                transform,
-                aliasing_threshold,
-            } => generator.generate_filled_path(
-                path,
-                fill_rule,
-                to_frame * transform,
-                aliasing_threshold,
-                storage,
-                clip.map(|clip| clip.path),
-            ),
-            Item::Stroke {
-                path,
-                stroke,
-                transform,
-                aliasing_threshold,
-            } => generator.generate_stroked_path(
-                path,
-                stroke,
-                to_frame * transform,
-                aliasing_threshold,
-                storage,
-                clip.map(|clip| clip.path),
-            ),
-        });
-        strip_bbox(&storage.strips)
-            .map_or(Bounds::EMPTY, |bbox| Bounds::of_rect(bbox, &self.origin))
+    /// Return the window of the viewport that holds `area`, which lies in
+    /// its tiles, in the viewport's coordinates.
+    fn window(&self, area: &Bounds) -> RectU16 {
+        let area = area.snap_to_tiles();
+        let local = |value: &Coord, origin: &Coord, size: u16| {
+            u16::try_from((value - origin).clamped_i64().clamp(0, size.into())).unwrap()
+        };
+        RectU16::new(
+            local(&area.x0, &self.origin.0, self.size.0),
+            local(&area.y0, &self.origin.1, self.size.1),
+            local(&area.x1, &self.origin.0, self.size.0),
+            local(&area.y1, &self.origin.1, self.size.1),
+        )
     }
 }
 
@@ -805,9 +740,6 @@ impl<'a> Extents<'a> {
                 Command::PopClip => {
                     if clips.pop().is_some() {
                         covers.pop();
-                        if let Some(home) = &mut self.home {
-                            home.pop_clip();
-                        }
                     }
                 }
                 Command::PushLayer(pushed) => {
@@ -847,23 +779,18 @@ impl<'a> Extents<'a> {
             {
                 Cover::Tiles(self.outside(&item, covers, clips))
             }
-            _ => Cover::Paths(self.outside(&item, covers, clips)),
+            _ => Cover::Paths {
+                all: self.outside(&item, covers, clips),
+                home: Bounds::EMPTY,
+            },
         };
-        let drawn = match self.home.as_mut().and_then(|home| home.push_clip(clip)) {
-            Some(drawn) => drawn,
-            None => {
-                let drawn = self.home_extent(&item, covers, clips);
-                // The recorder's state is kept from the first item drawn as
-                // it draws it, the clips under this one pushed.
-                self.home
-                    .as_mut()
-                    .and_then(|home| home.push_clip(clip))
-                    .unwrap_or(drawn)
-            }
-        };
+        let drawn = self.home_extent(&item, covers, clips);
         match cover {
             Cover::Tiles(bounds) => Cover::Tiles(bounds.union(&drawn)),
-            Cover::Paths(bounds) => Cover::Paths(bounds.union(&drawn)),
+            Cover::Paths { all, .. } => Cover::Paths {
+                all: all.union(&drawn),
+                home: drawn,
+            },
             Cover::All | Cover::Rect(_) => cover,
         }
     }
@@ -875,8 +802,26 @@ impl<'a> Extents<'a> {
         match cover {
             Cover::All => None,
             Cover::Rect(rect) => Some(self.rect_tiles(*rect)),
-            Cover::Tiles(bounds) | Cover::Paths(bounds) => Some(bounds.clone()),
+            Cover::Tiles(bounds) | Cover::Paths { all: bounds, .. } => Some(bounds.clone()),
         }
+    }
+
+    /// Return what the recorder culls what it flattens to where it draws
+    /// `area`: in its viewport, the bounds of the strips the clips that
+    /// cover `cover` have there, or the viewport without clips, and
+    /// elsewhere those of their strips anywhere, see [`Self::clip_bounds`].
+    fn cull(&self, cover: &Cover, area: &Bounds) -> Option<Bounds> {
+        let Some(home) = self.home_holding(area) else {
+            return self.clip_bounds(cover);
+        };
+        Some(match cover {
+            Cover::All => home.viewport.clone(),
+            // The strips of rectangles and blocks of tiles cut to the viewport.
+            Cover::Rect(_) | Cover::Tiles(_) => {
+                self.clip_bounds(cover).unwrap().intersect(&home.tiles)
+            }
+            Cover::Paths { home: bounds, .. } => bounds.clone(),
+        })
     }
 
     /// Return a rectangle without bounds cut to the viewport the recorder
@@ -904,25 +849,32 @@ impl<'a> Extents<'a> {
     /// Return the bounds of the strips `item` draws under `clips` in the
     /// recorder's viewport, see [`Home`].
     fn home_extent(&mut self, item: &Item<'_>, covers: &[Cover], clips: &[&Clip]) -> Bounds {
-        let Some(reach) = self.reach(item, covers) else {
+        let Some(home) = &self.home else {
             return Bounds::EMPTY;
         };
-        let level = self.level;
-        let Some(home) = &mut self.home else {
+        let cover = covers.last().unwrap();
+        // What the recorder culls to in its viewport.
+        let cull = self.cull(cover, &home.tiles).unwrap();
+        let Some(reach) = self.reach(item, Some(&cull)) else {
             return Bounds::EMPTY;
         };
-        if reach.intersect(&home.tiles).is_empty() {
+        let area = reach.intersect(&home.tiles);
+        if area.is_empty() {
             return Bounds::EMPTY;
         }
-        let cover = covers.last().unwrap();
-        if !home.inside.contains(&reach) || matches!(cover, Cover::Paths(_)) {
-            return home.draw(level, clips, item);
+        if !home.inside.contains(&reach) || matches!(cover, Cover::Paths { .. }) {
+            let area = match cover {
+                Cover::All => area,
+                Cover::Rect(_) | Cover::Tiles(_) | Cover::Paths { .. } => area.intersect(&cull),
+            };
+            return self.search(item, covers, clips, area);
         }
         let (origin, to_frame, size) = (home.origin.clone(), home.to_frame, home.size);
         // The clips' strips in the viewport.
-        let cull = self
-            .clip_bounds(cover)
-            .map(|cull| cull.intersect(&self.home.as_ref().unwrap().tiles));
+        let cull = match cover {
+            Cover::All => None,
+            Cover::Rect(_) | Cover::Tiles(_) | Cover::Paths { .. } => Some(cull),
+        };
         if let Some(rect) = item.frame_rect(to_frame) {
             // As `StripGenerator::generate_filled_rect_fast` cuts it.
             let viewport = Rect::new(0.0, 0.0, f64::from(size.0), f64::from(size.1));
@@ -930,7 +882,7 @@ impl<'a> Extents<'a> {
             let rect = match cover {
                 Cover::All => rect,
                 Cover::Rect(clip) => rect.intersect(to_frame.transform_rect_bbox(*clip)),
-                Cover::Tiles(_) | Cover::Paths(_) => {
+                Cover::Tiles(_) | Cover::Paths { .. } => {
                     let cull = cull.as_ref().unwrap();
                     rect.intersect(to_frame.transform_rect_bbox(to_rect(cull)))
                 }
@@ -943,7 +895,7 @@ impl<'a> Extents<'a> {
         }
         let cut = match cover {
             Cover::All => None,
-            Cover::Rect(_) | Cover::Tiles(_) | Cover::Paths(_) => cull.clone(),
+            Cover::Rect(_) | Cover::Tiles(_) | Cover::Paths { .. } => cull.clone(),
         };
         if cut.as_ref().is_some_and(Bounds::is_empty) {
             return Bounds::EMPTY;
@@ -960,17 +912,16 @@ impl<'a> Extents<'a> {
             .map_or(Bounds::EMPTY, |tiles| tiles.to_bounds(&origin))
     }
 
-    /// Return bounds holding the tiles `item` can cover under clips that
-    /// cover the last of `covers`, from its geometry, or `None` if it covers
-    /// none.
-    fn reach(&self, item: &Item<'_>, covers: &[Cover]) -> Option<Bounds> {
-        let cull = self.clip_bounds(covers.last().unwrap());
+    /// Return bounds holding the tiles `item` can cover, flattened with the
+    /// culling of clips whose strips lie in `cull`, from its geometry, or
+    /// `None` if it covers none.
+    fn reach(&self, item: &Item<'_>, cull: Option<&Bounds>) -> Option<Bounds> {
         let reach = match item.device_rect() {
             Some(rect) => Bounds::covering(self.unbounded_cut(rect.abs())),
-            None => Some(Bounds::covering(item.device_bounds()).map_or_else(
-                || self.viewport.clone(),
-                |bounds| culled(bounds, cull.as_ref()),
-            )),
+            None => Some(
+                Bounds::covering(item.device_bounds())
+                    .map_or_else(|| self.viewport.clone(), |bounds| culled(bounds, cull)),
+            ),
         };
         // A rectangle covers the tile holding its right and bottom edges.
         reach.map(|reach| reach.expand(&Padding::uniform(TILE.into())).snap_to_tiles())
@@ -979,7 +930,8 @@ impl<'a> Extents<'a> {
     /// Return the bounds of the strips `item` draws under `clips` outside the
     /// recorder's viewport, see [`Self::extent`].
     fn outside(&mut self, item: &Item<'_>, covers: &[Cover], clips: &[&Clip]) -> Bounds {
-        let Some(reach) = self.reach(item, covers) else {
+        let cull = self.clip_bounds(covers.last().unwrap());
+        let Some(reach) = self.reach(item, cull.as_ref()) else {
             return Bounds::EMPTY;
         };
         let pieces = match &self.home {
@@ -1018,7 +970,7 @@ impl<'a> Extents<'a> {
                 let cut = cull.as_ref().unwrap().intersect(piece);
                 self.path(item, Some(&cut), cull.as_ref())
             }
-            (_, Cover::Paths(bounds)) => {
+            (_, Cover::Paths { all: bounds, .. }) => {
                 let area = self.covered(item, Some(&bounds.intersect(piece)), cull.as_ref());
                 self.search(item, covers, clips, area)
             }
@@ -1091,7 +1043,7 @@ impl<'a> Extents<'a> {
         if area.is_empty() {
             return Bounds::EMPTY;
         }
-        if !fits(&area) {
+        if !fits(&area) && self.home_holding(&area).is_none() {
             return self.far_path(item, &area, cut, cull);
         }
         let origin = self.frame_at(&area);
@@ -1102,10 +1054,20 @@ impl<'a> Extents<'a> {
             .map_or(Bounds::EMPTY, |tiles| tiles.to_bounds(&origin))
     }
 
+    /// Return the recorder's viewport if `area` lies in its tiles, see
+    /// [`Home`].
+    fn home_holding(&self, area: &Bounds) -> Option<&Home> {
+        self.home.as_ref().filter(|home| home.tiles.contains(area))
+    }
+
     /// Return the origin of a frame holding `area` inside its margin: that of
-    /// the viewport if it does, where the recorder flattens, and otherwise
-    /// one at the top left of `area`.
+    /// the viewport if it does, or if `area` lies in the recorder's viewport,
+    /// where the recorder flattens, and otherwise one at the top left of
+    /// `area`.
     fn frame_at(&self, area: &Bounds) -> Position {
+        if let Some(home) = self.home_holding(area) {
+            return home.origin.clone();
+        }
         let origin = self.viewport.origin();
         let frame = Bounds::new(
             &origin.0 + MARGIN,
@@ -1377,7 +1339,7 @@ impl<'a> Extents<'a> {
         clips: &[&Clip],
         area: Bounds,
     ) -> Bounds {
-        let cull = self.clip_bounds(covers.last().unwrap());
+        let cull = self.cull(covers.last().unwrap(), &area);
         let mut found = Bounds::EMPTY;
         for side in 0..4 {
             // How far a part reaches on the side, larger the further.
@@ -1449,7 +1411,7 @@ impl<'a> Extents<'a> {
                 if area.is_empty() {
                     return area;
                 }
-                let cull = self.clip_bounds(cover);
+                let cull = self.cull(cover, &area);
                 area = self.covered(&Item::of_clip(clip), Some(&area), cull.as_ref());
             }
             if area.is_empty() || area == before {
@@ -1460,27 +1422,43 @@ impl<'a> Extents<'a> {
 
     /// Return the bounds of the strips `item` draws in `area`, which a frame
     /// holds, under `clips`, which cover the last of `covers`, by drawing
-    /// them in that frame as the recorder draws them: each culled to the
-    /// strips of the clips under it in the whole target, which a window cut
-    /// to `area` would not hold.
+    /// them as the recorder draws them, each culled to the strips of the
+    /// clips under it, which a generator cut to `area` would not hold: in
+    /// the recorder's viewport, in a window of it, and elsewhere in a frame.
     fn draw(&self, item: &Item<'_>, covers: &[Cover], clips: &[&Clip], area: &Bounds) -> Bounds {
-        // A frame around `area` with a margin on every side, so that the
-        // strip generator is no larger: the tiler puts lines past its right
-        // edge in its last column.
-        let snapped = area.snap_to_tiles();
-        let origin = (&snapped.x0 - MARGIN, &snapped.y0 - MARGIN);
-        let to_frame = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
-        let side = |end: &Coord, start: &Coord| {
-            u16::try_from((end - start).clamped_i64() + MARGIN).unwrap()
+        // The origin of the generator's viewport, and that of its strips.
+        let (origin, strips_origin, mut generator, frame) = match self.home_holding(area) {
+            Some(home) => {
+                let window = home.window(area);
+                let strips_origin = (
+                    &home.origin.0 + i64::from(window.x0),
+                    &home.origin.1 + i64::from(window.y0),
+                );
+                let generator =
+                    StripGenerator::new_window(home.size.0, home.size.1, window, self.level);
+                (home.origin.clone(), strips_origin, generator, None)
+            }
+            None => {
+                // A frame around `area` with a margin on every side, so that
+                // the strip generator is no larger: the tiler puts lines past
+                // its right edge in its last column.
+                let snapped = area.snap_to_tiles();
+                let origin = (&snapped.x0 - MARGIN, &snapped.y0 - MARGIN);
+                let side = |end: &Coord, start: &Coord| {
+                    u16::try_from((end - start).clamped_i64() + MARGIN).unwrap()
+                };
+                let (width, height) = (side(&area.x1, &origin.0), side(&area.y1, &origin.1));
+                let generator = StripGenerator::new(width, height, self.level);
+                let frame = Rect::new(0.0, 0.0, width.into(), height.into());
+                (origin.clone(), origin, generator, Some(frame))
+            }
         };
-        let (width, height) = (side(&area.x1, &origin.0), side(&area.y1, &origin.1));
-        let mut generator = StripGenerator::new(width, height, self.level);
+        let to_frame = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
         // `generate_filled_rect_fast` cuts a rectangle under a clip path only to
         // the clip's bounds, which lie in the recorder's viewport but reach past
-        // the frame; past the frame, the clip covers nothing.
-        let in_frame =
-            |rect: Rect| rect.intersect(Rect::new(0.0, 0.0, width.into(), height.into()));
-        let cull = |cover: &Cover| frame_cull(self.clip_bounds(cover).as_ref(), &origin);
+        // a frame; past the frame, the clip covers nothing.
+        let in_frame = |rect: Rect| frame.map_or(rect, |frame| rect.intersect(frame));
+        let cull = |cover: &Cover| frame_cull(self.cull(cover, area).as_ref(), &origin);
         let mut clip: Option<(StripStorage, ClipShape)> = None;
         for (pushed, cover) in clips.iter().zip(covers) {
             let mut storage = StripStorage::default();
@@ -1546,7 +1524,7 @@ impl<'a> Extents<'a> {
                 existing.map(|clip| clip.path),
             ),
         }
-        let Some(region) = Tiles::of_bounds(area, &origin) else {
+        let Some(region) = Tiles::of_bounds(area, &strips_origin) else {
             return Bounds::EMPTY;
         };
         let tile = |value: i64| u16::try_from(value).unwrap();
@@ -1574,7 +1552,7 @@ impl<'a> Extents<'a> {
             |tiles, segment| add(tiles, *segment),
             add,
         );
-        tiles.map_or(Bounds::EMPTY, |tiles| tiles.to_bounds(&origin))
+        tiles.map_or(Bounds::EMPTY, |tiles| tiles.to_bounds(&strips_origin))
     }
 }
 

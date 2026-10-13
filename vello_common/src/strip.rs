@@ -346,7 +346,7 @@ pub fn render(
     aliasing_threshold: Option<u8>,
     lines: &[Line],
 ) {
-    dispatch!(level, simd => render_impl(simd,
+    dispatch!(level, simd => render_impl::<_, false>(simd,
                                          tiles,
                                          strip_buf,
                                          alpha_buf,
@@ -355,8 +355,28 @@ pub fn render(
                                          lines));
 }
 
+/// Render the tiles [`Tiles::make_window_tiles_analytic_aa`] keeps of a window of the
+/// viewport `lines` lie in into strips at the window's origin.
+pub fn render_window(
+    level: Level,
+    tiles: &Tiles,
+    strip_buf: &mut Vec<Strip>,
+    alpha_buf: &mut Vec<u8>,
+    fill_rule: Fill,
+    aliasing_threshold: Option<u8>,
+    lines: &[Line],
+) {
+    dispatch!(level, simd => render_impl::<_, true>(simd,
+                                                    tiles,
+                                                    strip_buf,
+                                                    alpha_buf,
+                                                    fill_rule,
+                                                    aliasing_threshold,
+                                                    lines));
+}
+
 #[inline(always)]
-fn render_impl<S: Simd>(
+fn render_impl<S: Simd, const WINDOW: bool>(
     s: S,
     tiles: &Tiles,
     strip_buf: &mut Vec<Strip>,
@@ -365,6 +385,7 @@ fn render_impl<S: Simd>(
     aliasing_threshold: Option<u8>,
     lines: &[Line],
 ) {
+    let origin = if WINDOW { tiles.origin() } else { (0, 0) };
     let row_windings = &tiles.windings.coarse;
     let has_culled_tiles = tiles.has_culled_tiles();
     let viewport_width = tiles.width();
@@ -463,8 +484,9 @@ fn render_impl<S: Simd>(
 
     for (tile_idx, tile) in tiles.iter().copied().chain([Tile::SENTINEL]).enumerate() {
         let line = lines[tile.line_idx() as usize];
-        let tile_left_x = f32::from(tile.x) * f32::from(Tile::WIDTH);
-        let tile_top_y = f32::from(tile.y) * f32::from(Tile::HEIGHT);
+        // Wraps only for the sentinel, whose line is not used.
+        let tile_left_x = f32::from(tile.x.wrapping_add(origin.0)) * f32::from(Tile::WIDTH);
+        let tile_top_y = f32::from(tile.y.wrapping_add(origin.1)) * f32::from(Tile::HEIGHT);
         let p0_x = line.p0.x - tile_left_x;
         let p0_y = line.p0.y - tile_top_y;
         let p1_x = line.p1.x - tile_left_x;

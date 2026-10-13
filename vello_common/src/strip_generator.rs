@@ -88,6 +88,8 @@ pub struct StripGenerator {
     tiles: Tiles,
     width: u16,
     height: u16,
+    /// The part of the viewport whose strips are generated, if not all of it.
+    window: Option<RectU16>,
 }
 
 impl StripGenerator {
@@ -102,6 +104,29 @@ impl StripGenerator {
             temp_storage: StripStorage::default(),
             width,
             height,
+            window: None,
+        }
+    }
+
+    /// Create a strip generator for a viewport of `width` by `height` that generates
+    /// its strips in `window`, a part of it whose top left lies on a tile corner, at the
+    /// window's origin, with the memory of the window: those the viewport has there,
+    /// with their fills, see [`Tiles::make_window_tiles_analytic_aa`].
+    ///
+    /// Paths and rectangles are given, culled and rounded in the viewport's
+    /// coordinates, and so are the bounds of clip paths, whose strips are those of the
+    /// window.
+    pub fn new_window(width: u16, height: u16, window: RectU16, level: Level) -> Self {
+        Self {
+            level,
+            line_buf: Vec::new(),
+            tiles: Tiles::new(level, window.width(), window.height()),
+            flatten_ctx: FlattenCtx::default(),
+            stroke_ctx: StrokeCtx::default(),
+            temp_storage: StripStorage::default(),
+            width,
+            height,
+            window: Some(window),
         }
     }
 
@@ -175,29 +200,55 @@ impl StripGenerator {
         fill_rule: Fill,
         clip_path: Option<PathDataRef<'_>>,
     ) {
-        self.tiles
-            .make_tiles_analytic_aa(self.level, &self.line_buf, self.width, self.height);
+        match self.window {
+            None => self.tiles.make_tiles_analytic_aa(
+                self.level,
+                &self.line_buf,
+                self.width,
+                self.height,
+            ),
+            Some(window) => self.tiles.make_window_tiles_analytic_aa(
+                self.level,
+                &self.line_buf,
+                self.width,
+                self.height,
+                window,
+            ),
+        };
 
         self.tiles.sort_tiles();
 
         let level = self.level;
         let tiles = &self.tiles;
         let line_buf = &self.line_buf;
+        let windowed = self.window.is_some();
         render_with_clip(
             level,
             &mut self.temp_storage,
             strip_storage,
             clip_path,
             |strips, alphas| {
-                strip::render(
-                    level,
-                    tiles,
-                    strips,
-                    alphas,
-                    fill_rule,
-                    aliasing_threshold,
-                    line_buf,
-                );
+                if windowed {
+                    strip::render_window(
+                        level,
+                        tiles,
+                        strips,
+                        alphas,
+                        fill_rule,
+                        aliasing_threshold,
+                        line_buf,
+                    );
+                } else {
+                    strip::render(
+                        level,
+                        tiles,
+                        strips,
+                        alphas,
+                        fill_rule,
+                        aliasing_threshold,
+                        line_buf,
+                    );
+                }
             },
         );
     }
@@ -244,13 +295,15 @@ impl StripGenerator {
         };
 
         let level = self.level;
+        let window = self.window;
         render_with_clip(
             level,
             &mut self.temp_storage,
             strip_storage,
             complex_clip,
-            |strips, alphas| {
-                rect::render(level, clamped, strips, alphas);
+            |strips, alphas| match window {
+                None => rect::render(level, clamped, strips, alphas),
+                Some(window) => rect::render_window(level, clamped, window, strips, alphas),
             },
         );
 
@@ -334,12 +387,269 @@ fn render_with_clip(
 
 #[cfg(test)]
 mod tests {
+    use alloc::collections::{BTreeMap, BTreeSet};
     use alloc::format;
+    use alloc::vec::Vec;
 
+    use crate::clip::{ClipRef, ClipShape, PathDataRef};
     use crate::fearless_simd::Level;
-    use crate::kurbo::{Affine, Rect, Shape};
+    use crate::geometry::RectU16;
+    use crate::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
     use crate::peniko::Fill;
+    use crate::strip::visit_strip_fill_segments;
     use crate::strip_generator::{StripGenerator, StripStorage};
+    use crate::tile::Tile;
+    use crate::util::strip_bbox;
+
+    /// A source of pseudo-random numbers.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, end: u64) -> u64 {
+            self.next() % end
+        }
+
+        fn number(&mut self, low: f64, high: f64) -> f64 {
+            low + (self.next() >> 11) as f64 / (1_u64 << 53) as f64 * (high - low)
+        }
+    }
+
+    /// Something drawn, or pushed as a clip.
+    enum Drawn {
+        Fill(BezPath, Fill),
+        Stroke(BezPath, Stroke),
+        Rect(Rect),
+    }
+
+    /// Return a coordinate around a viewport side of `size`: mostly near it, some on
+    /// tile edges or a little to either side, which `f32` rounds onto them, some far
+    /// beyond it, where fills are clipped before flattening.
+    fn coordinate(random: &mut Random, size: u16) -> f64 {
+        let size = f64::from(size);
+        let edge = |random: &mut Random| (random.below(size as u64 / 4 + 2) * 4) as f64;
+        match random.below(8) {
+            0 => edge(random),
+            1 => {
+                let off = [
+                    2_f64.powi(-22),
+                    -(2_f64.powi(-22)),
+                    1e-7,
+                    -1e-7,
+                    2_f64.powi(-30),
+                ];
+                edge(random) + off[random.below(off.len() as u64) as usize]
+            }
+            2 => random.number(-1e6, 1e6),
+            _ => random.number(-40.0, size + 40.0),
+        }
+    }
+
+    fn random_drawn(random: &mut Random, (width, height): (u16, u16)) -> Drawn {
+        let point = |random: &mut Random| (coordinate(random, width), coordinate(random, height));
+        if random.below(5) == 0 {
+            let (a, mut b) = (point(random), point(random));
+            // Sides whose distance rounds away in `f32`, which still cover a tile.
+            match random.below(4) {
+                0 => b.0 = a.0 + 1e-7,
+                1 => b.1 = a.1 - 1e-7,
+                _ => {}
+            }
+            return Drawn::Rect(Rect::new(a.0, a.1, b.0, b.1));
+        }
+        let mut path = BezPath::new();
+        path.move_to(point(random));
+        for _ in 0..1 + random.below(8) {
+            match random.below(6) {
+                0 => path.quad_to(point(random), point(random)),
+                1 => path.curve_to(point(random), point(random), point(random)),
+                2 => path.close_path(),
+                _ => path.line_to(point(random)),
+            }
+        }
+        match random.below(3) {
+            0 => Drawn::Stroke(path, Stroke::new(random.number(0.5, 12.0))),
+            1 => Drawn::Fill(path, Fill::EvenOdd),
+            _ => Drawn::Fill(path, Fill::NonZero),
+        }
+    }
+
+    /// Draw `drawn` with `generator` under `clip`, whose strips cull to `cull`, and
+    /// return its strips and the shape it has as a clip.
+    fn draw(
+        generator: &mut StripGenerator,
+        drawn: &Drawn,
+        clip: Option<(&StripStorage, ClipShape)>,
+        cull: RectU16,
+    ) -> (StripStorage, ClipShape) {
+        let clip = clip.map(|(storage, shape)| ClipRef {
+            path: PathDataRef {
+                strips: &storage.strips,
+                alphas: &storage.alphas,
+                bbox: cull,
+                opaque_bbox: None,
+            },
+            shape,
+        });
+        let mut storage = StripStorage::default();
+        let shape = match drawn {
+            Drawn::Rect(rect) => generator.generate_filled_rect_fast(rect, &mut storage, clip),
+            Drawn::Fill(path, fill_rule) => {
+                generator.generate_filled_path(
+                    path,
+                    *fill_rule,
+                    Affine::IDENTITY,
+                    None,
+                    &mut storage,
+                    clip.map(|clip| clip.path),
+                );
+                ClipShape::Path
+            }
+            Drawn::Stroke(path, stroke) => {
+                generator.generate_stroked_path(
+                    path,
+                    stroke,
+                    Affine::IDENTITY,
+                    None,
+                    &mut storage,
+                    clip.map(|clip| clip.path),
+                );
+                ClipShape::Path
+            }
+        };
+        (storage, shape)
+    }
+
+    fn clip_of(clip: &Option<(StripStorage, ClipShape)>) -> Option<(&StripStorage, ClipShape)> {
+        clip.as_ref().map(|(storage, shape)| (storage, *shape))
+    }
+
+    /// Return the alphas of each tile `strips` cover in `tiles`, those of a fill opaque,
+    /// at their offset from the top left of `tiles`.
+    fn covered(storage: &StripStorage, tiles: RectU16) -> BTreeMap<(u16, u16), [u8; 16]> {
+        let mut covered = BTreeMap::new();
+        let at = |x: u16, y: u16| (x - tiles.x0, y - tiles.y0);
+        visit_strip_fill_segments(
+            &storage.strips,
+            tiles,
+            &mut covered,
+            |covered, segment| {
+                for (column, x) in (segment.tile_x0..segment.tile_x1).enumerate() {
+                    let start = segment.alpha_idx as usize + column * 16;
+                    let alphas = storage.alphas[start..start + 16].try_into().unwrap();
+                    covered.insert(at(x, segment.tile_y), alphas);
+                }
+            },
+            |covered, segment| {
+                for x in segment.tile_x0..segment.tile_x1 {
+                    covered.insert(at(x, segment.tile_y), [255; 16]);
+                }
+            },
+        );
+        covered
+    }
+
+    /// A generator for a window of a viewport makes the strips and fills a generator for
+    /// the whole viewport makes there, and their alphas in rows with no strips left of
+    /// the window, for paths, strokes and rectangles reaching past the viewport's edges
+    /// and far beyond, under clip paths and rectangles.
+    #[test]
+    fn a_window_holds_the_strips_of_the_viewport() {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        // Windows compared that start right of the viewport's left edge, and at it.
+        let mut compared = [0; 2];
+        for case in 0..3000 {
+            let size = (1 + random.below(160) as u16, 1 + random.below(160) as u16);
+            let start = |random: &mut Random, size: u16| match random.below(3) {
+                0 => 0,
+                _ => random.below(u64::from(size.div_ceil(Tile::WIDTH))) as u16 * Tile::WIDTH,
+            };
+            let (x0, y0) = (start(&mut random, size.0), start(&mut random, size.1));
+            let end = |random: &mut Random, start: u16, size: u16| match random.below(3) {
+                0 => size,
+                _ => start + 1 + random.below(u64::from(size - start)) as u16,
+            };
+            let window = RectU16::new(
+                x0,
+                y0,
+                end(&mut random, x0, size.0),
+                end(&mut random, y0, size.1),
+            );
+            let clips: Vec<Drawn> = (0..random.below(3))
+                .map(|_| random_drawn(&mut random, size))
+                .collect();
+            let item = random_drawn(&mut random, size);
+            let mut whole = StripGenerator::new(size.0, size.1, Level::baseline());
+            let mut part = StripGenerator::new_window(size.0, size.1, window, Level::baseline());
+            let (mut whole_clip, mut part_clip) = (None, None);
+            let tiles = window.to_tile_bounds();
+            // The rows of the window where what lies left of it changes alphas in it: of
+            // paths with tiles left of it, or lines left of the viewport, whose fractional
+            // winding the renderer adds only to a first tile in the first column.
+            let mut left_rows = BTreeSet::new();
+            let mut cull = RectU16::new(0, 0, size.0, size.1);
+            for drawn in clips.iter().chain([&item]) {
+                let drawn_whole = draw(&mut whole, drawn, clip_of(&whole_clip), cull);
+                let drawn_part = draw(&mut part, drawn, clip_of(&part_clip), cull);
+                if !matches!(drawn, Drawn::Rect(_)) {
+                    let rows = tiles.y0..tiles.y1;
+                    for tile in whole.tiles.iter() {
+                        if tile.x < tiles.x0 && rows.contains(&tile.y) {
+                            left_rows.insert(tile.y - tiles.y0);
+                        }
+                    }
+                    if whole.tiles.has_culled_tiles() {
+                        let windings = &whole.tiles.windings;
+                        windings.for_active_rows_in_range(
+                            usize::from(tiles.y0),
+                            usize::from(tiles.y1),
+                            |row| {
+                                left_rows.insert(row as u16 - tiles.y0);
+                            },
+                        );
+                    }
+                }
+                // The clip's bounds, as `ClipContext` keeps them.
+                cull = strip_bbox(&drawn_whole.0.strips).unwrap_or(RectU16::ZERO);
+                (whole_clip, part_clip) = (Some(drawn_whole), Some(drawn_part));
+            }
+            let expected = covered(&whole_clip.unwrap().0, tiles);
+            let actual = covered(
+                &part_clip.unwrap().0,
+                RectU16::new(0, 0, tiles.width(), tiles.height()),
+            );
+            let keys = |covered: &BTreeMap<(u16, u16), [u8; 16]>| {
+                covered.keys().copied().collect::<Vec<_>>()
+            };
+            assert_eq!(
+                keys(&actual),
+                keys(&expected),
+                "case {case}: {window:?} of {size:?}"
+            );
+            let kept = |covered: &BTreeMap<(u16, u16), [u8; 16]>| {
+                covered
+                    .iter()
+                    .filter(|((_, y), _)| !left_rows.contains(y))
+                    .map(|(tile, alphas)| (*tile, *alphas))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                kept(&actual),
+                kept(&expected),
+                "case {case}: {window:?} of {size:?}"
+            );
+            if !expected.is_empty() {
+                compared[usize::from(window.x0 == 0)] += 1;
+            }
+        }
+        assert!(compared.iter().all(|count| *count > 300), "{compared:?}");
+    }
 
     #[test]
     fn reset() {
