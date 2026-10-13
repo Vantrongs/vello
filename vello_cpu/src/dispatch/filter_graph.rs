@@ -143,8 +143,10 @@ pub(crate) enum Command {
         aliasing_threshold: Option<u8>,
         mask: Option<Mask>,
     },
+    /// A rectangle, which `transform` keeps axis-aligned.
     FillRect {
         rect: Rect,
+        transform: Affine,
         paint: Paint,
         blend_mode: BlendMode,
         mask: Option<Mask>,
@@ -269,8 +271,23 @@ impl Dispatcher for Recording {
         blend_mode: BlendMode,
         mask: Option<Mask>,
     ) {
+        self.fill_transformed_rect(rect, Affine::IDENTITY, paint, blend_mode, mask);
+    }
+
+    // The recorder maps the rectangle with the transform composed with the
+    // shift into its viewport, which rounds differently from shifting the
+    // mapped rectangle.
+    fn fill_transformed_rect(
+        &mut self,
+        rect: &Rect,
+        transform: Affine,
+        paint: Paint,
+        blend_mode: BlendMode,
+        mask: Option<Mask>,
+    ) {
         self.commands.push(Command::FillRect {
             rect: *rect,
+            transform,
             paint,
             blend_mode,
             mask,
@@ -612,7 +629,9 @@ impl Command {
                     .transform_rect_bbox(path.control_box())
                     .inflate(device, device)
             }
-            Self::FillRect { rect, .. } => *rect,
+            Self::FillRect {
+                rect, transform, ..
+            } => transform.transform_rect_bbox(*rect),
             _ => return None,
         };
         // Covers what anti-aliasing and rounding add around the geometry.
@@ -1329,11 +1348,12 @@ fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Af
         ),
         Command::FillRect {
             rect,
+            transform,
             paint,
             blend_mode,
             mask,
         } => target.fill_rect_fast(
-            &to_window.transform_rect_bbox(*rect),
+            &(to_window * *transform).transform_rect_bbox(*rect),
             paint.clone(),
             *blend_mode,
             mask.clone(),

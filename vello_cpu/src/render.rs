@@ -35,7 +35,7 @@ use vello_common::peniko::{BlendMode, Fill};
 use vello_common::pixmap::{Pixmap, PixmapMut};
 use vello_common::render_state::RenderState;
 use vello_common::transforms::{RootTransforms, Transforms};
-use vello_common::util::into_fast_path_rect;
+use vello_common::util::{into_fast_path_rect, is_axis_aligned};
 
 #[cfg(feature = "text")]
 pub(crate) const DEFAULT_GLYPH_ATLAS_SIZE: u16 = 4096;
@@ -354,11 +354,10 @@ impl RenderContext {
             // Fast path: Use optimized rect filling if we have no skew in the path transform
             // and anti-aliasing is enabled.
             // TODO: Maybe also support no anti-aliasing in the fast path
-            if let Some(transformed_rect) =
-                into_fast_path_rect(*rect, &transform, ctx.aliasing_threshold)
-            {
-                ctx.dispatcher.fill_rect_fast(
-                    &transformed_rect,
+            if is_axis_aligned(&transform) && ctx.aliasing_threshold.is_none() {
+                ctx.dispatcher.fill_transformed_rect(
+                    rect,
+                    transform,
                     paint,
                     ctx.state.blend_mode,
                     ctx.mask.clone(),

@@ -48,6 +48,23 @@ pub(crate) trait Dispatcher: Any + Debug + Send {
         blend_mode: BlendMode,
         mask: Option<Mask>,
     );
+    /// Fill `rect` mapped by `transform`, which keeps it axis-aligned, with
+    /// the current paint.
+    fn fill_transformed_rect(
+        &mut self,
+        rect: &Rect,
+        transform: Affine,
+        paint: Paint,
+        blend_mode: BlendMode,
+        mask: Option<Mask>,
+    ) {
+        self.fill_rect_fast(
+            &transform.transform_rect_bbox(*rect),
+            paint,
+            blend_mode,
+            mask,
+        );
+    }
     fn push_clip_path(
         &mut self,
         path: &BezPath,

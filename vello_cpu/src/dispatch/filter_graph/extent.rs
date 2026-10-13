@@ -26,14 +26,15 @@
 //! segments reach furthest on each side, see [`Extents::far_path`].
 
 use super::{Clip, Command, FilterGraph, Layer, Step, WINDOW_SIZE};
-use crate::filter::placed::{Bounds, Coord, Position};
+use crate::filter::placed::{Bounds, Coord, Padding, Position};
 use crate::kurbo::{
-    Affine, BezPath, Join, Line as Segment, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point,
-    Rect, Stroke, StrokeCtx,
+    Affine, BezPath, CubicBez, Join, Line as Segment, ParamCurve, ParamCurveArclen,
+    ParamCurveExtrema, PathEl, PathSeg, Point, QuadBez, Rect, Stroke, StrokeCtx,
 };
 use crate::peniko::Fill;
 #[cfg(not(feature = "std"))]
 use crate::peniko::kurbo::common::FloatFuncs as _;
+use alloc::collections::BinaryHeap;
 use alloc::vec;
 use alloc::vec::Vec;
 use vello_common::clip::{ClipRef, ClipShape, PathDataRef};
@@ -43,6 +44,8 @@ use vello_common::geometry::RectU16;
 use vello_common::strip::{StripFillSegment, visit_strip_fill_segments};
 use vello_common::strip_generator::{StripGenerator, StripStorage};
 use vello_common::tile::{MAX_LINES_PER_PATH, Tile};
+use vello_common::util::strip_bbox;
+use vello_common::viewport::ViewportState;
 
 /// The side of the square frames paths are flattened in, which windows draw.
 const FRAME: i64 = WINDOW_SIZE;
@@ -65,16 +68,19 @@ const _: () = assert!(
 /// Something a filter layer draws or clips with, in root target coordinates.
 #[derive(Clone, Copy, Debug)]
 enum Item<'a> {
-    Rect(Rect),
+    /// A rectangle, mapped by the transform if it has one.
+    Rect(Rect, Option<Affine>),
     Fill {
         path: &'a BezPath,
         fill_rule: Fill,
         transform: Affine,
+        aliasing_threshold: Option<u8>,
     },
     Stroke {
         path: &'a BezPath,
         stroke: &'a Stroke,
         transform: Affine,
+        aliasing_threshold: Option<u8>,
     },
 }
 
@@ -86,23 +92,29 @@ impl<'a> Item<'a> {
                 path,
                 fill_rule,
                 transform,
+                aliasing_threshold,
                 ..
             } => Some(Self::Fill {
                 path,
                 fill_rule: *fill_rule,
                 transform: *transform,
+                aliasing_threshold: *aliasing_threshold,
             }),
             Command::StrokePath {
                 path,
                 stroke,
                 transform,
+                aliasing_threshold,
                 ..
             } => Some(Self::Stroke {
                 path,
                 stroke,
                 transform: *transform,
+                aliasing_threshold: *aliasing_threshold,
             }),
-            Command::FillRect { rect, .. } => Some(Self::Rect(*rect)),
+            Command::FillRect {
+                rect, transform, ..
+            } => Some(Self::Rect(*rect, Some(*transform))),
             _ => None,
         }
     }
@@ -113,13 +125,14 @@ impl<'a> Item<'a> {
                 path,
                 fill_rule,
                 transform,
-                ..
+                aliasing_threshold,
             } => Self::Fill {
                 path,
                 fill_rule: *fill_rule,
                 transform: *transform,
+                aliasing_threshold: *aliasing_threshold,
             },
-            Clip::Rect(rect) => Self::Rect(*rect),
+            Clip::Rect(rect) => Self::Rect(*rect, None),
         }
     }
 
@@ -129,13 +142,37 @@ impl<'a> Item<'a> {
             path,
             fill_rule: layer.fill_rule,
             transform: layer.clip_transform,
+            aliasing_threshold: layer.aliasing_threshold,
         })
     }
 
     fn fill_rule(&self) -> Fill {
         match self {
             Self::Fill { fill_rule, .. } => *fill_rule,
-            Self::Rect(_) | Self::Stroke { .. } => Fill::NonZero,
+            Self::Rect(..) | Self::Stroke { .. } => Fill::NonZero,
+        }
+    }
+
+    /// Return the rectangle in root target coordinates, if the item is one.
+    fn device_rect(&self) -> Option<Rect> {
+        match self {
+            Self::Rect(rect, transform) => {
+                Some(transform.map_or(*rect, |transform| transform.transform_rect_bbox(*rect)))
+            }
+            Self::Fill { .. } | Self::Stroke { .. } => None,
+        }
+    }
+
+    /// Return the rectangle in the frame `to_frame` maps root target
+    /// coordinates to, mapped as the recorder maps it, if the item is one.
+    fn frame_rect(&self, to_frame: Affine) -> Option<Rect> {
+        match self {
+            Self::Rect(rect, transform) => Some(
+                transform
+                    .map_or(to_frame, |transform| to_frame * transform)
+                    .transform_rect_bbox(*rect),
+            ),
+            Self::Fill { .. } | Self::Stroke { .. } => None,
         }
     }
 
@@ -154,7 +191,7 @@ impl<'a> Item<'a> {
                 let [a, b, c, d, _, _] = transform.as_coeffs();
                 miter * stroke.width.abs() / 2.0 * (a.abs() + b.abs() + c.abs() + d.abs())
             }
-            Self::Rect(_) | Self::Fill { .. } => 0.0,
+            Self::Rect(..) | Self::Fill { .. } => 0.0,
         }
     }
 
@@ -162,7 +199,7 @@ impl<'a> Item<'a> {
     /// item is flattened to.
     fn device_bounds(&self) -> Rect {
         let (path, transform) = match self {
-            Self::Rect(rect) => return rect.abs(),
+            Self::Rect(..) => return self.device_rect().unwrap().abs(),
             Self::Fill {
                 path, transform, ..
             }
@@ -177,11 +214,13 @@ impl<'a> Item<'a> {
             .inflate(reach, reach)
     }
 
-    /// Return the segments of the path in root target coordinates, with the
-    /// lines that close each subpath of a fill, as the flattener walks them.
-    fn device_segments(&self) -> Vec<PathSeg> {
+    /// Return the segments of the path in path coordinates, with the lines
+    /// that close each subpath of a fill, as the flattener walks them, each
+    /// with whether it starts a subpath, and the transform to root target
+    /// coordinates.
+    fn segments(&self) -> (Vec<(PathSeg, bool)>, Affine) {
         let (path, transform, closes) = match self {
-            Self::Rect(_) => return Vec::new(),
+            Self::Rect(..) => return (Vec::new(), Affine::IDENTITY),
             Self::Fill {
                 path, transform, ..
             } => (path, transform, true),
@@ -190,51 +229,71 @@ impl<'a> Item<'a> {
             } => (path, transform, false),
         };
         let mut segments = Vec::new();
-        let mut elements = path.iter().map(|element| *transform * element);
+        let mut elements = path.iter();
         let Some(PathEl::MoveTo(first)) = elements.next() else {
-            return segments;
+            return (segments, *transform);
         };
-        let (mut start, mut last) = (first, first);
-        let close = |segments: &mut Vec<PathSeg>, last: Point, start: Point| {
-            if closes && last != start {
-                segments.push(PathSeg::Line(Segment::new(last, start)));
-            }
+        let (mut start, mut last, mut starts) = (first, first, true);
+        let push = |segments: &mut Vec<(PathSeg, bool)>, starts: &mut bool, segment: PathSeg| {
+            segments.push((segment, core::mem::take(starts)));
         };
         for element in elements {
             match element {
                 PathEl::MoveTo(point) => {
-                    close(&mut segments, last, start);
+                    if closes && last != start {
+                        push(
+                            &mut segments,
+                            &mut starts,
+                            PathSeg::Line(Segment::new(last, start)),
+                        );
+                    }
                     (start, last) = (point, point);
+                    starts = true;
                 }
                 PathEl::LineTo(point) => {
-                    segments.push(PathSeg::Line(Segment::new(last, point)));
+                    push(
+                        &mut segments,
+                        &mut starts,
+                        PathSeg::Line(Segment::new(last, point)),
+                    );
                     last = point;
                 }
                 PathEl::QuadTo(control, point) => {
-                    segments.push(PathSeg::Quad(crate::kurbo::QuadBez::new(
-                        last, control, point,
-                    )));
+                    push(
+                        &mut segments,
+                        &mut starts,
+                        PathSeg::Quad(QuadBez::new(last, control, point)),
+                    );
                     last = point;
                 }
                 PathEl::CurveTo(first_control, second_control, point) => {
-                    segments.push(PathSeg::Cubic(crate::kurbo::CubicBez::new(
-                        last,
-                        first_control,
-                        second_control,
-                        point,
-                    )));
+                    push(
+                        &mut segments,
+                        &mut starts,
+                        PathSeg::Cubic(CubicBez::new(last, first_control, second_control, point)),
+                    );
                     last = point;
                 }
                 PathEl::ClosePath => {
                     if last != start {
-                        segments.push(PathSeg::Line(Segment::new(last, start)));
+                        push(
+                            &mut segments,
+                            &mut starts,
+                            PathSeg::Line(Segment::new(last, start)),
+                        );
                     }
                     last = start;
                 }
             }
         }
-        close(&mut segments, last, start);
-        segments
+        if closes && last != start {
+            push(
+                &mut segments,
+                &mut starts,
+                PathSeg::Line(Segment::new(last, start)),
+            );
+        }
+        (segments, *transform)
     }
 }
 
@@ -569,11 +628,154 @@ enum Cover {
     Paths(Bounds),
 }
 
+/// The viewport the recorder draws a filter layer in, see
+/// `ViewportState::push_root_viewport`, or the part of it at its origin that
+/// a strip generator addresses if it is larger, where what is drawn is found
+/// in the recorder's coordinates.
+///
+/// What lies inside it a tile away from its edges is found from its geometry
+/// there; anything else, which the recorder cuts at its edges, and what clip
+/// paths cut, is drawn as the recorder draws it, under its clips, which
+/// holds memory that follows the size of the viewport rather than the view.
+struct Home {
+    origin: Position,
+    /// The width and height of the viewport.
+    size: (u16, u16),
+    /// The tiles of the viewport, outside of which nothing is drawn in it.
+    tiles: Bounds,
+    /// The tiles a tile away from its edges.
+    inside: Bounds,
+    to_frame: Affine,
+    /// The recorder's state, once something is drawn as it draws it.
+    recorder: Option<(ViewportState, StripStorage)>,
+}
+
+impl Home {
+    fn new(viewport: &Bounds) -> Option<Self> {
+        if viewport.is_empty() {
+            return None;
+        }
+        let side = |length: Coord| {
+            length
+                .to_i64()
+                .and_then(|length| u16::try_from(length).ok())
+                .unwrap_or(FRAME as u16)
+        };
+        let size = (side(viewport.width()), side(viewport.height()));
+        let origin = viewport.origin();
+        let tiles = Bounds::new(
+            origin.0.clone(),
+            origin.1.clone(),
+            &origin.0 + i64::from(size.0),
+            &origin.1 + i64::from(size.1),
+        )
+        .snap_to_tiles();
+        let inside = Bounds::new(
+            &tiles.x0 + TILE,
+            &tiles.y0 + TILE,
+            &tiles.x1 - TILE,
+            &tiles.y1 - TILE,
+        );
+        Some(Self {
+            to_frame: Affine::translate((-origin.0.to_f64(), -origin.1.to_f64())),
+            origin,
+            size,
+            tiles,
+            inside,
+            recorder: None,
+        })
+    }
+
+    /// Return the recorder's state, with `clips` pushed if it is new.
+    fn recorder(&mut self, level: Level, clips: &[&Clip]) -> &mut (ViewportState, StripStorage) {
+        if self.recorder.is_none() {
+            let state = ViewportState::new(self.size.0, self.size.1, level);
+            self.recorder = Some((state, StripStorage::default()));
+            for clip in clips {
+                self.push_clip(clip);
+            }
+        }
+        self.recorder.as_mut().unwrap()
+    }
+
+    /// Push `clip` as `ClipState::push_clip_path` and `push_clip_rect` push
+    /// it, if the recorder's state is kept, and return the bounds of its
+    /// strips, which are cut to the clips under it.
+    fn push_clip(&mut self, clip: &Clip) -> Option<Bounds> {
+        let (state, _) = self.recorder.as_mut()?;
+        match clip {
+            Clip::Path {
+                path,
+                fill_rule,
+                transform,
+                aliasing_threshold,
+            } => state.push_clip_path(
+                path,
+                *fill_rule,
+                self.to_frame * *transform,
+                *aliasing_threshold,
+            ),
+            Clip::Rect(rect) => state.push_clip_rect(&self.to_frame.transform_rect_bbox(*rect)),
+        }
+        let bbox = state.clip().map_or(RectU16::ZERO, |clip| clip.path.bbox);
+        Some(Bounds::of_rect(bbox, &self.origin))
+    }
+
+    fn pop_clip(&mut self) {
+        if let Some((state, _)) = &mut self.recorder {
+            state.pop_clip();
+        }
+    }
+
+    /// Return the bounds of the strips `item` draws under `clips`, as
+    /// `SingleThreadedDispatcher::fill_path`, `stroke_path`, `fill_rect_fast`
+    /// and `layer_clip` draw it.
+    fn draw(&mut self, level: Level, clips: &[&Clip], item: &Item<'_>) -> Bounds {
+        let to_frame = self.to_frame;
+        let (state, storage) = self.recorder(level, clips);
+        state.with_generator_and_clip(|generator, clip| match *item {
+            Item::Rect(..) => {
+                let rect = item.frame_rect(to_frame).unwrap();
+                generator.generate_filled_rect_fast(&rect, storage, clip);
+            }
+            Item::Fill {
+                path,
+                fill_rule,
+                transform,
+                aliasing_threshold,
+            } => generator.generate_filled_path(
+                path,
+                fill_rule,
+                to_frame * transform,
+                aliasing_threshold,
+                storage,
+                clip.map(|clip| clip.path),
+            ),
+            Item::Stroke {
+                path,
+                stroke,
+                transform,
+                aliasing_threshold,
+            } => generator.generate_stroked_path(
+                path,
+                stroke,
+                to_frame * transform,
+                aliasing_threshold,
+                storage,
+                clip.map(|clip| clip.path),
+            ),
+        });
+        strip_bbox(&storage.strips)
+            .map_or(Bounds::EMPTY, |bbox| Bounds::of_rect(bbox, &self.origin))
+    }
+}
+
 /// Finds the bounds of the strips the commands of a filter layer draw.
 pub(super) struct Extents<'a> {
     level: Level,
     /// The viewport that bounds commands drawing without bounds, see `Node`.
     viewport: &'a Bounds,
+    home: Option<Home>,
     lines: Vec<Line>,
     flatten: FlattenCtx,
     stroke: StrokeCtx,
@@ -584,6 +786,7 @@ impl<'a> Extents<'a> {
         Self {
             level,
             viewport,
+            home: Home::new(viewport),
             lines: Vec::new(),
             flatten: FlattenCtx::default(),
             stroke: StrokeCtx::default(),
@@ -630,6 +833,9 @@ impl<'a> Extents<'a> {
                 Command::PopClip => {
                     if clips.pop().is_some() {
                         covers.pop();
+                        if let Some(home) = &mut self.home {
+                            home.pop_clip();
+                        }
                     }
                 }
                 Command::PushLayer(pushed) => {
@@ -653,24 +859,40 @@ impl<'a> Extents<'a> {
         open.swap_remove(0).0
     }
 
-    /// Return what the clips cover once `clip` is pushed onto `clips`, which
-    /// cover the last of `covers`, see `ClipContext::push_clip_rect`.
+    /// Push `clip` onto `clips`, which cover the last of `covers`, and return
+    /// what the clips cover then, see `ClipContext::push_clip_rect`.
     fn push_clip(&mut self, covers: &[Cover], clips: &[&Clip], clip: &Clip) -> Cover {
         let item = Item::of_clip(clip);
-        match (covers.last().unwrap(), clip) {
+        let cover = match (covers.last().unwrap(), clip) {
             (Cover::All, Clip::Rect(rect)) => Cover::Rect(self.unbounded_cut(rect.abs())),
             (Cover::Rect(clip), Clip::Rect(rect)) => Cover::Rect(rect.abs().intersect(*clip)),
             (Cover::Tiles(tiles), Clip::Rect(rect)) => {
                 let rect = rect.abs().intersect(to_rect(tiles));
                 Cover::Tiles(self.rect_tiles(rect).intersect(tiles))
             }
-            // A rectangle covers every tile its lines cross.
             (Cover::All | Cover::Rect(_) | Cover::Tiles(_), Clip::Path { .. })
                 if is_axis_aligned_rect(&item) =>
             {
-                Cover::Tiles(self.extent(&item, covers, clips))
+                Cover::Tiles(self.outside(&item, covers, clips))
             }
-            _ => Cover::Paths(self.extent(&item, covers, clips)),
+            _ => Cover::Paths(self.outside(&item, covers, clips)),
+        };
+        let drawn = match self.home.as_mut().and_then(|home| home.push_clip(clip)) {
+            Some(drawn) => drawn,
+            None => {
+                let drawn = self.home_extent(&item, covers, clips);
+                // The recorder's state is kept from the first item drawn as
+                // it draws it, the clips under this one pushed.
+                self.home
+                    .as_mut()
+                    .and_then(|home| home.push_clip(clip))
+                    .unwrap_or(drawn)
+            }
+        };
+        match cover {
+            Cover::Tiles(bounds) => Cover::Tiles(bounds.union(&drawn)),
+            Cover::Paths(bounds) => Cover::Paths(bounds.union(&drawn)),
+            Cover::All | Cover::Rect(_) => cover,
         }
     }
 
@@ -700,23 +922,133 @@ impl<'a> Extents<'a> {
 
     /// Return the bounds of the strips `item` draws under `clips`, which
     /// cover the last of `covers`, the first of which is that of no clip and
-    /// each next that of one more of `clips`.
+    /// each next that of one more of `clips`: in the recorder's viewport as
+    /// the recorder draws it, and outside of it from its geometry.
     fn extent(&mut self, item: &Item<'_>, covers: &[Cover], clips: &[&Clip]) -> Bounds {
+        let drawn = self.home_extent(item, covers, clips);
+        drawn.union(&self.outside(item, covers, clips))
+    }
+
+    /// Return the bounds of the strips `item` draws under `clips` in the
+    /// recorder's viewport, see [`Home`].
+    fn home_extent(&mut self, item: &Item<'_>, covers: &[Cover], clips: &[&Clip]) -> Bounds {
+        let Some(reach) = self.reach(item, covers) else {
+            return Bounds::EMPTY;
+        };
+        let level = self.level;
+        let Some(home) = &mut self.home else {
+            return Bounds::EMPTY;
+        };
+        if reach.intersect(&home.tiles).is_empty() {
+            return Bounds::EMPTY;
+        }
+        let cover = covers.last().unwrap();
+        if !home.inside.contains(&reach) || matches!(cover, Cover::Paths(_)) {
+            return home.draw(level, clips, item);
+        }
+        let (origin, to_frame, size) = (home.origin.clone(), home.to_frame, home.size);
+        // The clips' strips in the viewport.
+        let cull = self
+            .clip_bounds(cover)
+            .map(|cull| cull.intersect(&self.home.as_ref().unwrap().tiles));
+        if let Some(rect) = item.frame_rect(to_frame) {
+            // As `StripGenerator::generate_filled_rect_fast` cuts it.
+            let viewport = Rect::new(0.0, 0.0, f64::from(size.0), f64::from(size.1));
+            let rect = rect.abs().intersect(viewport);
+            let rect = match cover {
+                Cover::All => rect,
+                Cover::Rect(clip) => rect.intersect(to_frame.transform_rect_bbox(*clip)),
+                Cover::Tiles(_) | Cover::Paths(_) => {
+                    let cull = cull.as_ref().unwrap();
+                    rect.intersect(to_frame.transform_rect_bbox(to_rect(cull)))
+                }
+            };
+            let tiles = frame_rect_tiles(rect, &origin);
+            return match cull {
+                Some(cull) if !matches!(cover, Cover::Rect(_)) => tiles.intersect(&cull),
+                _ => tiles,
+            };
+        }
+        let cut = match cover {
+            Cover::All => None,
+            Cover::Rect(_) | Cover::Tiles(_) | Cover::Paths(_) => cull.clone(),
+        };
+        if cut.as_ref().is_some_and(Bounds::is_empty) {
+            return Bounds::EMPTY;
+        }
+        self.flatten(item, &origin, cull.as_ref());
+        let area = cut
+            .as_ref()
+            .map_or(reach.clone(), |cut| reach.intersect(cut));
+        let Some(region) = Tiles::of_bounds(&area, &origin) else {
+            return Bounds::EMPTY;
+        };
+        let cut = cut.and_then(|cut| Tiles::of_bounds(&cut, &origin));
+        frame_tiles(&self.lines, region, cut, item.fill_rule())
+            .map_or(Bounds::EMPTY, |tiles| tiles.to_bounds(&origin))
+    }
+
+    /// Return bounds holding the tiles `item` can cover under clips that
+    /// cover the last of `covers`, from its geometry, or `None` if it covers
+    /// none.
+    fn reach(&self, item: &Item<'_>, covers: &[Cover]) -> Option<Bounds> {
+        let cull = self.clip_bounds(covers.last().unwrap());
+        let reach = match item.device_rect() {
+            Some(rect) => Bounds::covering(self.unbounded_cut(rect.abs())),
+            None => Some(Bounds::covering(item.device_bounds()).map_or_else(
+                || self.viewport.clone(),
+                |bounds| culled(bounds, cull.as_ref()),
+            )),
+        };
+        // A rectangle covers the tile holding its right and bottom edges.
+        reach.map(|reach| reach.expand(&Padding::uniform(TILE.into())).snap_to_tiles())
+    }
+
+    /// Return the bounds of the strips `item` draws under `clips` outside the
+    /// recorder's viewport, see [`Self::extent`].
+    fn outside(&mut self, item: &Item<'_>, covers: &[Cover], clips: &[&Clip]) -> Bounds {
+        let Some(reach) = self.reach(item, covers) else {
+            return Bounds::EMPTY;
+        };
+        let pieces = match &self.home {
+            Some(home) => outside_of(&reach, &home.tiles),
+            None => vec![reach],
+        };
+        pieces.iter().fold(Bounds::EMPTY, |found, piece| {
+            found.union(&self.extent_in(item, covers, clips, piece))
+        })
+    }
+
+    /// Return the bounds of the strips `item` draws under `clips` inside
+    /// `piece`, from its geometry, see [`Self::extent`].
+    fn extent_in(
+        &mut self,
+        item: &Item<'_>,
+        covers: &[Cover],
+        clips: &[&Clip],
+        piece: &Bounds,
+    ) -> Bounds {
         let cover = covers.last().unwrap();
         let cull = self.clip_bounds(cover);
-        match (item, cover) {
-            (Item::Rect(rect), Cover::All) => self.rect_tiles(self.unbounded_cut(rect.abs())),
-            (Item::Rect(rect), Cover::Rect(clip)) => self.rect_tiles(rect.abs().intersect(*clip)),
-            (Item::Rect(rect), Cover::Tiles(tiles)) => self
+        match (item.device_rect(), cover) {
+            (Some(rect), Cover::All) => self
+                .rect_tiles(self.unbounded_cut(rect.abs()))
+                .intersect(piece),
+            (Some(rect), Cover::Rect(clip)) => self
+                .rect_tiles(rect.abs().intersect(*clip))
+                .intersect(piece),
+            (Some(rect), Cover::Tiles(tiles)) => self
                 .rect_tiles(rect.abs().intersect(to_rect(tiles)))
-                .intersect(tiles),
-            (_, Cover::All) => self.path(item, None, None),
-            (_, Cover::Rect(_) | Cover::Tiles(_)) => self.path(item, cull.as_ref(), cull.as_ref()),
+                .intersect(tiles)
+                .intersect(piece),
+            (None, Cover::All) => self.path(item, Some(piece), None),
+            (None, Cover::Rect(_) | Cover::Tiles(_)) => {
+                let cut = cull.as_ref().unwrap().intersect(piece);
+                self.path(item, Some(&cut), cull.as_ref())
+            }
             (_, Cover::Paths(bounds)) => {
-                let area = self.covered(item, Some(bounds), cull.as_ref());
-                let mut found = Bounds::EMPTY;
-                self.search(item, covers, clips, area, &mut found);
-                found
+                let area = self.covered(item, Some(&bounds.intersect(piece)), cull.as_ref());
+                self.search(item, covers, clips, area)
             }
         }
     }
@@ -725,12 +1057,12 @@ impl<'a> Extents<'a> {
     /// tiles a clip covers, or anywhere if there is none, flattened with the
     /// culling of clips whose strips lie in `cull`.
     fn covered(&mut self, item: &Item<'_>, cut: Option<&Bounds>, cull: Option<&Bounds>) -> Bounds {
-        match item {
-            Item::Rect(rect) => {
+        match item.device_rect() {
+            Some(rect) => {
                 let tiles = self.rect_tiles(self.unbounded_cut(rect.abs()));
                 cut.map_or(tiles.clone(), |cut| tiles.intersect(cut))
             }
-            _ => self.path(item, cut, cull),
+            None => self.path(item, cut, cull),
         }
     }
 
@@ -782,6 +1114,7 @@ impl<'a> Extents<'a> {
         let Some(bounds) = Bounds::covering(device) else {
             return self.unbounded_path(item, cut, cull);
         };
+        let bounds = culled(bounds, cull);
         let area = cut.map_or(bounds.clone(), |cut| bounds.intersect(cut));
         if area.is_empty() {
             return Bounds::EMPTY;
@@ -837,6 +1170,7 @@ impl<'a> Extents<'a> {
                 path,
                 stroke,
                 transform,
+                ..
             } => flatten::stroke(
                 level,
                 path.iter(),
@@ -847,7 +1181,7 @@ impl<'a> Extents<'a> {
                 &mut self.stroke,
                 cull,
             ),
-            Item::Rect(_) => unreachable!("rectangles are not flattened"),
+            Item::Rect(..) => unreachable!("rectangles are not flattened"),
         }
         self.lines.truncate(MAX_LINES_PER_PATH as usize);
     }
@@ -879,11 +1213,15 @@ impl<'a> Extents<'a> {
     ///
     /// The tiles reaching furthest on a side are those of the lines near the
     /// points of the path that reach furthest there inside `area`: where its
-    /// segments do, where they cross the edges of `area`, and the corners of
-    /// `cut`, which a fill can cover. From the furthest, the path is flattened
-    /// in a frame around each point not yet in one, with that side of the
-    /// frame beyond the point by a stroke's reach, until no point is left
-    /// that reaches further than the tiles found.
+    /// segments do, where they cross the edges of `area`, the corners of
+    /// `cut`, which a fill can cover, and where what lies left of the clips'
+    /// strips is drawn along their left edge, see `fill_clip`, the points
+    /// left of it moved onto it. On a dashed stroke, where such a point
+    /// lies in a gap, the drawn point reaching furthest on its side of it is
+    /// where the dashes before and after it end and start. From the furthest,
+    /// the path is flattened in a frame around each point not yet in one,
+    /// with that side of the frame beyond the point by a stroke's reach,
+    /// until no point is left that reaches further than the tiles found.
     fn far_path(
         &mut self,
         item: &Item<'_>,
@@ -900,30 +1238,82 @@ impl<'a> Extents<'a> {
             Point::new(limits.x0, limits.y1),
             Point::new(limits.x1, limits.y1),
         ];
-        let edges = [
+        let cull_rect = cull.map(to_rect);
+        let mut edges = vec![
             Segment::new(corners[0], corners[1]),
             Segment::new(corners[2], corners[3]),
             Segment::new(corners[0], corners[2]),
             Segment::new(corners[1], corners[3]),
         ];
+        if let Some(cull) = cull_rect {
+            edges.push(Segment::new(
+                Point::new(cull.x0, reached.y0),
+                Point::new(cull.x0, reached.y1),
+            ));
+        }
+        let dashes = match item {
+            Item::Stroke { stroke, .. } => Dashes::new(stroke),
+            Item::Rect(..) | Item::Fill { .. } => None,
+        };
+        let (segments, transform) = item.segments();
         let mut points: Vec<Point> = Vec::new();
-        for segment in item.device_segments() {
-            if !overlap(segment.bounding_box(), reached) {
-                continue;
+        // How far along its subpath the segment starts, for dashes.
+        let mut along = 0.0;
+        for (segment, starts) in segments {
+            if starts {
+                along = 0.0;
             }
-            let ends = [0.0, 1.0].into_iter().chain(segment.extrema());
-            points.extend(
-                ends.map(|t| segment.eval(t))
-                    .filter(|point| reached.contains(*point)),
-            );
-            for edge in &edges {
-                points.extend(
-                    segment
-                        .intersect_line(*edge)
-                        .iter()
-                        .map(|crossing| edge.eval(crossing.line_t)),
-                );
+            let length = dashes
+                .as_ref()
+                .map_or(0.0, |_| segment.arclen(DASH_ACCURACY));
+            let device = transform * segment;
+            if overlap(device.bounding_box(), reached) {
+                // Each parameter, with the point on an edge of `area` it
+                // crosses there.
+                let mut ends: Vec<(f64, Option<Point>)> = [0.0, 1.0]
+                    .into_iter()
+                    .chain(device.extrema())
+                    .map(|t| (t, None))
+                    .collect();
+                for edge in &edges {
+                    ends.extend(
+                        device
+                            .intersect_line(*edge)
+                            .iter()
+                            .map(|crossing| (crossing.segment_t, Some(edge.eval(crossing.line_t)))),
+                    );
+                }
+                for (t, crossing) in ends {
+                    match crossing {
+                        Some(point) => points.push(point),
+                        None => {
+                            let point = device.eval(t);
+                            points.extend(Some(point).filter(|point| reached.contains(*point)));
+                            if let Some(cull) = cull_rect
+                                && point.x < cull.x0
+                            {
+                                let moved = Point::new(cull.x0, point.y.clamp(cull.y0, cull.y1));
+                                points.extend(Some(moved).filter(|point| reached.contains(*point)));
+                            }
+                        }
+                    }
+                    let Some(dashes) = &dashes else {
+                        continue;
+                    };
+                    let at = along + segment.subsegment(0.0..t).arclen(DASH_ACCURACY);
+                    let Some((before, after)) = dashes.around(at) else {
+                        continue;
+                    };
+                    for stop in [before, after] {
+                        if (along..=along + length).contains(&stop) {
+                            let point =
+                                device.eval(segment.inv_arclen(stop - along, DASH_ACCURACY));
+                            points.extend(Some(point).filter(|point| reached.contains(*point)));
+                        }
+                    }
+                }
             }
+            along += length;
         }
         if cut.is_some() {
             points.extend(corners);
@@ -991,9 +1381,10 @@ impl<'a> Extents<'a> {
         match found {
             [Some(x0), Some(y0), Some(x1), Some(y1)] => Bounds::new(x0, y0, -x1, -y1),
             [None, None, None, None] => Bounds::EMPTY,
-            // Not reached by geometry the flattener draws whole near the
-            // points reaching furthest; a dashed stroke with gaps longer than
-            // a frame there can. The side then takes the bounds of the area.
+            // Reached only where frames at different origins round a dash
+            // differently, so that the frame around the point reaching
+            // furthest draws nothing; the side then takes the bounds of the
+            // area.
             [x0, y0, x1, y1] => Bounds::new(
                 x0.unwrap_or_else(|| area.x0.clone()),
                 y0.unwrap_or_else(|| area.y0.clone()),
@@ -1003,57 +1394,103 @@ impl<'a> Extents<'a> {
         }
     }
 
-    /// Add to `found` the bounds of the strips `item` draws in `area` under
-    /// `clips`, of which some are clip paths of any shape, and which cover
-    /// the last of `covers`, see [`Self::extent`].
+    /// Return the bounds of the strips `item` draws in `area` under `clips`,
+    /// of which some are clip paths of any shape, and which cover the last
+    /// of `covers`, see [`Self::extent`].
     ///
-    /// `area` shrinks to where `item` and each clip cover some tile, which
-    /// is exact for each of them, until it no longer changes. Inside a
-    /// frame, the item is drawn under the clips; a larger area is halved.
-    /// Where the edges of the item and a clip run close together over many
-    /// frames, every frame along them is drawn.
+    /// For each side in turn, the parts of `area` are taken from the one
+    /// reaching furthest there, until none left reaches further than what is
+    /// found. A part shrinks to where `item` and each clip cover some tile,
+    /// which is exact for each of them, until it no longer changes; a part
+    /// of at most [`DRAWN`] pixels a side is then drawn under the clips, and
+    /// a larger one is halved. Where the item and the clips cover tiles
+    /// together along a long run, the parts reaching furthest are found by
+    /// halving it. Where their edges run within a tile or two of each other
+    /// along a run without covering a tile together, which only drawing
+    /// tells, every part along it that reaches further than what is found is
+    /// drawn.
     fn search(
         &mut self,
         item: &Item<'_>,
         covers: &[Cover],
         clips: &[&Clip],
-        mut area: Bounds,
-        found: &mut Bounds,
-    ) {
+        area: Bounds,
+    ) -> Bounds {
         let cull = self.clip_bounds(covers.last().unwrap());
+        let mut found = Bounds::EMPTY;
+        let mut drawn: Vec<Bounds> = Vec::new();
+        for side in 0..4 {
+            // How far a part reaches on the side, larger the further.
+            let reach = |part: &Bounds| match side {
+                0 => -&part.x0,
+                1 => -&part.y0,
+                2 => part.x1.clone(),
+                _ => part.y1.clone(),
+            };
+            let beyond =
+                |part: &Bounds, found: &Bounds| found.is_empty() || reach(part) > reach(found);
+            let mut parts = vec![area.clone()];
+            let mut queue = BinaryHeap::from([(reach(&area), 0)]);
+            // Whether every part was drawn or found to hold no tiles drawn.
+            let mut complete = true;
+            while let Some((_, index)) = queue.pop() {
+                let part = core::mem::replace(&mut parts[index], Bounds::EMPTY);
+                if !beyond(&part, &found) {
+                    complete = false;
+                    break;
+                }
+                let part = self.shrink(item, covers, clips, cull.as_ref(), part);
+                if part.is_empty() || found.contains(&part) {
+                    continue;
+                }
+                if !beyond(&part, &found) {
+                    complete = false;
+                    continue;
+                }
+                if drawn_side(&part) <= DRAWN {
+                    if !drawn.iter().any(|drawn| drawn.contains(&part)) {
+                        found = found.union(&self.draw(item, covers, clips, &part));
+                        drawn.push(part);
+                    }
+                    continue;
+                }
+                for half in halves(&part) {
+                    queue.push((reach(&half), parts.len()));
+                    parts.push(half);
+                }
+            }
+            if complete {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Return `area` shrunk to where `item`, flattened with the culling of
+    /// clips whose strips lie in `cull`, and each of `clips`, which cover the
+    /// last of `covers`, cover some tile, until it no longer changes.
+    fn shrink(
+        &mut self,
+        item: &Item<'_>,
+        covers: &[Cover],
+        clips: &[&Clip],
+        cull: Option<&Bounds>,
+        mut area: Bounds,
+    ) -> Bounds {
         loop {
             let before = area.clone();
-            area = self.covered(item, Some(&area), cull.as_ref());
+            area = self.covered(item, Some(&area), cull);
             for (clip, cover) in clips.iter().zip(covers) {
                 if area.is_empty() {
-                    break;
+                    return area;
                 }
                 let cull = self.clip_bounds(cover);
                 area = self.covered(&Item::of_clip(clip), Some(&area), cull.as_ref());
             }
             if area.is_empty() || area == before {
-                break;
+                return area;
             }
         }
-        if area.is_empty() || found.contains(&area) {
-            return;
-        }
-        if fits(&area) {
-            *found = found.union(&self.draw(item, covers, clips, &area));
-            return;
-        }
-        let (mut low, mut high) = (area.clone(), area.clone());
-        if area.width() >= area.height() {
-            let middle = tile_floor(&(&area.x0 + &area.x1).shr(1));
-            low.x1 = middle.clone();
-            high.x0 = middle;
-        } else {
-            let middle = tile_floor(&(&area.y0 + &area.y1).shr(1));
-            low.y1 = middle.clone();
-            high.y0 = middle;
-        }
-        self.search(item, covers, clips, low, found);
-        self.search(item, covers, clips, high, found);
     }
 
     /// Return the bounds of the strips `item` draws in `area`, which a frame
@@ -1062,23 +1499,29 @@ impl<'a> Extents<'a> {
     /// strips of the clips under it in the whole target, which a window cut
     /// to `area` would not hold.
     fn draw(&self, item: &Item<'_>, covers: &[Cover], clips: &[&Clip], area: &Bounds) -> Bounds {
-        let origin = self.frame_at(area);
+        // A frame around `area` with a margin on every side, so that the
+        // strip generator is no larger: the tiler puts lines past its right
+        // edge in its last column.
+        let snapped = area.snap_to_tiles();
+        let origin = (&snapped.x0 - MARGIN, &snapped.y0 - MARGIN);
         let to_frame = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
         let side = |end: &Coord, start: &Coord| {
-            u16::try_from(((end - start).clamped_i64() + TILE - 1) / TILE * TILE).unwrap()
+            u16::try_from((end - start).clamped_i64() + MARGIN).unwrap()
         };
-        let mut generator = StripGenerator::new(
-            side(&area.x1, &origin.0),
-            side(&area.y1, &origin.1),
-            self.level,
-        );
+        let (width, height) = (side(&area.x1, &origin.0), side(&area.y1, &origin.1));
+        let mut generator = StripGenerator::new(width, height, self.level);
+        // `generate_filled_rect_fast` cuts a rectangle under a clip path only to
+        // the clip's bounds, which lie in the recorder's viewport but reach past
+        // the frame; past the frame, the clip covers nothing.
+        let in_frame =
+            |rect: Rect| rect.intersect(Rect::new(0.0, 0.0, width.into(), height.into()));
         let cull = |cover: &Cover| frame_cull(self.clip_bounds(cover).as_ref(), &origin);
         let mut clip: Option<(StripStorage, ClipShape)> = None;
         for (pushed, cover) in clips.iter().zip(covers) {
             let mut storage = StripStorage::default();
             let shape = match pushed {
                 Clip::Rect(rect) => generator.generate_filled_rect_fast(
-                    &to_frame.transform_rect_bbox(*rect),
+                    &in_frame(to_frame.transform_rect_bbox(*rect)),
                     &mut storage,
                     clip_ref(&clip, cull(cover)),
                 ),
@@ -1104,9 +1547,9 @@ impl<'a> Extents<'a> {
         let existing = clip_ref(&clip, cull(covers.last().unwrap()));
         let mut storage = StripStorage::default();
         match *item {
-            Item::Rect(rect) => {
+            Item::Rect(..) => {
                 generator.generate_filled_rect_fast(
-                    &to_frame.transform_rect_bbox(rect),
+                    &in_frame(item.frame_rect(to_frame).unwrap()),
                     &mut storage,
                     existing,
                 );
@@ -1115,11 +1558,12 @@ impl<'a> Extents<'a> {
                 path,
                 fill_rule,
                 transform,
+                aliasing_threshold,
             } => generator.generate_filled_path(
                 path,
                 fill_rule,
                 to_frame * transform,
-                None,
+                aliasing_threshold,
                 &mut storage,
                 existing.map(|clip| clip.path),
             ),
@@ -1127,11 +1571,12 @@ impl<'a> Extents<'a> {
                 path,
                 stroke,
                 transform,
+                aliasing_threshold,
             } => generator.generate_stroked_path(
                 path,
                 stroke,
                 to_frame * transform,
-                None,
+                aliasing_threshold,
                 &mut storage,
                 existing.map(|clip| clip.path),
             ),
@@ -1168,6 +1613,64 @@ impl<'a> Extents<'a> {
     }
 }
 
+/// The accuracy `dash::dash` measures dashes to; the points found from it
+/// only place frames, which hold a dash that ends a little elsewhere.
+const DASH_ACCURACY: f64 = 1e-6;
+
+/// The dash pattern of a stroke as `dash::dash` walks each subpath: entries
+/// drawn and skipped in turn, the first drawn, from `offset` into the period.
+struct Dashes<'a> {
+    entries: &'a [f64],
+    /// The entries in a period: odd patterns are walked twice, the second
+    /// time with what is drawn and skipped swapped.
+    count: usize,
+    period: f64,
+    offset: f64,
+}
+
+impl<'a> Dashes<'a> {
+    /// Return the dashes of `stroke`, unless it is drawn solid.
+    fn new(stroke: &'a Stroke) -> Option<Self> {
+        let entries = &stroke.dash_pattern[..];
+        if entries.is_empty() {
+            return None;
+        }
+        let sum: f64 = entries.iter().sum();
+        let (period, count) = if entries.len() % 2 == 1 {
+            (2.0 * sum, 2 * entries.len())
+        } else {
+            (sum, entries.len())
+        };
+        // Other patterns place no gap a point could lie in.
+        let valid = period.is_finite()
+            && period > 0.0
+            && entries.iter().all(|entry| *entry >= 0.0)
+            && stroke.dash_offset.is_finite();
+        valid.then(|| Self {
+            entries,
+            count,
+            period,
+            offset: stroke.dash_offset.rem_euclid(period),
+        })
+    }
+
+    /// Return where the dashes before and after `at`, a length along a
+    /// subpath, end and start, if `at` lies in a gap.
+    fn around(&self, at: f64) -> Option<(f64, f64)> {
+        let position = (self.offset + at).rem_euclid(self.period);
+        let mut start = 0.0;
+        for index in 0..self.count {
+            let end = start + self.entries[index % self.entries.len()];
+            if position < end || index == self.count - 1 {
+                return (index % 2 == 1)
+                    .then_some((at - (position - start), at + (end - position)));
+            }
+            start = end;
+        }
+        None
+    }
+}
+
 /// Return the clip whose strips are in `clip`, culling to `bbox`.
 fn clip_ref(clip: &Option<(StripStorage, ClipShape)>, bbox: RectU16) -> Option<ClipRef<'_>> {
     clip.as_ref().map(|(storage, shape)| ClipRef {
@@ -1179,6 +1682,109 @@ fn clip_ref(clip: &Option<(StripStorage, ClipShape)>, bbox: RectU16) -> Option<C
         },
         shape: *shape,
     })
+}
+
+/// Return the parts of `bounds` outside `hole`: the rows above and below
+/// it, and those beside it.
+fn outside_of(bounds: &Bounds, hole: &Bounds) -> Vec<Bounds> {
+    let hole = hole.intersect(bounds);
+    if hole.is_empty() {
+        return vec![bounds.clone()];
+    }
+    [
+        Bounds::new(
+            bounds.x0.clone(),
+            bounds.y0.clone(),
+            bounds.x1.clone(),
+            hole.y0.clone(),
+        ),
+        Bounds::new(
+            bounds.x0.clone(),
+            hole.y1.clone(),
+            bounds.x1.clone(),
+            bounds.y1.clone(),
+        ),
+        Bounds::new(
+            bounds.x0.clone(),
+            hole.y0.clone(),
+            hole.x0.clone(),
+            hole.y1.clone(),
+        ),
+        Bounds::new(
+            hole.x1.clone(),
+            hole.y0.clone(),
+            bounds.x1.clone(),
+            hole.y1.clone(),
+        ),
+    ]
+    .into_iter()
+    .filter(|piece| !piece.is_empty())
+    .collect()
+}
+
+/// Return the tiles `rect`, in the coordinates of the viewport at `origin`
+/// and cut to it, covers, as `vello_common::rect::render` covers it: from the
+/// tile holding its top left pixel to the one holding its right edge and its
+/// bottom pixel.
+fn frame_rect_tiles(rect: Rect, origin: &Position) -> Bounds {
+    let finite = [rect.x0, rect.y0, rect.x1, rect.y1]
+        .iter()
+        .all(|value| value.is_finite());
+    if !finite || rect.is_zero_area() {
+        return Bounds::EMPTY;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the recorder converts coordinates to `f32`"
+    )]
+    let pixel = |value: f64, round: fn(f32) -> f32| Coord::from(whole(round(value as f32)));
+    let (x0, y0) = (pixel(rect.x0, f32::floor), pixel(rect.y0, f32::floor));
+    let (x1, y1) = (pixel(rect.x1, f32::floor), pixel(rect.y1, f32::ceil));
+    Bounds::new(
+        &origin.0 + tile_floor(&x0),
+        &origin.1 + tile_floor(&y0),
+        &origin.0 + (tile_floor(&x1) + TILE),
+        &origin.1 - tile_floor(&-y1),
+    )
+}
+
+/// Return `bounds`, which hold the lines of a path, with the column of
+/// tiles along the left edge of `cull`, the bounds of the strips of the clips
+/// it is drawn under, where what lies left of it is drawn, see `fill_clip`.
+fn culled(bounds: Bounds, cull: Option<&Bounds>) -> Bounds {
+    match cull {
+        Some(cull) if !cull.is_empty() && bounds.x0 < cull.x0 => bounds.union(&Bounds::new(
+            cull.x0.clone(),
+            bounds.y0.clone(),
+            &cull.x0 + TILE,
+            bounds.y1.clone(),
+        )),
+        _ => bounds,
+    }
+}
+
+/// The longest side of the parts [`Extents::search`] draws, which bounds
+/// what drawing one costs.
+const DRAWN: i64 = 1024;
+
+/// Return the longer side of `part`.
+fn drawn_side(part: &Bounds) -> i64 {
+    part.width().max(part.height()).clamped_i64()
+}
+
+/// Return the halves of `area` across its longer side, split on a tile.
+fn halves(area: &Bounds) -> [Bounds; 2] {
+    let (mut low, mut high) = (area.clone(), area.clone());
+    if area.width() >= area.height() {
+        let middle = tile_floor(&(&area.x0 + &area.x1).shr(1));
+        low.x1 = middle.clone();
+        high.x0 = middle;
+    } else {
+        let middle = tile_floor(&(&area.y0 + &area.y1).shr(1));
+        low.y1 = middle.clone();
+        high.y0 = middle;
+    }
+    [low, high]
 }
 
 /// Return whether a frame holds `area` inside its margin.
@@ -1272,34 +1878,37 @@ fn overlap(a: Rect, b: Rect) -> bool {
     a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1
 }
 
-/// Return whether `item` is a path whose device lines outline an
-/// axis-aligned rectangle, which covers every tile its lines cross.
+/// Return whether `item` is a path that outlines an axis-aligned rectangle
+/// once, under a transform that keeps its sides axis-aligned: four lines,
+/// each joining the last, along one axis and then the other, back to where
+/// they start. Its winding is then one inside, which either fill rule
+/// fills, and its sides have equal coordinates in every frame, so it covers
+/// every tile its lines cross.
 fn is_axis_aligned_rect(item: &Item<'_>) -> bool {
-    let segments = item.device_segments();
-    let mut corners: Vec<Point> = Vec::with_capacity(4);
-    for segment in &segments {
-        let PathSeg::Line(line) = segment else {
-            return false;
-        };
-        if line.p0.x != line.p1.x && line.p0.y != line.p1.y {
-            return false;
-        }
-        if !corners.contains(&line.p0) {
-            corners.push(line.p0);
-        }
-        if corners.len() > 4 {
-            return false;
-        }
+    if !matches!(item, Item::Fill { .. }) {
+        return false;
     }
-    let xs = corners
+    let (segments, transform) = item.segments();
+    let [a, b, c, d, _, _] = transform.as_coeffs();
+    if !(b == 0.0 && c == 0.0 || a == 0.0 && d == 0.0) {
+        return false;
+    }
+    let lines: Vec<Segment> = segments
         .iter()
-        .filter(|corner| corner.x == corners[0].x)
-        .count();
-    let ys = corners
-        .iter()
-        .filter(|corner| corner.y == corners[0].y)
-        .count();
-    corners.len() == 4 && segments.len() == 4 && xs == 2 && ys == 2
+        .filter_map(|(segment, _)| match segment {
+            PathSeg::Line(line) => Some(*line),
+            PathSeg::Quad(_) | PathSeg::Cubic(_) => None,
+        })
+        .collect();
+    if lines.len() != 4 || segments.len() != 4 {
+        return false;
+    }
+    let along_x = |line: &Segment| line.p0.y == line.p1.y && line.p0.x != line.p1.x;
+    let along_y = |line: &Segment| line.p0.x == line.p1.x && line.p0.y != line.p1.y;
+    (0..4).all(|index| {
+        let (line, next) = (&lines[index], &lines[(index + 1) % 4]);
+        line.p1 == next.p0 && (along_x(line) && along_y(next) || along_y(line) && along_x(next))
+    })
 }
 
 /// Return `bounds` as a rectangle in `f64`, whose sides are not finite where

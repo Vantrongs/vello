@@ -348,6 +348,50 @@ fn blur_of_a_band_costs_the_same_however_long_it_is() {
     }
 }
 
+/// Blur, in a 64 by 64 view, a band reaching `band` pixels down from its top
+/// under a clip path reaching `clip` pixels down, whose sides lean by a pixel
+/// over that length, so that the band and the clip cover tiles together all
+/// along the shorter of them.
+fn blurred_band_under_a_leaning_clip(band: f64, clip: f64, edge_mode: EdgeMode) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
+        std_deviation: 4.0,
+        edge_mode,
+    }));
+    let mut path = BezPath::new();
+    path.move_to((20.0, 0.0));
+    path.line_to((40.0, 0.0));
+    path.line_to((41.0, clip));
+    path.line_to((21.0, clip));
+    path.close_path();
+    context.push_clip_path(&path);
+    context.set_paint(BLUE);
+    context.fill_rect(&Rect::new(20.0, 0.0, 42.0, band));
+    context.pop_clip();
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn blur_of_a_band_under_a_leaning_clip_costs_the_same_however_long_it_is() {
+    for edge_mode in [EdgeMode::None, EdgeMode::Duplicate] {
+        let (short, _) = measure(|| blurred_band_under_a_leaning_clip(4_096.0, 4_096.0, edge_mode));
+        for length in [262_144.0, 1_048_576.0, 16_777_216.0] {
+            let (usage, pixels) =
+                measure(|| blurred_band_under_a_leaning_clip(length, length, edge_mode));
+            // The view and the blur's reach see the same of a shorter band.
+            let expected = blurred_band_under_a_leaning_clip(4_096.0, length, edge_mode);
+            let case = format!("{edge_mode:?} at length {length}");
+            assert!(pixels == expected, "{case}");
+            assert!(
+                usage.peak <= short.peak + short.peak / 4
+                    && usage.total <= short.total + short.total / 4,
+                "{case}: {usage:?}, at 4096: {short:?}"
+            );
+        }
+    }
+}
+
 /// Blur, in a 64 by 64 view, a square and a path that only moves, from the
 /// origin to `distance` pixels down and right of it, and so draws nothing.
 fn blurred_with_moves(distance: f64, edge_mode: EdgeMode) -> Vec<u8> {
