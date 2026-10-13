@@ -684,6 +684,22 @@ pub(crate) struct FilterGraph {
     simd_level: Level,
 }
 
+/// The parts of the outputs per layer past which [`FilterGraph::plan`]
+/// stops finding the content inside boxes around where the view can depend
+/// on it.
+const BUDGET_PER_LAYER: usize = 64;
+
+/// Where [`FilterGraph::needed_sources`] follows the view into a child.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Through {
+    /// Inside the box where the child's output can have content.
+    Boxes,
+    /// As `Boxes`, with the parts of each source merged into one box.
+    Hulls,
+    /// Inside the content [`FilterGraph::contents`] found for the child.
+    Content,
+}
+
 /// A filter layer placed as the recorder places filter layers in a target
 /// large enough to hold all of its content, in root target coordinates.
 ///
@@ -877,8 +893,30 @@ impl FilterGraph {
     ///
     /// What a layer's needed output depends on in its source is followed into
     /// each child only where the child's output can have content, so a part
-    /// is counted only if some content can reach the view through it.
+    /// is counted only if some content can reach the view through it. Inside
+    /// the box where a child's output can have content, the copies of the
+    /// view that the filters above it make can fall in the gaps between the
+    /// copies of the content that those below it make, so the content is
+    /// found first, inside one box around where the view can depend on each
+    /// layer, and the view is followed only into it. Where that finds more
+    /// than [`BUDGET_PER_LAYER`] parts per layer, copies of the content fall
+    /// in the gaps between those of the view as well, and the view is
+    /// followed through the boxes instead; either way then counts parts for
+    /// combinations of copies that do not land in the view.
     fn plan(&mut self) {
+        let hulls = self.needed_sources(Through::Hulls);
+        let through = if self.contents(hulls, Some(BUDGET_PER_LAYER * self.nodes.len())) {
+            Through::Content
+        } else {
+            Through::Boxes
+        };
+        let sources = self.needed_sources(through);
+        self.contents(sources, None);
+    }
+
+    /// Find where the visible output depends on the output of each layer,
+    /// from the view down, and return where it depends on each source.
+    fn needed_sources(&mut self, through: Through) -> Vec<Regions> {
         let nodes = &mut self.nodes;
         let placement = nodes[0].pixmap.intersect(&self.view);
         nodes[0].needed = Regions::of(placement.intersect(&nodes[0].output_box));
@@ -891,18 +929,39 @@ impl FilterGraph {
                     source.insert(read.intersect(&node.source_box));
                 }
             }
+            if through == Through::Hulls {
+                source = Regions::of(
+                    source
+                        .iter()
+                        .fold(Bounds::EMPTY, |hull, region| hull.union(region)),
+                );
+            }
             for child in &self.layers[index].children {
                 let node = &nodes[child.layer];
                 let shown = node.pixmap.clip(child.clip).intersect(&node.output_box);
                 let mut needed = Regions::default();
                 for region in source.iter() {
-                    needed.insert(region.intersect(&shown));
+                    let region = region.intersect(&shown);
+                    needed.insert(match through {
+                        Through::Boxes | Through::Hulls => region,
+                        Through::Content => node.content.hull_within(&region),
+                    });
                 }
                 nodes[child.layer].needed = needed;
             }
             sources.push(source);
         }
-        for (index, needed_source) in sources.into_iter().enumerate().rev() {
+        sources
+    }
+
+    /// Find where the source and the output of each layer can have content
+    /// inside the parts of its source in `needed_sources`, from the children
+    /// up; return `false` once the parts of the outputs are more than
+    /// `budget`.
+    fn contents(&mut self, needed_sources: Vec<Regions>, budget: Option<usize>) -> bool {
+        let nodes = &mut self.nodes;
+        let mut count = 0;
+        for (index, needed_source) in needed_sources.into_iter().enumerate().rev() {
             let node = &nodes[index];
             let mut source = Regions::default();
             for region in needed_source.iter() {
@@ -966,12 +1025,17 @@ impl FilterGraph {
                     content.insert(region.clone());
                 }
             }
+            count += content.len();
+            if budget.is_some_and(|budget| count > budget) {
+                return false;
+            }
             let node = &mut nodes[index];
             node.source = source;
             node.blurred = blurred;
             node.filtered = filtered;
             node.content = content;
         }
+        true
     }
 
     /// Replay layer `index` into a window covering `area`, which starts on a

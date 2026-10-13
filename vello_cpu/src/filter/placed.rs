@@ -604,6 +604,10 @@ impl Regions {
         self.regions.iter()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.regions.len()
+    }
+
     /// Return the regions that overlap `bounds` or share an edge with it, in
     /// the order of [`Self::iter`].
     pub(crate) fn touching(&self, bounds: &Bounds) -> impl Iterator<Item = &Bounds> + '_ {

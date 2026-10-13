@@ -457,12 +457,17 @@ fn wide_blurs_match_the_blur_of_the_whole_pixmap() {
     }
 }
 
-/// Return the regions a graph keeps for a square shadowed `depth` times by
-/// drop shadows that each keep their source and move it by a distinct power
-/// of two times 128 pixels, alternately right and left, so that the content
-/// has `2^depth` copies, of which the one moved by every shadow lies in a 64
-/// by 64 view.
-fn nested_shadow_regions(depth: u32) -> usize {
+/// Return the regions each node of a graph keeps, from the outermost, for
+/// squares shadowed `depth` times by drop shadows that each keep their source
+/// and move it by `offset(level)` pixels, the outermost by `offset(depth - 1)`.
+/// The first square lies where the copy moved by `moved(depth)` lands at 16
+/// in a 64 by 64 view, the others where each of `far` says.
+fn shadow_regions(
+    depth: u32,
+    offset: impl Fn(u32) -> f32,
+    moved: impl Fn(u32) -> f64,
+    far: &[(f64, f64)],
+) -> Vec<usize> {
     use super::super::Dispatcher;
     use super::Recording;
     use crate::filter::placed::Bounds;
@@ -470,14 +475,6 @@ fn nested_shadow_regions(depth: u32) -> usize {
     use crate::peniko::{BlendMode, Fill};
     use vello_common::paint::{Paint, PremulColor};
 
-    let offset = |level: u32| {
-        let distance = 128.0 * 2_f32.powi(i32::try_from(level).unwrap());
-        if level.is_multiple_of(2) {
-            distance
-        } else {
-            -distance
-        }
-    };
     let shadow = |level: u32| {
         FilterData::new(
             Filter::from_primitive(FilterPrimitive::DropShadow {
@@ -508,18 +505,20 @@ fn nested_shadow_regions(depth: u32) -> usize {
             Some(shadow(level)),
         );
     }
-    let x = 16.0
-        - (0..depth)
-            .map(|level| f64::from(offset(level)))
-            .sum::<f64>();
-    recording.fill_rect_fast(
-        &Rect::new(x, 16.0, x + 1.0, 17.0),
+    let paint = || {
         Paint::Solid(PremulColor::from_alpha_color(AlphaColor::from_rgba8(
             0, 0, 255, 255,
-        ))),
-        BlendMode::default(),
-        None,
-    );
+        )))
+    };
+    let x = 16.0 - moved(depth);
+    for (x0, x1) in core::iter::once((x, x + 1.0)).chain(far.iter().copied()) {
+        recording.fill_rect_fast(
+            &Rect::new(x0, 16.0, x1, 17.0),
+            paint(),
+            BlendMode::default(),
+            None,
+        );
+    }
     for _ in 0..depth - 1 {
         recording.pop_layer();
     }
@@ -539,17 +538,165 @@ fn nested_shadow_regions(depth: u32) -> usize {
             .map(|regions| regions.iter().count())
             .sum::<usize>()
         })
-        .sum()
+        .collect()
+}
+
+/// A distinct power of two times 128 pixels for each level, alternately
+/// right and left.
+fn alternating(level: u32) -> f32 {
+    let distance = 128.0 * 2_f32.powi(i32::try_from(level).unwrap());
+    if level.is_multiple_of(2) {
+        distance
+    } else {
+        -distance
+    }
 }
 
 #[test]
 fn nested_shadows_keep_regions_only_for_copies_the_view_depends_on() {
-    let regions: Vec<usize> = [20, 24].into_iter().map(nested_shadow_regions).collect();
-    // Each layer keeps a few regions, however many copies its content has.
-    for (depth, regions) in [20, 24].into_iter().zip(&regions) {
+    // The square every shadow moves lands in the view; the content has
+    // `2^depth` copies.
+    let moved = |depth: u32| (0..depth).map(|level| f64::from(alternating(level))).sum();
+    for depth in [20, 24] {
+        // The outermost shadow moves furthest, or least.
+        let reversed = |level: u32| alternating(depth - 1 - level);
+        let moved_reversed = |depth: u32| (0..depth).map(|level| f64::from(reversed(level))).sum();
+        for regions in [
+            shadow_regions(depth, alternating, moved, &[]),
+            shadow_regions(depth, reversed, moved_reversed, &[]),
+        ] {
+            // Each layer keeps a few regions, however many copies its
+            // content has.
+            let total: usize = regions.iter().sum();
+            assert!(
+                total <= 8 * depth as usize,
+                "{depth} layers keep {total} regions: {regions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shadows_keep_no_regions_for_copies_between_far_apart_squares() {
+    // Every shadow moves right, so of the copies only the unmoved first
+    // square lands in the view. The second square lies left of every copy of
+    // the first, which the view depends on through the gap between them.
+    let right = |level: u32| 128.0 * 2_f32.powi(i32::try_from(level).unwrap());
+    for depth in [8, 12, 16, 20] {
+        let far = -128.0 * 2_f64.powi(i32::try_from(depth).unwrap());
+        let regions = shadow_regions(depth, right, |_| 0.0, &[(far, far + 32.0)]);
+        let total: usize = regions.iter().sum();
         assert!(
-            *regions <= 8 * depth,
-            "{depth} layers keep {regions} regions"
+            total <= 8 * depth as usize,
+            "{depth} layers keep {total} regions: {regions:?}"
         );
+    }
+}
+
+/// Return the pixels of a 64 by 64 view of squares, each given by its left
+/// and top edges and its side, in nested drop shadows of the same color
+/// that move them by `offsets`, from the outermost, and keep them, by
+/// painting each copy.
+fn shadowed_squares(squares: &[(f64, f64, f64)], offsets: &[(f64, f64)]) -> Vec<bool> {
+    let mut painted = vec![false; usize::from(VIEW) * usize::from(VIEW)];
+    for &(x, y, side) in squares {
+        for copy in 0..1_usize << offsets.len() {
+            let (mut x, mut y) = (x, y);
+            for (level, (dx, dy)) in offsets.iter().enumerate() {
+                if copy >> level & 1 == 1 {
+                    (x, y) = (x + dx, y + dy);
+                }
+            }
+            for row in 0..VIEW {
+                for column in 0..VIEW {
+                    let (px, py) = (f64::from(column), f64::from(row));
+                    if (x..x + side).contains(&px) && (y..y + side).contains(&py) {
+                        painted[usize::from(row) * usize::from(VIEW) + usize::from(column)] = true;
+                    }
+                }
+            }
+        }
+    }
+    painted
+}
+
+#[test]
+fn nested_shadows_of_separate_squares_paint_every_copy_in_the_view() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = |count: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % count
+    };
+    // Distances of each magnitude, so that copies fall in the gaps between
+    // others, either way.
+    let distance = |next: &mut dyn FnMut(u64) -> u64| {
+        let distance = (1_i64 << (2 + next(20))) + next(64) as i64 - 32;
+        (if next(2) == 0 { distance } else { -distance }) as f64
+    };
+    let color = AlphaColor::from_rgba8(0, 0, 255, 255);
+    for case in 0..300 {
+        let depth = 1 + next(6) as usize;
+        let offsets: Vec<(f64, f64)> = (0..depth)
+            .map(|_| {
+                if next(2) == 0 {
+                    (distance(&mut next), 0.0)
+                } else {
+                    (distance(&mut next), distance(&mut next))
+                }
+            })
+            .collect();
+        // Squares a copy of which lands in the view, and others anywhere.
+        let squares: Vec<(f64, f64, f64)> = (0..1 + next(3))
+            .map(|_| {
+                let side = 1.0 + next(24) as f64;
+                let (mut x, mut y) = (next(80) as f64 - 8.0, next(80) as f64 - 8.0);
+                if next(3) == 0 {
+                    (x, y) = (x + distance(&mut next), y + distance(&mut next));
+                } else {
+                    for (dx, dy) in &offsets {
+                        if next(2) == 1 {
+                            (x, y) = (x - dx, y - dy);
+                        }
+                    }
+                }
+                (x, y, side)
+            })
+            .collect();
+        let expected = shadowed_squares(&squares, &offsets);
+        for mode in [RenderMode::OptimizeSpeed, RenderMode::OptimizeQuality] {
+            let image = render(VIEW, VIEW, mode, |ctx| {
+                for &(dx, dy) in &offsets {
+                    #[expect(clippy::cast_possible_truncation, reason = "the distances fit `f32`")]
+                    ctx.push_filter_layer(Filter::from_primitive(FilterPrimitive::DropShadow {
+                        dx: dx as f32,
+                        dy: dy as f32,
+                        std_deviation: 0.0,
+                        color,
+                        edge_mode: EdgeMode::None,
+                    }));
+                }
+                ctx.set_paint(color);
+                for &(x, y, side) in &squares {
+                    ctx.fill_rect(&Rect::new(x, y, x + side, y + side));
+                }
+                for _ in &offsets {
+                    ctx.pop_layer();
+                }
+            });
+            let painted: Vec<bool> = image.data().iter().map(|pixel| pixel.a != 0).collect();
+            assert!(
+                painted == expected,
+                "case {case}, {mode:?}: squares {squares:?}, offsets {offsets:?}"
+            );
+            assert!(
+                image
+                    .data()
+                    .iter()
+                    .all(|pixel| pixel.a == 0 || (pixel.b, pixel.a) == (255, 255)),
+                "case {case}, {mode:?}"
+            );
+        }
     }
 }
