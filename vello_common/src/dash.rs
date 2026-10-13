@@ -655,6 +655,84 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
     }
 }
 
+/// The subpaths of dashed `dashes`, each a dash as dashing draws it, whose control
+/// points can reach the device area of `near`, or that hold NaN, which makes the
+/// consumer drop the whole path. Each is held until the next starts.
+pub(crate) struct NearDashes<I> {
+    dashes: I,
+    near: Cull,
+    held: Vec<PathEl>,
+    next: usize,
+    /// The move that starts the subpath after those held.
+    start: Option<PathEl>,
+}
+
+impl<I: Iterator<Item = PathEl>> NearDashes<I> {
+    pub(crate) fn new(dashes: I, near: Cull) -> Self {
+        Self {
+            dashes,
+            near,
+            held: Vec::new(),
+            next: 0,
+            start: None,
+        }
+    }
+}
+
+impl<I: Iterator<Item = PathEl>> Iterator for NearDashes<I> {
+    type Item = PathEl;
+
+    fn next(&mut self) -> Option<PathEl> {
+        loop {
+            if let Some(el) = self.held.get(self.next) {
+                self.next += 1;
+                return Some(*el);
+            }
+            self.held.clear();
+            self.next = 0;
+            let mut held = self.start.take().into_iter().chain(&mut self.dashes);
+            let mut reach = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            let mut nan = false;
+            for el in &mut held {
+                if matches!(el, PathEl::MoveTo(_)) && !self.held.is_empty() {
+                    self.start = Some(el);
+                    break;
+                }
+                let points: &[Point] = match &el {
+                    PathEl::MoveTo(p) | PathEl::LineTo(p) => core::slice::from_ref(p),
+                    PathEl::QuadTo(p1, p2) => &[*p1, *p2],
+                    PathEl::CurveTo(p1, p2, p3) => &[*p1, *p2, *p3],
+                    PathEl::ClosePath => &[],
+                };
+                for p in points {
+                    let d = self.near.device_point(*p);
+                    nan |= d.is_nan();
+                    reach = [
+                        reach[0].min(d.x),
+                        reach[1].min(d.y),
+                        reach[2].max(d.x),
+                        reach[3].max(d.y),
+                    ];
+                }
+                self.held.push(el);
+            }
+            if self.held.is_empty() {
+                return None;
+            }
+            // What comes before the first move draws from where the pen starts.
+            let opened = matches!(self.held[0], PathEl::MoveTo(_));
+            if opened && !nan && self.near.misses(reach) {
+                self.held.clear();
+            }
+        }
+    }
+}
+
 /// The length of the control polygon of `seg`, at least its arc length.
 fn control_length(seg: &PathSeg) -> f64 {
     match *seg {

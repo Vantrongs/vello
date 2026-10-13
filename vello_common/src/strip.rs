@@ -409,9 +409,42 @@ fn render_impl<S: Simd, const WINDOW: bool>(
         Fill::EvenOdd => winding % 2 != 0,
     };
 
+    // In a window, the winding at the right edge of the last strip of the viewport left of
+    // it in row `y`, and whether that strip reaches the window, as rendering the strips
+    // of the viewport from the left leaves them.
+    let lead_end = |y: u16| {
+        let lead = tiles.lead();
+        let first = lead.partition_point(|tile| tile.y < y);
+        let row = &lead[first..first + lead[first..].partition_point(|tile| tile.y == y)];
+        let last = row.last()?;
+        let tile_top_y = f32::from(y + origin.1) * f32::from(Tile::HEIGHT);
+        let mut winding = tiles.windings.coarse[y as usize];
+        for tile in row.iter().filter(|tile| tile.winding()) {
+            if let Some(sign) = winding_sign(lines[tile.line_idx() as usize], tile_top_y) {
+                winding -= sign as i32;
+            }
+        }
+        let mut end = f32x4::splat(s, winding as f32);
+        if row[0].x == 0 {
+            let fine_winding: f32x4<_> = tiles.windings.partial[y as usize].simd_into(s);
+            end += fine_winding;
+        }
+        let mut areas = [f32x4::splat(s, 0.0); Tile::WIDTH as usize];
+        for tile in row {
+            let line = lines[tile.line_idx() as usize];
+            let tile_left_x = f32::from(tile.x) * f32::from(Tile::WIDTH);
+            if let Some((_, acc)) = tile_coverage(s, line, tile_left_x, tile_top_y, &mut areas) {
+                end += acc;
+            }
+        }
+        Some((end, last.x + 1 == origin.0))
+    };
+
     // Helper to handle "captive strips". When a row has tiles, but the first tile
     // is not at the left edge of the viewport (x != 0), we must emit a solid strip
-    // from x=0 to that tile if the coarse winding dictates a fill.
+    // from x=0 to that tile if the coarse winding dictates a fill. Returns the row's
+    // coarse winding, the winding accumulated at the first tile's left edge, and the
+    // winding its location starts from.
     let emit_captive_strip =
         |y: u16, is_left_viewport: bool, strips: &mut Vec<Strip>, alphas: &mut Vec<u8>| {
             let coarse_wd = tiles.windings.coarse[y as usize];
@@ -422,12 +455,26 @@ fn render_impl<S: Simd, const WINDOW: bool>(
             }
 
             let mut acc = f32x4::splat(s, coarse_wd as f32);
-            if is_left_viewport {
+            // A window's left edge is the viewport's only at its origin.
+            if is_left_viewport && (!WINDOW || origin.0 == 0) {
                 let fine_winding: f32x4<_> = tiles.windings.partial[y as usize].simd_into(s);
                 acc += fine_winding;
             }
 
-            (coarse_wd, acc)
+            // A location after a gap starts from the winding the strip before it ends with,
+            // and a strip running on into the window carries it on.
+            if WINDOW && let Some((end, adjacent)) = lead_end(y) {
+                return (
+                    coarse_wd,
+                    if adjacent && is_left_viewport {
+                        end
+                    } else {
+                        acc
+                    },
+                    end,
+                );
+            }
+            (coarse_wd, acc, acc)
         };
 
     // The accumulated tile winding delta. A line that crosses the top edge of a tile
@@ -468,10 +515,10 @@ fn render_impl<S: Simd, const WINDOW: bool>(
 
             return;
         }
-        let (wd, acc) = emit_captive_strip(prev_tile.y, left_viewport, strip_buf, alpha_buf);
+        let (wd, acc, start) = emit_captive_strip(prev_tile.y, left_viewport, strip_buf, alpha_buf);
         winding_delta = wd;
         accumulated_winding = acc;
-        location_winding = [accumulated_winding; Tile::WIDTH as usize];
+        location_winding = [start; Tile::WIDTH as usize];
     }
 
     // The strip we're building.
@@ -483,15 +530,6 @@ fn render_impl<S: Simd, const WINDOW: bool>(
     );
 
     for (tile_idx, tile) in tiles.iter().copied().chain([Tile::SENTINEL]).enumerate() {
-        let line = lines[tile.line_idx() as usize];
-        // Wraps only for the sentinel, whose line is not used.
-        let tile_left_x = f32::from(tile.x.wrapping_add(origin.0)) * f32::from(Tile::WIDTH);
-        let tile_top_y = f32::from(tile.y.wrapping_add(origin.1)) * f32::from(Tile::HEIGHT);
-        let p0_x = line.p0.x - tile_left_x;
-        let p0_y = line.p0.y - tile_top_y;
-        let p1_x = line.p1.x - tile_left_x;
-        let p1_y = line.p1.y - tile_top_y;
-
         // Push out the winding as an alpha mask when we move to the next location (i.e., a tile
         // without the same location).
         if !prev_tile.same_loc(&tile) {
@@ -576,7 +614,7 @@ fn render_impl<S: Simd, const WINDOW: bool>(
 
                 // Logic identical to the start (see above): fill any vertical gaps (empty rows)
                 // between the previous and current tile using the row windings.
-                if has_culled_tiles && !is_sentinel {
+                let start = if has_culled_tiles && !is_sentinel {
                     Strip::emit_culled_background(
                         prev_tile.y + 1,
                         tile.y,
@@ -587,17 +625,20 @@ fn render_impl<S: Simd, const WINDOW: bool>(
                         should_fill,
                     );
 
-                    let (wd, acc) = emit_captive_strip(tile.y, left_viewport, strip_buf, alpha_buf);
+                    let (wd, acc, start) =
+                        emit_captive_strip(tile.y, left_viewport, strip_buf, alpha_buf);
                     winding_delta = wd;
                     accumulated_winding = acc;
+                    start
                 } else {
                     winding_delta = 0;
                     accumulated_winding = f32x4::splat(s, 0.0);
+                    accumulated_winding
                 };
 
                 #[expect(clippy::needless_range_loop, reason = "dimension clarity")]
                 for x in 0..Tile::WIDTH as usize {
-                    location_winding[x] = accumulated_winding;
+                    location_winding[x] = start;
                 }
             } else {
                 // Note: this fill is mathematically not necessary. It provides a way to reduce
@@ -618,155 +659,15 @@ fn render_impl<S: Simd, const WINDOW: bool>(
         }
         prev_tile = tile;
 
-        // TODO: horizontal geometry has no impact on winding. This branch will be removed when
-        // horizontal geometry is culled at the tile-generation stage.
-        if p0_y == p1_y {
-            continue;
+        let line = lines[tile.line_idx() as usize];
+        let tile_left_x = f32::from(tile.x + origin.0) * f32::from(Tile::WIDTH);
+        let tile_top_y = f32::from(tile.y + origin.1) * f32::from(Tile::HEIGHT);
+        if let Some((sign, acc)) =
+            tile_coverage(s, line, tile_left_x, tile_top_y, &mut location_winding)
+        {
+            winding_delta += sign as i32 * i32::from(tile.winding());
+            accumulated_winding += acc;
         }
-
-        // Lines moving upwards (in a y-down coordinate system) add to winding; lines moving
-        // downwards subtract from winding.
-        let sign = (p0_y - p1_y).signum();
-
-        // Calculate winding / pixel area coverage.
-        //
-        // Conceptually, horizontal rays are shot from left to right. Every time the ray crosses a
-        // line that is directed upwards (decreasing `y`), the winding is incremented. Every time
-        // the ray crosses a line moving downwards (increasing `y`), the winding is decremented.
-        // The fractional area coverage of a pixel is the integral of the winding within it.
-        //
-        // Practically, to calculate this, each pixel is considered individually, and we determine
-        // whether the line moves through this pixel. The line's y-delta within this pixel is
-        // accumulated and added to the area coverage of pixels to the right. Within the pixel
-        // itself, the area to the right of the line segment forms a trapezoid (or a triangle in
-        // the degenerate case). The area of this trapezoid is added to the pixel's area coverage.
-        //
-        // For example, consider the following pixel square, with a line indicated by asterisks
-        // starting inside the pixel and crossing its bottom edge. The area covered is the
-        // trapezoid on the bottom-right enclosed by the line and the pixel square. The area is
-        // positive if the line moves down, and negative otherwise.
-        //
-        //  __________________
-        //  |                |
-        //  |         *------|
-        //  |        *       |
-        //  |       *        |
-        //  |      *         |
-        //  |     *          |
-        //  |    *           |
-        //  |___*____________|
-        //     *
-        //    *
-
-        let (line_top_y, line_top_x, line_bottom_y, line_bottom_x) = if p0_y < p1_y {
-            (p0_y, p0_x, p1_y, p1_x)
-        } else {
-            (p1_y, p1_x, p0_y, p0_x)
-        };
-
-        let y_slope = (line_bottom_y - line_top_y) / (line_bottom_x - line_top_x);
-        let x_slope = 1. / y_slope;
-
-        winding_delta += sign as i32 * i32::from(tile.winding());
-
-        let line_top_y = f32x4::splat(s, line_top_y);
-        let line_bottom_y = f32x4::splat(s, line_bottom_y);
-
-        // See the explanation of this term on the `line_px_left_yx` and `line_px_right_yx`
-        // variables below.
-        let line_px_base_yx = line_top_y.mul_add(-x_slope, line_top_x);
-
-        let px_top_y = f32x4::simd_from(s, [0., 1., 2., 3.]);
-        let px_bottom_y = 1. + px_top_y;
-
-        let ymin = line_top_y.max(px_top_y);
-        let ymax = line_bottom_y.min(px_bottom_y);
-
-        let mut acc = f32x4::splat(s, 0.0);
-
-        for x_idx in 0..Tile::WIDTH {
-            let x_idx_s = f32x4::splat(s, x_idx as f32);
-            let px_left_x = x_idx_s;
-            let px_right_x = 1.0 + x_idx_s;
-
-            // The y-coordinate of the intersections between the line and the pixel's left and
-            // right edges respectively.
-            //
-            // There is some subtlety going on here: `y_slope` will usually be finite, but will
-            // be `inf` for purely vertical lines (`p0_x == p1_x`).
-            //
-            // In the case of `inf`, the resulting slope calculation will be `-inf` or `inf`
-            // depending on whether the pixel edge is left or right of the line, respectively
-            // (from the viewport's coordinate system perspective). The `min` and `max`
-            // y-clamping logic generalizes nicely, as a pixel edge to the left of the line is
-            // clamped to `ymin`, and a pixel edge to the right is clamped to `ymax`.
-            //
-            // In the special case where a vertical line and pixel edge are at the exact same
-            // x-position (collinear), the line belongs to the pixel on whose _left_ edge it is
-            // situated. The resulting slope calculation for the edge the line is situated on
-            // will be NaN, as `0 * inf` results in NaN. This is true for both the left and
-            // right edge.
-            //
-            // We know `ymin` and `ymax` are finite. We require the `max` operation to pick `ymin`
-            // if its first operand is NaN. On x86, that maps to the semantics of `_mm_max_ps`,
-            // which `f32x4::max` emits: that instruction takes element-wise
-            // `if first > second { first } else { second }`. For AArch64, we do require the
-            // `f32x4::max_precise` semantics (as `vmax_f32` returns NaN if either operand is NaN);
-            // however, for AArch64 the precise version should be comparatively less expensive than
-            // on x86. For `min`, we then know both operands are finite, so we can unambiguously
-            // use the relaxed version. If this ever breaks, tests should fail loudly, because NaNs
-            // happen a lot here!
-            trait F32x4MaxExt {
-                fn max_if_first_nan_take_second(self, rhs: Self) -> Self;
-            }
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            impl<S: Simd> F32x4MaxExt for f32x4<S> {
-                #[inline(always)]
-                fn max_if_first_nan_take_second(self, rhs: Self) -> Self {
-                    self.max(rhs)
-                }
-            }
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            impl<S: Simd> F32x4MaxExt for f32x4<S> {
-                #[inline(always)]
-                fn max_if_first_nan_take_second(self, rhs: Self) -> Self {
-                    self.max_precise(rhs)
-                }
-            }
-            let line_px_left_y = (px_left_x - line_top_x)
-                .mul_add(y_slope, line_top_y)
-                .max_if_first_nan_take_second(ymin)
-                .min(ymax);
-            let line_px_right_y = (px_right_x - line_top_x)
-                .mul_add(y_slope, line_top_y)
-                .max_if_first_nan_take_second(ymin)
-                .min(ymax);
-
-            // For each pixel we calculate the x-coordinates of the left- and rightmost points on
-            // the line segment within that pixel. We do this based on the y-offsets of those two
-            // points from the top of the line. This can be calculated as, e.g.,
-            // `(line_px_left_y - line_top_y) * x_slope + line_top_x`.
-            //
-            // Rather than calculating that y-offset twice for each pixel within the loop through
-            // subtracting from the points' y-coordinates, we get rid of that subtraction by baking
-            // it into the algebraic "base" x-coordinate `line_px_base_yx` calculated above the
-            // loop. When adding that term to `y * x_slope` it gives the x-coordinate of the point
-            // along the line.
-            //
-            // Note `x_slope` is always finite, as horizontal geometry is elided.
-            let line_px_left_yx = line_px_left_y.mul_add(x_slope, line_px_base_yx);
-            let line_px_right_yx = line_px_right_y.mul_add(x_slope, line_px_base_yx);
-            let h = (line_px_right_y - line_px_left_y).abs();
-
-            // The trapezoidal area enclosed between the line and the right edge of the pixel
-            // square. More straightforwardly written as follows, but the `madd` is faster.
-            // 0.5 * h * (2. * px_right_x - line_px_right_yx - line_px_left_yx).
-            let area = h * (line_px_right_yx + line_px_left_yx).mul_add(-0.5, px_right_x);
-            location_winding[x_idx as usize] += area.mul_add(sign, acc);
-            acc = h.mul_add(sign, acc);
-        }
-
-        accumulated_winding += acc;
     }
 
     if has_culled_tiles {
@@ -782,6 +683,181 @@ fn render_impl<S: Simd, const WINDOW: bool>(
     }
 
     maybe_emit_sentinel_strip(strip_buf, alpha_buf);
+}
+
+/// Return the direction `line` winds in in the row of tiles whose top is at `tile_top_y`,
+/// or `None` if it is horizontal there.
+#[inline(always)]
+fn winding_sign(line: Line, tile_top_y: f32) -> Option<f32> {
+    let p0_y = line.p0.y - tile_top_y;
+    let p1_y = line.p1.y - tile_top_y;
+
+    // TODO: horizontal geometry has no impact on winding. This branch will be removed when
+    // horizontal geometry is culled at the tile-generation stage.
+    if p0_y == p1_y {
+        return None;
+    }
+
+    // Lines moving upwards (in a y-down coordinate system) add to winding; lines moving
+    // downwards subtract from winding.
+    Some((p0_y - p1_y).signum())
+}
+
+/// Add the area right of `line` in each pixel of the tile whose top left is at
+/// `tile_left_x`, `tile_top_y` to `location_winding`, and return the direction the line
+/// winds in and the winding it adds at the tile's right edge, or `None` if it is
+/// horizontal there.
+#[inline(always)]
+fn tile_coverage<S: Simd>(
+    s: S,
+    line: Line,
+    tile_left_x: f32,
+    tile_top_y: f32,
+    location_winding: &mut [f32x4<S>; Tile::WIDTH as usize],
+) -> Option<(f32, f32x4<S>)> {
+    let sign = winding_sign(line, tile_top_y)?;
+    let p0_x = line.p0.x - tile_left_x;
+    let p0_y = line.p0.y - tile_top_y;
+    let p1_x = line.p1.x - tile_left_x;
+    let p1_y = line.p1.y - tile_top_y;
+
+    // Calculate winding / pixel area coverage.
+    //
+    // Conceptually, horizontal rays are shot from left to right. Every time the ray crosses a
+    // line that is directed upwards (decreasing `y`), the winding is incremented. Every time
+    // the ray crosses a line moving downwards (increasing `y`), the winding is decremented.
+    // The fractional area coverage of a pixel is the integral of the winding within it.
+    //
+    // Practically, to calculate this, each pixel is considered individually, and we determine
+    // whether the line moves through this pixel. The line's y-delta within this pixel is
+    // accumulated and added to the area coverage of pixels to the right. Within the pixel
+    // itself, the area to the right of the line segment forms a trapezoid (or a triangle in
+    // the degenerate case). The area of this trapezoid is added to the pixel's area coverage.
+    //
+    // For example, consider the following pixel square, with a line indicated by asterisks
+    // starting inside the pixel and crossing its bottom edge. The area covered is the
+    // trapezoid on the bottom-right enclosed by the line and the pixel square. The area is
+    // positive if the line moves down, and negative otherwise.
+    //
+    //  __________________
+    //  |                |
+    //  |         *------|
+    //  |        *       |
+    //  |       *        |
+    //  |      *         |
+    //  |     *          |
+    //  |    *           |
+    //  |___*____________|
+    //     *
+    //    *
+
+    let (line_top_y, line_top_x, line_bottom_y, line_bottom_x) = if p0_y < p1_y {
+        (p0_y, p0_x, p1_y, p1_x)
+    } else {
+        (p1_y, p1_x, p0_y, p0_x)
+    };
+
+    let y_slope = (line_bottom_y - line_top_y) / (line_bottom_x - line_top_x);
+    let x_slope = 1. / y_slope;
+
+    let line_top_y = f32x4::splat(s, line_top_y);
+    let line_bottom_y = f32x4::splat(s, line_bottom_y);
+
+    // See the explanation of this term on the `line_px_left_yx` and `line_px_right_yx`
+    // variables below.
+    let line_px_base_yx = line_top_y.mul_add(-x_slope, line_top_x);
+
+    let px_top_y = f32x4::simd_from(s, [0., 1., 2., 3.]);
+    let px_bottom_y = 1. + px_top_y;
+
+    let ymin = line_top_y.max(px_top_y);
+    let ymax = line_bottom_y.min(px_bottom_y);
+
+    let mut acc = f32x4::splat(s, 0.0);
+
+    for x_idx in 0..Tile::WIDTH {
+        let x_idx_s = f32x4::splat(s, x_idx as f32);
+        let px_left_x = x_idx_s;
+        let px_right_x = 1.0 + x_idx_s;
+
+        // The y-coordinate of the intersections between the line and the pixel's left and
+        // right edges respectively.
+        //
+        // There is some subtlety going on here: `y_slope` will usually be finite, but will
+        // be `inf` for purely vertical lines (`p0_x == p1_x`).
+        //
+        // In the case of `inf`, the resulting slope calculation will be `-inf` or `inf`
+        // depending on whether the pixel edge is left or right of the line, respectively
+        // (from the viewport's coordinate system perspective). The `min` and `max`
+        // y-clamping logic generalizes nicely, as a pixel edge to the left of the line is
+        // clamped to `ymin`, and a pixel edge to the right is clamped to `ymax`.
+        //
+        // In the special case where a vertical line and pixel edge are at the exact same
+        // x-position (collinear), the line belongs to the pixel on whose _left_ edge it is
+        // situated. The resulting slope calculation for the edge the line is situated on
+        // will be NaN, as `0 * inf` results in NaN. This is true for both the left and
+        // right edge.
+        //
+        // We know `ymin` and `ymax` are finite. We require the `max` operation to pick `ymin`
+        // if its first operand is NaN. On x86, that maps to the semantics of `_mm_max_ps`,
+        // which `f32x4::max` emits: that instruction takes element-wise
+        // `if first > second { first } else { second }`. For AArch64, we do require the
+        // `f32x4::max_precise` semantics (as `vmax_f32` returns NaN if either operand is NaN);
+        // however, for AArch64 the precise version should be comparatively less expensive than
+        // on x86. For `min`, we then know both operands are finite, so we can unambiguously
+        // use the relaxed version. If this ever breaks, tests should fail loudly, because NaNs
+        // happen a lot here!
+        trait F32x4MaxExt {
+            fn max_if_first_nan_take_second(self, rhs: Self) -> Self;
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        impl<S: Simd> F32x4MaxExt for f32x4<S> {
+            #[inline(always)]
+            fn max_if_first_nan_take_second(self, rhs: Self) -> Self {
+                self.max(rhs)
+            }
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        impl<S: Simd> F32x4MaxExt for f32x4<S> {
+            #[inline(always)]
+            fn max_if_first_nan_take_second(self, rhs: Self) -> Self {
+                self.max_precise(rhs)
+            }
+        }
+        let line_px_left_y = (px_left_x - line_top_x)
+            .mul_add(y_slope, line_top_y)
+            .max_if_first_nan_take_second(ymin)
+            .min(ymax);
+        let line_px_right_y = (px_right_x - line_top_x)
+            .mul_add(y_slope, line_top_y)
+            .max_if_first_nan_take_second(ymin)
+            .min(ymax);
+
+        // For each pixel we calculate the x-coordinates of the left- and rightmost points on
+        // the line segment within that pixel. We do this based on the y-offsets of those two
+        // points from the top of the line. This can be calculated as, e.g.,
+        // `(line_px_left_y - line_top_y) * x_slope + line_top_x`.
+        //
+        // Rather than calculating that y-offset twice for each pixel within the loop through
+        // subtracting from the points' y-coordinates, we get rid of that subtraction by baking
+        // it into the algebraic "base" x-coordinate `line_px_base_yx` calculated above the
+        // loop. When adding that term to `y * x_slope` it gives the x-coordinate of the point
+        // along the line.
+        //
+        // Note `x_slope` is always finite, as horizontal geometry is elided.
+        let line_px_left_yx = line_px_left_y.mul_add(x_slope, line_px_base_yx);
+        let line_px_right_yx = line_px_right_y.mul_add(x_slope, line_px_base_yx);
+        let h = (line_px_right_y - line_px_left_y).abs();
+
+        // The trapezoidal area enclosed between the line and the right edge of the pixel
+        // square. More straightforwardly written as follows, but the `madd` is faster.
+        // 0.5 * h * (2. * px_right_x - line_px_right_yx - line_px_left_yx).
+        let area = h * (line_px_right_yx + line_px_left_yx).mul_add(-0.5, px_right_x);
+        location_winding[x_idx as usize] += area.mul_add(sign, acc);
+        acc = h.mul_add(sign, acc);
+    }
+
+    Some((sign, acc))
 }
 
 #[cfg(test)]

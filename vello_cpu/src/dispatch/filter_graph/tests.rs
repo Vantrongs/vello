@@ -6,7 +6,7 @@
 
 use crate::filter::gaussian_blur::apply_blur;
 use crate::filter::pixmap::FilterPixmap;
-use crate::kurbo::{Affine, Circle, Point, Rect, Shape, Stroke};
+use crate::kurbo::{Affine, BezPath, Circle, Point, Rect, Shape, Stroke};
 use crate::peniko::{Color, Extend, Gradient, ImageQuality, ImageSampler};
 use crate::{
     Image, ImageSource, Level, Pixmap, RasterizerSettings, RenderContext, RenderMode,
@@ -697,6 +697,225 @@ fn nested_shadows_of_separate_squares_paint_every_copy_in_the_view() {
                     .all(|pixel| pixel.a == 0 || (pixel.b, pixel.a) == (255, 255)),
                 "case {case}, {mode:?}"
             );
+        }
+    }
+}
+
+/// Draw the geometry of case `item`, fractional and inside the view, moved by `base`.
+fn fractional(ctx: &mut RenderContext, item: usize, base: Affine) {
+    ctx.set_transform(base);
+    ctx.set_paint(Color::from_rgb8(30, 60, 200));
+    let mut curve = BezPath::new();
+    curve.move_to((5.3, 50.7));
+    curve.curve_to((20.1, 2.2), (40.6, 60.3), (58.9, 9.4));
+    match item {
+        0 => ctx.fill_rect(&Rect::new(10.3, 10.6, 20.2, 20.9)),
+        1 => ctx.fill_path(&Circle::new((30.3, 29.7), 13.1).to_path(0.1)),
+        2 => {
+            curve.line_to((31.25, 45.1));
+            ctx.set_stroke(Stroke::new(2.3));
+            ctx.stroke_path(&curve);
+        }
+        3 => {
+            ctx.set_stroke(Stroke::new(1.7).with_dashes(0.3, [2.1, 1.3]));
+            ctx.stroke_path(&curve);
+        }
+        _ => {
+            ctx.push_clip_path(&Circle::new((33.1, 31.7), 21.3).to_path(0.1));
+            ctx.fill_rect(&Rect::new(8.7, 12.2, 56.1, 47.9));
+            ctx.pop_clip();
+        }
+    }
+}
+
+/// An offset moves the pixels the recorder draws in the viewport of the
+/// layer's source, where geometry is rounded: windows of it that start inside
+/// the geometry, where the offset brings it in from the right, round it there too.
+#[test]
+fn an_offset_moves_the_geometry_drawn_in_the_viewport_of_the_source() {
+    for (dx, dy) in [(3.0, 1.0), (-13.0, 5.0), (-7.0, -9.0), (21.0, 0.0)] {
+        let filter = Filter::from_primitive(FilterPrimitive::Offset { dx, dy });
+        let data = FilterData::new(filter.clone(), Affine::IDENTITY);
+        let (left, top) = data.source_shift();
+        let size = data.source_viewport_size(VIEW, VIEW).unwrap();
+        for item in 0..5 {
+            for shift in [(0.0, 0.0), (0.37, 0.61), (-2.13, 1.9)] {
+                for mode in [RenderMode::OptimizeSpeed, RenderMode::OptimizeQuality] {
+                    let moved = render(VIEW, VIEW, mode, |ctx| {
+                        ctx.push_filter_layer(filter.clone());
+                        fractional(ctx, item, Affine::translate(shift));
+                        ctx.pop_layer();
+                    });
+                    let base =
+                        Affine::translate((left as f64, top as f64)) * Affine::translate(shift);
+                    let source = render(size.width(), size.height(), mode, |ctx| {
+                        fractional(ctx, item, base);
+                    });
+                    let mut expected = Pixmap::new(VIEW, VIEW);
+                    for (index, pixel) in expected.data_mut().iter_mut().enumerate() {
+                        let (x, y) = (index % usize::from(VIEW), index / usize::from(VIEW));
+                        let from = |at: usize, by: f32, shift: u64, side: u16| {
+                            let at = at as i64 - by as i64 + shift as i64;
+                            usize::try_from(at)
+                                .ok()
+                                .filter(|at| *at < usize::from(side))
+                        };
+                        if let (Some(u), Some(v)) = (
+                            from(x, dx, left, size.width()),
+                            from(y, dy, top, size.height()),
+                        ) {
+                            *pixel = source.data()[v * usize::from(size.width()) + u];
+                        }
+                    }
+                    assert!(
+                        moved.data() == expected.data(),
+                        "offset ({dx}, {dy}), item {item}, shift {shift:?}, {mode:?}: {} pixels differ",
+                        moved
+                            .data()
+                            .iter()
+                            .zip(expected.data())
+                            .filter(|(a, b)| a != b)
+                            .count()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Curves crowded into the tiles left of a window, under a clip reaching
+/// past them, change what the window draws through the rounding of their
+/// coverage, so they are flattened as in the recorder's whole viewport: the
+/// window culls them to the bounds of the clip's strips there.
+#[test]
+fn windows_flatten_curves_left_of_them_as_the_viewport_does() {
+    // The offset moves the source left by this many pixels.
+    let moved_by = 30;
+    let filter = Filter::from_primitive(FilterPrimitive::Offset {
+        dx: -(moved_by as f32),
+        dy: 0.0,
+    });
+    let size = FilterData::new(filter.clone(), Affine::IDENTITY)
+        .source_viewport_size(VIEW, VIEW)
+        .unwrap();
+    let clip = Circle::new((50.3, 32.1), 70.0).to_path(0.1);
+    struct Random(u64);
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn number(&mut self, low: f64, high: f64) -> f64 {
+            low + (self.next() % 1_000_000) as f64 / 1_000_000.0 * (high - low)
+        }
+    }
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    for case in 0..1000 {
+        let mut path = BezPath::new();
+        let mut y = random.number(-5.0, 10.0);
+        path.move_to((random.number(60.0, 90.0), y));
+        path.line_to((random.number(2.0, 26.0), y));
+        for _ in 0..40 {
+            let y1 = y + random.number(0.2, 2.0);
+            path.curve_to(
+                (random.number(16.0, 27.9), random.number(y, y1)),
+                (random.number(16.0, 27.9), random.number(y, y1)),
+                (random.number(16.0, 27.9), y1),
+            );
+            y = y1;
+        }
+        path.line_to((random.number(60.0, 90.0), y));
+        path.close_path();
+        let width = (random.next() % 2 == 1).then(|| random.number(0.3, 3.0));
+        let mode = [RenderMode::OptimizeSpeed, RenderMode::OptimizeQuality][case % 2];
+        let draw = |ctx: &mut RenderContext| {
+            ctx.push_clip_path(&clip);
+            ctx.set_paint(Color::from_rgb8(30, 60, 200));
+            match width {
+                Some(width) => {
+                    ctx.set_stroke(Stroke::new(width));
+                    ctx.stroke_path(&path);
+                }
+                None => ctx.fill_path(&path),
+            }
+            ctx.pop_clip();
+        };
+        let moved = render(VIEW, VIEW, mode, |ctx| {
+            ctx.push_filter_layer(filter.clone());
+            draw(ctx);
+            ctx.pop_layer();
+        });
+        let source = render(size.width(), size.height(), mode, draw);
+        let width = usize::from(VIEW);
+        let differ = moved
+            .data()
+            .iter()
+            .enumerate()
+            .filter(|(index, pixel)| {
+                let (x, y) = (index % width, index / width);
+                **pixel != source.data()[y * usize::from(size.width()) + x + moved_by]
+            })
+            .count();
+        assert_eq!(differ, 0, "case {case}: {} {width:?}", path.to_svg());
+    }
+}
+
+/// The recorder's viewport of a source may be up to the whole `u16` domain
+/// wide, past the largest tile multiple in it, and the source is drawn there
+/// as the recorder draws it: an offset bringing in its far edge shows the
+/// pixels the recorder draws there.
+#[test]
+fn an_offset_shows_the_far_edge_of_the_widest_viewports_as_drawn_there() {
+    let moved_by = 65_472;
+    let filter = Filter::from_primitive(FilterPrimitive::Offset {
+        dx: -(moved_by as f32),
+        dy: 0.0,
+    });
+    let edge = f64::from(moved_by);
+    for view in [61, 62, 63] {
+        let viewport = view + moved_by;
+        for item in 0..2 {
+            let draw = |ctx: &mut RenderContext| {
+                ctx.set_paint(Color::from_rgb8(30, 60, 200));
+                if item == 0 {
+                    ctx.fill_path(&Circle::new((edge + 55.37, 30.3), 9.13).to_path(0.1));
+                } else {
+                    let mut curve = BezPath::new();
+                    curve.move_to((edge + 40.3, 5.7));
+                    curve.curve_to(
+                        (edge + 80.1, 20.2),
+                        (edge + 30.6, 50.3),
+                        (edge + 66.9, 59.4),
+                    );
+                    ctx.set_stroke(Stroke::new(1.7));
+                    ctx.stroke_path(&curve);
+                }
+            };
+            for mode in [RenderMode::OptimizeSpeed, RenderMode::OptimizeQuality] {
+                let moved = render(view, VIEW, mode, |ctx| {
+                    ctx.push_filter_layer(filter.clone());
+                    draw(ctx);
+                    ctx.pop_layer();
+                });
+                let source = render(viewport, VIEW, mode, draw);
+                let (view, viewport, moved_by) = (
+                    usize::from(view),
+                    usize::from(viewport),
+                    usize::from(moved_by),
+                );
+                let differ = moved
+                    .data()
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, pixel)| {
+                        let (x, y) = (index % view, index / view);
+                        **pixel != source.data()[y * viewport + x + moved_by]
+                    })
+                    .count();
+                assert_eq!(differ, 0, "view {view}, item {item}, {mode:?}");
+            }
         }
     }
 }

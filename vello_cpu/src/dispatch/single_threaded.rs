@@ -88,35 +88,45 @@ impl SingleThreadedDispatcher {
         }
     }
 
-    /// Create a dispatcher for a window that starts at `origin` in its pixel
-    /// grid and let `draw` replay the window's commands into it.
+    /// Create a dispatcher for `window`, a part of the tiles of a viewport of
+    /// `width` by `height` that starts on a tile corner at `origin` in its
+    /// pixel grid, and let `draw` replay the window's commands into it in the
+    /// viewport's coordinates, see [`StripGenerator::new_window`].
     ///
     /// Everything drawn goes into one filter layer that holds the window content.
+    ///
+    /// [`StripGenerator::new_window`]: vello_common::strip_generator::StripGenerator::new_window
     pub(crate) fn window(
         (width, height): (u16, u16),
+        window: RectU16,
         level: Level,
         origin: Position,
         draw: impl FnOnce(&mut Self),
     ) -> Self {
-        let mut window = Self {
+        let size = (window.width(), window.height());
+        let mut target = Self {
             grid_origin: origin,
-            ..Self::new(width, height, level)
+            ..Self::new(size.0, size.1, level)
         };
-        let content = content_filter();
-        window.viewport.push_root_viewport(&content);
-        window.filter_sources.push(FilterSource::WindowContent);
-        window.recorder.push_layer(
+        target.viewport.push_window_viewport(width, height, window);
+        target.filter_sources.push(FilterSource::WindowContent);
+        target.recorder.push_layer(
             LayerProps {
                 blend_mode: BlendMode::default(),
                 opacity: 1.0,
                 mask: None,
                 clip_path: None,
             },
-            Some(content),
+            Some(content_filter()),
         );
-        draw(&mut window);
-        window.pop_layer();
-        window
+        draw(&mut target);
+        target.pop_layer();
+        target
+    }
+
+    /// The viewports and clips commands are drawn in.
+    pub(crate) fn viewport_mut(&mut self) -> &mut ViewportState {
+        &mut self.viewport
     }
 
     /// Return the bounds of the window content in the window's grid.
@@ -171,7 +181,7 @@ impl SingleThreadedDispatcher {
         &mut self,
         layer: &Layer,
         mask: Option<Mask>,
-        to_window: Affine,
+        to_frame: Affine,
         filter: FilterData,
         dest: RectU16,
         node: usize,
@@ -180,7 +190,7 @@ impl SingleThreadedDispatcher {
             self.layer_clip(
                 path,
                 layer.fill_rule,
-                to_window * layer.clip_transform,
+                to_frame * layer.clip_transform,
                 layer.aliasing_threshold,
             )
         });

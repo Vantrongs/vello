@@ -25,7 +25,7 @@
 //! A path larger than a frame is flattened in frames placed where its
 //! segments reach furthest on each side, see [`Extents::far_path`].
 
-use super::{Clip, Command, FilterGraph, Layer, Step, WINDOW_SIZE, stroke_reach};
+use super::{Clip, Command, FilterGraph, Frames, Layer, Step, WINDOW_SIZE, stroke_reach};
 use crate::filter::placed::{Bounds, Coord, Padding, Position};
 use crate::kurbo::{
     Affine, BezPath, Line as Segment, ParamCurve, ParamCurveArclen, ParamCurveExtrema, PathSeg,
@@ -34,7 +34,7 @@ use crate::kurbo::{
 use crate::peniko::Fill;
 #[cfg(not(feature = "std"))]
 use crate::peniko::kurbo::common::FloatFuncs as _;
-use alloc::collections::BinaryHeap;
+use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -48,7 +48,7 @@ use vello_common::strip_generator::{StripGenerator, StripStorage};
 use vello_common::tile::{MAX_LINES_PER_PATH, Tile};
 
 /// The side of the square frames paths are flattened in, which windows draw.
-const FRAME: i64 = WINDOW_SIZE;
+const FRAME: i64 = WINDOW_SIZE as i64;
 
 /// How far inside a frame what is found in it must lie; lines that cross its
 /// edges are tiled as a window would not, so tiles there are not counted.
@@ -633,14 +633,7 @@ impl Home {
         if viewport.is_empty() {
             return None;
         }
-        let side = |length: Coord| {
-            length
-                .to_i64()
-                .and_then(|length| u16::try_from(length).ok())
-                .unwrap_or(FRAME as u16)
-        };
-        let size = (side(viewport.width()), side(viewport.height()));
-        let origin = viewport.origin();
+        let Frames { origin, size, .. } = Frames::new(viewport);
         let viewport = Bounds::new(
             origin.0.clone(),
             origin.1.clone(),
@@ -680,6 +673,49 @@ impl Home {
     }
 }
 
+/// Where the recorder culls what it flattens under a clip, see
+/// `StripGenerator::generate_filled_path`: the bounds of the strips of the
+/// clips in effect, in its viewport and, for the copies of it the source is
+/// drawn in elsewhere, anywhere, see [`Extents::cull`].
+#[derive(Clone, Debug)]
+pub(super) struct Cull {
+    home: Bounds,
+    elsewhere: Bounds,
+}
+
+impl Cull {
+    /// Return the culling rectangle in the frame at `frame` of `frames`, as
+    /// the recorder finds it drawing the whole frame.
+    pub(super) fn in_frame(&self, frames: &Frames, frame: &Position) -> RectU16 {
+        let bounds = if *frame == frames.origin {
+            &self.home
+        } else {
+            &self.elsewhere
+        };
+        // The recorder's bounds saturate, see `RectU16::from_tile_bounds`, and
+        // those of clips elsewhere are cut to the frame as `frame_cull` cuts them.
+        let local = |value: &Coord, origin: &Coord| {
+            u16::try_from((value - origin).clamped_i64().clamp(0, u16::MAX.into())).unwrap()
+        };
+        let cull = RectU16::new(
+            local(&bounds.x0, &frame.0),
+            local(&bounds.y0, &frame.1),
+            local(&bounds.x1, &frame.0),
+            local(&bounds.y1, &frame.1),
+        );
+        // The recorder's bounds of clips without strips.
+        if cull.is_empty() { RectU16::ZERO } else { cull }
+    }
+}
+
+/// Where the recorder culls under the clips of a layer: those its source is
+/// drawn under, in order, and those it pushes, by command.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Culls {
+    pub(super) outer: Vec<Cull>,
+    pub(super) pushed: BTreeMap<usize, Cull>,
+}
+
 /// Finds the bounds of the strips the commands of a filter layer draw.
 pub(super) struct Extents<'a> {
     level: Level,
@@ -709,18 +745,37 @@ impl<'a> Extents<'a> {
 
     /// Return the bounds of the content of the source of layer `index`, with
     /// the nested layers composited where `pixmap` says, as the recorder
-    /// bounds a layer's content, see `CommandRecorder::pop_layer_placed`.
+    /// bounds a layer's content, see `CommandRecorder::pop_layer_placed`, and
+    /// where it culls under each clip.
     pub(super) fn content(
         &mut self,
         graph: &FilterGraph,
         index: usize,
         pixmap: &dyn Fn(usize) -> Bounds,
-    ) -> Bounds {
+    ) -> (Bounds, Culls) {
+        self.walk(graph, index, Some(pixmap))
+    }
+
+    /// Return where the recorder culls under each clip of layer `index`.
+    pub(super) fn culls(&mut self, graph: &FilterGraph, index: usize) -> Culls {
+        self.walk(graph, index, None).1
+    }
+
+    /// Return where the recorder culls under each clip of layer `index`, and
+    /// with `pixmap`, the bounds of its content, see [`Self::content`].
+    fn walk(
+        &mut self,
+        graph: &FilterGraph,
+        index: usize,
+        pixmap: Option<&dyn Fn(usize) -> Bounds>,
+    ) -> (Bounds, Culls) {
         let layer = &graph.layers[index];
         let mut clips: Vec<&Clip> = Vec::new();
         let mut covers = vec![Cover::All];
+        let mut culls = Culls::default();
         for clip in &layer.clips {
             let cover = self.push_clip(&covers, &clips, clip);
+            culls.outer.push(self.cull_under(&cover));
             covers.push(cover);
             clips.push(clip);
         }
@@ -731,16 +786,19 @@ impl<'a> Extents<'a> {
             *content = content.union(bounds);
         };
         for step in &layer.steps {
-            let command = match *step {
-                Step::Command { command, .. } => &graph.commands[command],
+            let (at, command) = match *step {
+                Step::Command { command, .. } => (command, &graph.commands[command]),
                 Step::Nested { layer, .. } => {
-                    add(&mut open, &pixmap(layer));
+                    if let Some(pixmap) = pixmap {
+                        add(&mut open, &pixmap(layer));
+                    }
                     continue;
                 }
             };
             match command {
                 Command::PushClip(clip) => {
                     let cover = self.push_clip(&covers, &clips, clip);
+                    culls.pushed.insert(at, self.cull_under(&cover));
                     covers.push(cover);
                     clips.push(clip);
                 }
@@ -749,6 +807,7 @@ impl<'a> Extents<'a> {
                         covers.pop();
                     }
                 }
+                _ if pixmap.is_none() => {}
                 Command::PushLayer(pushed) => {
                     let clip =
                         Item::of_layer_clip(pushed).map(|item| self.extent(&item, &covers, &clips));
@@ -767,7 +826,17 @@ impl<'a> Extents<'a> {
                 }
             }
         }
-        open.swap_remove(0).0
+        (open.swap_remove(0).0, culls)
+    }
+
+    /// Return where the recorder culls what it flattens under clips that
+    /// cover `cover`, see [`Self::cull`].
+    fn cull_under(&self, cover: &Cover) -> Cull {
+        let elsewhere = self.clip_bounds(cover).expect("a clip was pushed");
+        let home = self.home.as_ref().map_or(elsewhere.clone(), |home| {
+            self.cull(cover, &home.tiles).unwrap()
+        });
+        Cull { home, elsewhere }
     }
 
     /// Push `clip` onto `clips`, which cover the last of `covers`, and return
@@ -823,10 +892,11 @@ impl<'a> Extents<'a> {
         };
         Some(match cover {
             Cover::All => home.viewport.clone(),
-            // The strips of rectangles and blocks of tiles cut to the viewport.
-            Cover::Rect(_) | Cover::Tiles(_) => {
-                self.clip_bounds(cover).unwrap().intersect(&home.tiles)
-            }
+            // Cut to the viewport before it is tiled, see
+            // `StripGenerator::generate_filled_rect_fast`.
+            Cover::Rect(rect) => self.rect_tiles(rect.intersect(to_rect(&home.viewport))),
+            // The strips of blocks of tiles cut to the viewport.
+            Cover::Tiles(_) => self.clip_bounds(cover).unwrap().intersect(&home.tiles),
             Cover::Paths { home: bounds, .. } => bounds.clone(),
         })
     }
@@ -1468,7 +1538,8 @@ impl<'a> Extents<'a> {
                     &home.origin.1 + i64::from(window.y0),
                 );
                 let generator =
-                    StripGenerator::new_window(home.size.0, home.size.1, window, self.level);
+                    StripGenerator::new_window(home.size.0, home.size.1, window, self.level)
+                        .walking_dashes_past();
                 (home.origin.clone(), strips_origin, generator, None)
             }
             None => {

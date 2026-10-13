@@ -4,6 +4,7 @@
 //! Flattening filled and stroked paths.
 
 use crate::cull::{Cull, SplitHuge};
+use crate::dash::NearDashes;
 use crate::flatten_simd::{Callback, LinePathEl};
 use crate::geometry::RectU16;
 #[cfg(not(feature = "std"))]
@@ -270,8 +271,45 @@ pub fn stroke_near(
         flatten_ctx,
         stroke_ctx,
         cull_bbox,
-        Some(near),
+        Some(Near::Walked(near)),
     );
+}
+
+/// Flatten a stroked Bézier path into line segments as [`stroke`] does, for the lines
+/// that can reach `area` or what lies left of it in its rows, from which the strip
+/// renderer accumulates the winding in it: a dashed stroke draws only the dashes that
+/// can, each as [`stroke`] draws it.
+pub fn stroke_left_of(
+    level: Level,
+    path: impl IntoIterator<Item = PathEl>,
+    style: &Stroke,
+    affine: Affine,
+    line_buf: &mut Vec<Line>,
+    flatten_ctx: &mut FlattenCtx,
+    stroke_ctx: &mut StrokeCtx,
+    cull_bbox: RectU16,
+    area: RectU16,
+) {
+    stroke_impl(
+        level,
+        path,
+        style,
+        affine,
+        line_buf,
+        flatten_ctx,
+        stroke_ctx,
+        cull_bbox,
+        Some(Near::Left(area)),
+    );
+}
+
+/// The dashes a stroke draws, if not all of them.
+#[derive(Clone, Copy, Debug)]
+enum Near<T> {
+    /// Those that can reach an area, with the pattern walked past the others.
+    Walked(T),
+    /// Those that can reach an area or what lies left of it in its rows.
+    Left(T),
 }
 
 #[inline(always)]
@@ -284,7 +322,7 @@ fn stroke_impl(
     flatten_ctx: &mut FlattenCtx,
     stroke_ctx: &mut StrokeCtx,
     cull_bbox: RectU16,
-    near: Option<RectU16>,
+    near: Option<Near<RectU16>>,
 ) {
     let scale = max_scale(affine);
     if scale.is_nan() || scale <= 0.0 {
@@ -294,8 +332,14 @@ fn stroke_impl(
     // Thin strokes are flattened and dashes measured in path space, with a tolerance
     // divided by `scale`.
     let cull = Cull::in_path_space(affine, stroke_cull_rect(cull_bbox, style, scale), scale);
-    let near =
-        near.map(|near| Cull::in_path_space(affine, stroke_cull_rect(near, style, scale), scale));
+    let in_path_space = |rect| Cull::in_path_space(affine, rect, scale);
+    let near = near.map(|near| match near {
+        Near::Walked(area) => Near::Walked(in_path_space(stroke_cull_rect(area, style, scale))),
+        Near::Left(area) => {
+            let [_, top, right, bottom] = stroke_cull_rect(area, style, scale);
+            Near::Left(in_path_space([f64::NEG_INFINITY, top, right, bottom]))
+        }
+    });
     if style.width * scale <= HAIRLINE_MAX_WIDTH {
         hairline(
             path,
@@ -322,12 +366,26 @@ fn stroke_impl(
         expand_stroke(path, style, tolerance, stroke_ctx);
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, near);
+        let dashed =
+            |near| crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, near);
         let solid = Stroke {
             dash_pattern: kurbo::Dashes::new(),
             ..style.clone()
         };
-        expand_stroke(dashed, &solid, tolerance, stroke_ctx);
+        match near {
+            Some(Near::Left(near)) => {
+                expand_stroke(
+                    NearDashes::new(dashed(None), near),
+                    &solid,
+                    tolerance,
+                    stroke_ctx,
+                );
+            }
+            Some(Near::Walked(near)) => {
+                expand_stroke(dashed(Some(near)), &solid, tolerance, stroke_ctx);
+            }
+            None => expand_stroke(dashed(None), &solid, tolerance, stroke_ctx),
+        }
     }
     fill(
         level,
@@ -402,7 +460,7 @@ fn hairline(
     flatten_ctx: &mut FlattenCtx,
     cull_bbox: RectU16,
     cull: Cull,
-    near: Option<Cull>,
+    near: Option<Near<Cull>>,
 ) {
     line_buf.clear();
     let [left, right] = &mut flatten_ctx.hairline_sides;
@@ -436,8 +494,19 @@ fn hairline(
         crate::cull::flatten(path, tolerance, cull, |el| sink.push(el));
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, near);
-        kurbo::flatten(dashed, tolerance, |el| sink.push(el));
+        let dashed =
+            |near| crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, near);
+        match near {
+            Some(Near::Left(near)) => {
+                kurbo::flatten(NearDashes::new(dashed(None), near), tolerance, |el| {
+                    sink.push(el);
+                });
+            }
+            Some(Near::Walked(near)) => kurbo::flatten(dashed(Some(near)), tolerance, |el| {
+                sink.push(el);
+            }),
+            None => kurbo::flatten(dashed(None), tolerance, |el| sink.push(el)),
+        }
     }
     sink.end_subpath(false);
     if sink.is_nan {

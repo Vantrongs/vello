@@ -5,7 +5,7 @@
 
 use super::{Cover, Extents, FRAME, Item, MARGIN, TILE, outside_of};
 use crate::dispatch::Dispatcher;
-use crate::dispatch::filter_graph::Clip;
+use crate::dispatch::filter_graph::{Clip, Frames};
 use crate::dispatch::single_threaded::SingleThreadedDispatcher;
 use crate::filter::placed::{Bounds, Coord};
 use crate::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Shape, Stroke};
@@ -15,7 +15,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use vello_common::color::palette::css::BLACK;
 use vello_common::fearless_simd::Level;
+use vello_common::geometry::RectU16;
 use vello_common::paint::{Paint, PremulColor};
+use vello_common::viewport::ViewportState;
 
 /// A source of pseudo-random numbers.
 struct Random(u64);
@@ -299,38 +301,40 @@ fn recorded(viewport: &Bounds, drawn: &Drawn, clips: &[Clip]) -> Bounds {
     let origin = viewport.origin();
     let to_window = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
     let paint = || Paint::Solid(PremulColor::from_alpha_color(BLACK));
-    let window = SingleThreadedDispatcher::window(size, Level::baseline(), origin, |target| {
-        for clip in clips {
-            clip.push_into(target, to_window);
-        }
-        match drawn {
-            Drawn::Rect(rect, transform) => target.fill_transformed_rect(
-                rect,
-                to_window * *transform,
-                paint(),
-                BlendMode::default(),
-                None,
-            ),
-            Drawn::Fill(path, fill_rule, transform) => target.fill_path(
-                path,
-                *fill_rule,
-                to_window * *transform,
-                paint(),
-                BlendMode::default(),
-                None,
-                None,
-            ),
-            Drawn::Stroke(path, stroke, transform) => target.stroke_path(
-                path,
-                stroke,
-                to_window * *transform,
-                paint(),
-                BlendMode::default(),
-                None,
-                None,
-            ),
-        }
-    });
+    let whole = RectU16::new(0, 0, size.0, size.1);
+    let window =
+        SingleThreadedDispatcher::window(size, whole, Level::baseline(), origin, |target| {
+            for clip in clips {
+                clip.push_into(target.viewport_mut(), to_window);
+            }
+            match drawn {
+                Drawn::Rect(rect, transform) => target.fill_transformed_rect(
+                    rect,
+                    to_window * *transform,
+                    paint(),
+                    BlendMode::default(),
+                    None,
+                ),
+                Drawn::Fill(path, fill_rule, transform) => target.fill_path(
+                    path,
+                    *fill_rule,
+                    to_window * *transform,
+                    paint(),
+                    BlendMode::default(),
+                    None,
+                    None,
+                ),
+                Drawn::Stroke(path, stroke, transform) => target.stroke_path(
+                    path,
+                    stroke,
+                    to_window * *transform,
+                    paint(),
+                    BlendMode::default(),
+                    None,
+                    None,
+                ),
+            }
+        });
     window.window_content()
 }
 
@@ -456,6 +460,54 @@ fn extents_near_the_viewport_origin_are_those_the_recorder_draws() {
             recorded(&viewport, &drawn, &clips),
             "case {case}: {}",
             describe(&drawn, &clips)
+        );
+    }
+}
+
+/// Return the bounds the recorder finds for the strips of `clips` in
+/// `viewport` as each is pushed, which cull what is drawn under them.
+fn recorded_culls(viewport: &Bounds, clips: &[Clip]) -> Vec<RectU16> {
+    let side = |length: Coord| u16::try_from(length.to_i64().unwrap()).unwrap();
+    let origin = viewport.origin();
+    let to_viewport = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
+    let mut target = ViewportState::new(
+        side(viewport.width()),
+        side(viewport.height()),
+        Level::baseline(),
+    );
+    clips
+        .iter()
+        .map(|clip| {
+            clip.push_into(&mut target, to_viewport);
+            target.clip().unwrap().path.bbox
+        })
+        .collect()
+}
+
+#[test]
+fn windows_cull_under_clips_as_the_recorder_does_in_its_viewport() {
+    let mut random = Random(0x3c6e_f372_fe94_f82b);
+    for case in 0..4000 {
+        let (x, y) = random.pick(&[(0, 0), (-4, -8), (-1000, -76), (-60_000, -4)]);
+        let viewport = Bounds::new(x, y, x + 300, y + 200);
+        let bits = random.pick(&[Some(0), Some(3), None]);
+        let coordinate = within(-60.0, 360.0, bits);
+        let moved = |random: &mut Random| coordinate(random) + random.pick(&[x, y]) as f64;
+        let clips = random_clips(&mut random, &moved);
+        let clip_refs: Vec<&Clip> = clips.iter().collect();
+        let mut extents = Extents::new(Level::baseline(), &viewport);
+        let mut covers = alloc::vec![Cover::All];
+        let frames = Frames::new(&viewport);
+        let mut culls = Vec::new();
+        for (index, clip) in clips.iter().enumerate() {
+            let cover = extents.push_clip(&covers, &clip_refs[..index], clip);
+            culls.push(extents.cull_under(&cover).in_frame(&frames, &frames.origin));
+            covers.push(cover);
+        }
+        assert_eq!(
+            culls,
+            recorded_culls(&viewport, &clips),
+            "case {case}: {clips:?} in {viewport:?}"
         );
     }
 }

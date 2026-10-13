@@ -95,6 +95,11 @@ impl Cull {
         b
     }
 
+    /// Where `p` lies on the device.
+    pub(crate) fn device_point(&self, p: Point) -> Point {
+        self.affine * p
+    }
+
     pub(crate) fn misses(&self, b: [f64; 4]) -> bool {
         let r = self.rect;
         b[2] < r[0] || b[3] < r[1] || b[0] > r[2] || b[1] > r[3]

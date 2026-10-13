@@ -90,6 +90,11 @@ pub struct StripGenerator {
     height: u16,
     /// The part of the viewport whose strips are generated, if not all of it.
     window: Option<RectU16>,
+    /// Whether dashes that cannot reach the window are walked past, see
+    /// [`Self::walking_dashes_past`].
+    walk_dashes: bool,
+    /// The bounds of the strips of the next clip pushed, see [`Self::set_clip_bounds`].
+    clip_bounds: Option<RectU16>,
 }
 
 impl StripGenerator {
@@ -105,18 +110,21 @@ impl StripGenerator {
             width,
             height,
             window: None,
+            walk_dashes: false,
+            clip_bounds: None,
         }
     }
 
     /// Create a strip generator for a viewport of `width` by `height` that generates
-    /// its strips in `window`, a part of it whose top left lies on a tile corner, at the
-    /// window's origin, with the memory of the window: those the viewport has there,
-    /// with their fills, see [`Tiles::make_window_tiles_analytic_aa`].
+    /// its strips in `window`, a part of its tiles whose top left lies on a tile corner,
+    /// at the window's origin, with the memory of the window and of what lies left of it
+    /// in its rows: those the viewport has there, with their fills and alphas, see
+    /// [`Tiles::make_window_tiles_analytic_aa`].
     ///
     /// Paths and rectangles are given, culled and rounded in the viewport's
     /// coordinates, and so are the bounds of clip paths, whose strips are those of the
-    /// window. A dashed stroke draws only the dashes that can reach the window, see
-    /// [`flatten::stroke_near`].
+    /// window. A dashed stroke draws only the dashes that can reach the window or what
+    /// lies left of it in its rows, see [`flatten::stroke_left_of`].
     pub fn new_window(width: u16, height: u16, window: RectU16, level: Level) -> Self {
         Self {
             level,
@@ -128,6 +136,43 @@ impl StripGenerator {
             width,
             height,
             window: Some(window),
+            walk_dashes: false,
+            clip_bounds: None,
+        }
+    }
+
+    /// Draw only the dashes that can reach the window, walking the pattern past the
+    /// others in work that follows the window, see [`flatten::stroke_near`]: where the
+    /// dashes start is then that of the viewport only up to rounding, and the alphas of
+    /// a row leave out the dashes left of the window.
+    pub fn walking_dashes_past(mut self) -> Self {
+        self.walk_dashes = true;
+        self
+    }
+
+    /// Set the bounds in the viewport of the strips the next clip pushed with this
+    /// generator has in the whole viewport, which cull what is drawn under it: those of
+    /// its strips in a window are smaller.
+    pub fn set_clip_bounds(&mut self, bounds: RectU16) {
+        self.clip_bounds = Some(bounds);
+    }
+
+    /// Return the bounds in the viewport of a clip whose strips are `strips`: those
+    /// [`Self::set_clip_bounds`] set, or else those of the strips, moved into the
+    /// viewport from a window's origin.
+    pub(crate) fn clip_bounds(&mut self, strips: &[Strip]) -> RectU16 {
+        if let Some(bounds) = self.clip_bounds.take() {
+            return bounds;
+        }
+        let bounds = strip_bbox(strips).unwrap_or(RectU16::ZERO);
+        match self.window {
+            Some(window) if !bounds.is_empty() => RectU16::new(
+                bounds.x0 + window.x0,
+                bounds.y0 + window.y0,
+                bounds.x1 + window.x0,
+                bounds.y1 + window.y0,
+            ),
+            _ => bounds,
         }
     }
 
@@ -181,7 +226,11 @@ impl StripGenerator {
         let cull_bbox = clip_path
             .map(|clip_path| clip_path.bbox)
             .unwrap_or(RectU16::new(0, 0, self.width, self.height));
-        match self.window {
+        // Lines anywhere in the tiles of the window change them.
+        let reached = self
+            .window
+            .map(|window| RectU16::from_tile_bounds(window.to_tile_bounds()));
+        match reached {
             None => flatten::stroke(
                 self.level,
                 path,
@@ -193,7 +242,18 @@ impl StripGenerator {
                 cull_bbox,
             ),
             // What lies outside the window is closed outlines, whose winding cancels in it.
-            Some(window) => flatten::stroke_near(
+            Some(window) if self.walk_dashes => flatten::stroke_near(
+                self.level,
+                path,
+                stroke,
+                transform,
+                &mut self.line_buf,
+                &mut self.flatten_ctx,
+                &mut self.stroke_ctx,
+                cull_bbox,
+                window,
+            ),
+            Some(window) => flatten::stroke_left_of(
                 self.level,
                 path,
                 stroke,
@@ -402,7 +462,7 @@ fn render_with_clip(
 
 #[cfg(test)]
 mod tests {
-    use alloc::collections::{BTreeMap, BTreeSet};
+    use alloc::collections::BTreeMap;
     use alloc::format;
     use alloc::vec::Vec;
 
@@ -488,9 +548,17 @@ mod tests {
                 _ => path.line_to(point(random)),
             }
         }
-        match random.below(3) {
+        match random.below(4) {
             0 => Drawn::Stroke(path, Stroke::new(random.number(0.5, 12.0))),
-            1 => Drawn::Fill(path, Fill::EvenOdd),
+            1 => {
+                let dashes: Vec<f64> = (0..1 + random.below(4))
+                    .map(|_| random.number(0.5, 30.0))
+                    .collect();
+                let stroke = Stroke::new(random.number(0.5, 12.0))
+                    .with_dashes(random.number(0.0, 40.0), dashes);
+                Drawn::Stroke(path, stroke)
+            }
+            2 => Drawn::Fill(path, Fill::EvenOdd),
             _ => Drawn::Fill(path, Fill::NonZero),
         }
     }
@@ -570,15 +638,16 @@ mod tests {
         covered
     }
 
-    /// A generator for a window of a viewport makes the strips and fills a generator for
-    /// the whole viewport makes there, and their alphas in rows with no strips left of
-    /// the window, for paths, strokes and rectangles reaching past the viewport's edges
-    /// and far beyond, under clip paths and rectangles.
+    /// A generator for a window of a viewport makes the strips, fills and alphas a
+    /// generator for the whole viewport makes there, for paths, strokes and rectangles
+    /// reaching past the viewport's edges and far beyond, under clip paths and
+    /// rectangles.
     #[test]
     fn a_window_holds_the_strips_of_the_viewport() {
         let mut random = Random(0x9e37_79b9_7f4a_7c15);
-        // Windows compared that start right of the viewport's left edge, and at it.
-        let mut compared = [0; 2];
+        // Windows compared that start at the viewport's left edge, and right of it with
+        // and without tiles of the viewport left of them in their rows.
+        let mut compared = [0; 3];
         for case in 0..3000 {
             let size = (1 + random.below(160) as u16, 1 + random.below(160) as u16);
             let start = |random: &mut Random, size: u16| match random.below(3) {
@@ -586,8 +655,9 @@ mod tests {
                 _ => random.below(u64::from(size.div_ceil(Tile::WIDTH))) as u16 * Tile::WIDTH,
             };
             let (x0, y0) = (start(&mut random, size.0), start(&mut random, size.1));
-            let end = |random: &mut Random, start: u16, size: u16| match random.below(3) {
+            let end = |random: &mut Random, start: u16, size: u16| match random.below(4) {
                 0 => size,
+                1 => size.next_multiple_of(Tile::WIDTH),
                 _ => start + 1 + random.below(u64::from(size - start)) as u16,
             };
             let window = RectU16::new(
@@ -604,32 +674,16 @@ mod tests {
             let mut part = StripGenerator::new_window(size.0, size.1, window, Level::baseline());
             let (mut whole_clip, mut part_clip) = (None, None);
             let tiles = window.to_tile_bounds();
-            // The rows of the window where what lies left of it changes alphas in it: of
-            // paths with tiles left of it, or lines left of the viewport, whose fractional
-            // winding the renderer adds only to a first tile in the first column.
-            let mut left_rows = BTreeSet::new();
+            let mut left = false;
             let mut cull = RectU16::new(0, 0, size.0, size.1);
             for drawn in clips.iter().chain([&item]) {
                 let drawn_whole = draw(&mut whole, drawn, clip_of(&whole_clip), cull);
                 let drawn_part = draw(&mut part, drawn, clip_of(&part_clip), cull);
-                if !matches!(drawn, Drawn::Rect(_)) {
-                    let rows = tiles.y0..tiles.y1;
-                    for tile in whole.tiles.iter() {
-                        if tile.x < tiles.x0 && rows.contains(&tile.y) {
-                            left_rows.insert(tile.y - tiles.y0);
-                        }
-                    }
-                    if whole.tiles.has_culled_tiles() {
-                        let windings = &whole.tiles.windings;
-                        windings.for_active_rows_in_range(
-                            usize::from(tiles.y0),
-                            usize::from(tiles.y1),
-                            |row| {
-                                left_rows.insert(row as u16 - tiles.y0);
-                            },
-                        );
-                    }
-                }
+                left |= !matches!(drawn, Drawn::Rect(_))
+                    && whole
+                        .tiles
+                        .iter()
+                        .any(|tile| tile.x < tiles.x0 && (tiles.y0..tiles.y1).contains(&tile.y));
                 // The clip's bounds, as `ClipContext` keeps them.
                 cull = strip_bbox(&drawn_whole.0.strips).unwrap_or(RectU16::ZERO);
                 (whole_clip, part_clip) = (Some(drawn_whole), Some(drawn_part));
@@ -639,31 +693,29 @@ mod tests {
                 &part_clip.unwrap().0,
                 RectU16::new(0, 0, tiles.width(), tiles.height()),
             );
-            let keys = |covered: &BTreeMap<(u16, u16), [u8; 16]>| {
-                covered.keys().copied().collect::<Vec<_>>()
-            };
             assert_eq!(
-                keys(&actual),
-                keys(&expected),
+                actual.keys().collect::<Vec<_>>(),
+                expected.keys().collect::<Vec<_>>(),
                 "case {case}: {window:?} of {size:?}"
             );
-            let kept = |covered: &BTreeMap<(u16, u16), [u8; 16]>| {
-                covered
-                    .iter()
-                    .filter(|((_, y), _)| !left_rows.contains(y))
-                    .map(|(tile, alphas)| (*tile, *alphas))
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(
-                kept(&actual),
-                kept(&expected),
-                "case {case}: {window:?} of {size:?}"
-            );
+            for (tile, alphas) in &expected {
+                assert_eq!(
+                    actual[tile], *alphas,
+                    "case {case}: {window:?} of {size:?}, tile {tile:?}"
+                );
+            }
             if !expected.is_empty() {
-                compared[usize::from(window.x0 == 0)] += 1;
+                compared[if window.x0 == 0 {
+                    0
+                } else {
+                    1 + usize::from(left)
+                }] += 1;
             }
         }
-        assert!(compared.iter().all(|count| *count > 300), "{compared:?}");
+        assert!(
+            compared[0] > 300 && compared[1] > 50 && compared[2] > 300,
+            "{compared:?}"
+        );
     }
 
     #[test]

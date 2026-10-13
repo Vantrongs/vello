@@ -15,9 +15,9 @@
 //! The output is then computed only where the view shows it: each filter
 //! computes the pixels of an area from the pixels of its source that they
 //! depend on, see [`Pyramid`] for blurs, and the source is rendered for those
-//! pixels in windows of at most 65532 pixels a side, the most that strips,
-//! tiles and fine rasterization address, with the output of each nested filter
-//! computed the same way where a window shows it. Pixels are those of the
+//! pixels in windows of the viewport the recorder draws it in, which round and
+//! cull its geometry as the recorder does there, see [`Frames`], with the
+//! output of each nested filter computed the same way where a window shows it. Pixels are those of the
 //! filters run on whole pixmaps, while memory follows the view and the work
 //! follows the source the visible output depends on.
 
@@ -38,7 +38,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::marker::PhantomData;
-use extent::Extents;
+use extent::{Cull, Culls, Extents};
 use vello_common::clip::PushedClip;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd};
@@ -48,6 +48,8 @@ use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint};
 use vello_common::pixmap::PixmapMut;
+use vello_common::tile::Tile;
+use vello_common::viewport::ViewportState;
 
 /// A clip as it was pushed, in root target coordinates.
 #[derive(Clone, Debug)]
@@ -90,21 +92,18 @@ impl Clip {
         }
     }
 
-    /// Push the clip into `target`, whose pixels are root target pixels mapped by `to_window`.
-    fn push_into(&self, target: &mut SingleThreadedDispatcher, to_window: Affine) {
+    /// Push the clip into `target`, whose pixels are root target pixels mapped by `to_frame`.
+    fn push_into(&self, target: &mut ViewportState, to_frame: Affine) {
         match self {
             Self::Path {
                 path,
                 fill_rule,
                 transform,
                 aliasing_threshold,
-            } => target.push_clip_path(
-                path,
-                *fill_rule,
-                to_window * *transform,
-                *aliasing_threshold,
-            ),
-            Self::Rect(rect) => target.push_clip_rect(&to_window.transform_rect_bbox(*rect)),
+            } => {
+                target.push_clip_path(path, *fill_rule, to_frame * *transform, *aliasing_threshold);
+            }
+            Self::Rect(rect) => target.push_clip_rect(&to_frame.transform_rect_bbox(*rect)),
         }
     }
 }
@@ -196,7 +195,7 @@ impl Recording {
     pub(crate) fn push_clips_into(&self, target: &mut SingleThreadedDispatcher) {
         for command in &self.commands {
             match command {
-                Command::PushClip(clip) => clip.push_into(target, Affine::IDENTITY),
+                Command::PushClip(clip) => clip.push_into(target.viewport_mut(), Affine::IDENTITY),
                 Command::PopClip => target.pop_clip(),
                 _ => {}
             }
@@ -728,9 +727,18 @@ enum Through {
 /// content. Which parts of it the view depends on are then followed from the
 /// view down, so that copies of the content that no visible output depends on
 /// are never counted, see [`FilterGraph::plan`].
+///
+/// The source is drawn in the coordinates of the viewport its unbounded
+/// commands are bounded by, as the recorder draws it there, which rounds
+/// the geometry and culls it to the strips of the clips it is drawn under;
+/// outside of it, in those of copies of it, see [`Frames`] and [`Cull`].
 #[derive(Debug)]
 struct Node {
     reach: Reach,
+    /// The viewports the source is drawn in.
+    frames: Frames,
+    /// Where the recorder culls under the source's clips.
+    culls: Culls,
     /// The pixmap the filter runs on, where the output is composited into the
     /// parent; empty if the source has no content.
     pixmap: Bounds,
@@ -831,12 +839,14 @@ impl FilterGraph {
             }
         }
         let pixmap_of = |node: usize| nodes[node].as_ref().unwrap().pixmap.clone();
-        let bounds = if exact {
-            Extents::new(self.simd_level, viewport).content(self, index, &pixmap_of)
+        let mut extents = Extents::new(self.simd_level, viewport);
+        let (bounds, culls) = if exact {
+            extents.content(self, index, &pixmap_of)
         } else {
-            candidates
+            let bounds = candidates
                 .iter()
-                .fold(bounds, |bounds, candidate| bounds.union(candidate))
+                .fold(bounds, |bounds, candidate| bounds.union(candidate));
+            (bounds, extents.culls(self, index))
         };
         let pixmap = bounds.expand(&reach.filter_padding).snap_to_tiles();
         let mut source_box = Bounds::EMPTY;
@@ -881,6 +891,8 @@ impl FilterGraph {
         };
         Node {
             reach,
+            frames: Frames::new(viewport),
+            culls,
             pixmap,
             source_box,
             output_box,
@@ -1044,51 +1056,68 @@ impl FilterGraph {
         true
     }
 
-    /// Replay layer `index` into a window covering `area`, which starts on a
-    /// tile corner and spans at most [`WINDOW_SIZE`] pixels on each side, with
-    /// nested layers composited where `pixmap` says.
+    /// Replay layer `index` into a window covering `area`, which lies in the
+    /// frame at `frame` on tile corners, with nested layers composited where
+    /// `pixmap` says.
     fn window(
         &self,
         index: usize,
         area: &Bounds,
+        frame: &Position,
         pixmap: &dyn Fn(usize) -> Bounds,
     ) -> SingleThreadedDispatcher {
         let layer = &self.layers[index];
+        let Node { frames, culls, .. } = &self.nodes[index];
         let origin = area.origin();
-        let side = |length: Coord| u16::try_from(length.to_i64().unwrap()).unwrap();
-        let size = (side(area.width()), side(area.height()));
-        let to_window = Affine::translate((-origin.0.to_f64(), -origin.1.to_f64()));
-        SingleThreadedDispatcher::window(size, self.simd_level, origin.clone(), |target| {
-            for clip in &layer.clips {
-                clip.push_into(target, to_window);
-            }
-            for step in &layer.steps {
-                match *step {
-                    Step::Command { command, drawn } => {
-                        // A command drawing outside the window has no strips in it.
-                        let outside = drawn
-                            .and_then(Bounds::covering)
-                            .is_some_and(|drawn| !drawn.touches(area));
-                        if !outside {
-                            apply(target, &self.commands[command], to_window);
+        let to_frame = Affine::translate((-frame.0.to_f64(), -frame.1.to_f64()));
+        // The window holds too little of the clips' strips to bound them.
+        let push_clip = |target: &mut SingleThreadedDispatcher, clip: &Clip, cull: &Cull| {
+            let viewport = target.viewport_mut();
+            viewport.set_clip_bounds(cull.in_frame(frames, frame));
+            clip.push_into(viewport, to_frame);
+        };
+        SingleThreadedDispatcher::window(
+            frames.size,
+            area.to_rect_u16(frame),
+            self.simd_level,
+            origin.clone(),
+            |target| {
+                for (clip, cull) in layer.clips.iter().zip(&culls.outer) {
+                    push_clip(target, clip, cull);
+                }
+                for step in &layer.steps {
+                    match *step {
+                        Step::Command { command, drawn } => match &self.commands[command] {
+                            Command::PushClip(clip) => {
+                                push_clip(target, clip, &culls.pushed[&command]);
+                            }
+                            command => {
+                                // A command drawing outside the window has no strips in it.
+                                let outside = drawn
+                                    .and_then(Bounds::covering)
+                                    .is_some_and(|drawn| !drawn.touches(area));
+                                if !outside {
+                                    apply(target, command, to_frame);
+                                }
+                            }
+                        },
+                        Step::Nested { layer, push } => {
+                            let Command::PushLayer(pushed) = &self.commands[push] else {
+                                unreachable!("a nested layer starts with its push");
+                            };
+                            target.push_rendered_filter_layer(
+                                pushed,
+                                pushed.mask.clone(),
+                                to_frame,
+                                self.layers[layer].filter.clone(),
+                                pixmap(layer).intersect(area).to_rect_u16(&origin),
+                                layer,
+                            );
                         }
                     }
-                    Step::Nested { layer, push } => {
-                        let Command::PushLayer(pushed) = &self.commands[push] else {
-                            unreachable!("a nested layer starts with its push");
-                        };
-                        target.push_rendered_filter_layer(
-                            pushed,
-                            pushed.mask.clone(),
-                            to_window,
-                            self.layers[layer].filter.clone(),
-                            pixmap(layer).intersect(area).to_rect_u16(&origin),
-                            layer,
-                        );
-                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     /// Return where the output of the recorded layer is composited in the view.
@@ -1290,7 +1319,7 @@ impl<S: Simd, F: FineKernel<S>> Rendering<'_, S, F> {
         let mut source = PlacedPixmap::new(area.clone());
         // Windows are rendered in whole tiles.
         let content = node.source.hull_within(area).snap_to_tiles();
-        for shown in split(&content, WINDOW_SIZE) {
+        for (frame, shown) in node.frames.split(&content) {
             let mut nested = BTreeMap::new();
             for child in &graph.layers[index].children {
                 let child_node = &graph.nodes[child.layer];
@@ -1305,7 +1334,9 @@ impl<S: Simd, F: FineKernel<S>> Rendering<'_, S, F> {
                     );
                 }
             }
-            let window = graph.window(index, &shown, &|layer| graph.nodes[layer].pixmap.clone());
+            let window = graph.window(index, &shown, &frame, &|layer| {
+                graph.nodes[layer].pixmap.clone()
+            });
             let encoded_paints = paints_at(self.encoded_paints, &shown.origin());
             if let Some(rendered) = window.render_window::<S, F>(
                 self.simd,
@@ -1321,34 +1352,75 @@ impl<S: Simd, F: FineKernel<S>> Rendering<'_, S, F> {
     }
 }
 
-/// Width and height of a window, the largest tile multiple in the `u16` domain.
-const WINDOW_SIZE: i64 = 65532;
+/// Width and height of the frames of a viewport larger than the `u16` domain,
+/// the largest tile multiple in it.
+const WINDOW_SIZE: u16 = 65532;
 
-/// Return `bounds` split into pieces at most `size` wide and high, from its top left.
-fn split(bounds: &Bounds, size: i64) -> Vec<Bounds> {
-    let steps = |start: &Coord, end: &Coord| {
-        let count = (end - start).div_floor(&Coord::from(size)).to_usize() + 1;
-        (0..count)
-            .map(|step| start + i64::try_from(step).unwrap() * size)
-            .filter(|from| from < end)
-            .map(|from| {
-                let to = (&from + size).min(end.clone());
-                (from, to)
-            })
-            .collect::<Vec<_>>()
-    };
-    if bounds.is_empty() {
-        return Vec::new();
+/// The viewports the source of a layer is drawn in, as the recorder draws its
+/// viewport: the recorder's, cut to [`WINDOW_SIZE`] pixels a side at its origin
+/// if it does not fit the `u16` domain, and copies of it laid side by side from
+/// there in whole tiles. What the source draws outside the recorder's viewport,
+/// which the recorder cuts, counts as drawn in the copy it lies in, if it lies
+/// in the copy's viewport.
+#[derive(Debug)]
+struct Frames {
+    origin: Position,
+    /// The width and height of each.
+    size: (u16, u16),
+    /// The distances between them: their sides, in whole tiles.
+    step: (i64, i64),
+}
+
+impl Frames {
+    fn new(viewport: &Bounds) -> Self {
+        let side = |length: Coord| {
+            let length = length.to_i64().map_or(i64::MAX, |length| length.max(0));
+            u16::try_from(length).unwrap_or(WINDOW_SIZE)
+        };
+        let size = (side(viewport.width()), side(viewport.height()));
+        let step =
+            |length: u16, tile: u16| i64::from(length.max(1).div_ceil(tile)) * i64::from(tile);
+        Self {
+            origin: viewport.origin(),
+            size,
+            step: (step(size.0, Tile::WIDTH), step(size.1, Tile::HEIGHT)),
+        }
     }
-    let columns = steps(&bounds.x0, &bounds.x1);
-    steps(&bounds.y0, &bounds.y1)
-        .into_iter()
-        .flat_map(|(y0, y1)| {
-            columns
-                .iter()
-                .map(move |(x0, x1)| Bounds::new(x0.clone(), y0.clone(), x1.clone(), y1.clone()))
-        })
-        .collect()
+
+    /// Return the parts of `bounds`, which lie on tile corners, in the
+    /// viewport of each frame, with the frame's origin.
+    fn split(&self, bounds: &Bounds) -> Vec<(Position, Bounds)> {
+        if bounds.is_empty() {
+            return Vec::new();
+        }
+        let starts = |start: &Coord, end: &Coord, origin: &Coord, step: i64| {
+            let step = Coord::from(step);
+            let first = (start - origin).div_floor(&step);
+            let last = (end - origin - 1).div_floor(&step);
+            let count = (&last - &first).to_usize() + 1;
+            (0..count)
+                .map(|index| origin + (&first + i64::try_from(index).unwrap()).mul(&step))
+                .collect::<Vec<_>>()
+        };
+        let columns = starts(&bounds.x0, &bounds.x1, &self.origin.0, self.step.0);
+        let rows = starts(&bounds.y0, &bounds.y1, &self.origin.1, self.step.1);
+        let mut parts = Vec::with_capacity(columns.len() * rows.len());
+        for y in &rows {
+            for x in &columns {
+                let viewport = Bounds::new(
+                    x.clone(),
+                    y.clone(),
+                    x + i64::from(self.size.0),
+                    y + i64::from(self.size.1),
+                );
+                let part = bounds.intersect(&viewport);
+                if !part.is_empty() {
+                    parts.push(((x.clone(), y.clone()), part));
+                }
+            }
+        }
+        parts
+    }
 }
 
 /// Return copies of `paints` for sampling at the pixels of a window at `origin`.
@@ -1380,7 +1452,7 @@ pub(crate) fn content_filter() -> FilterData {
     )
 }
 
-fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Affine) {
+fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_frame: Affine) {
     match command {
         Command::FillPath {
             path,
@@ -1393,7 +1465,7 @@ fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Af
         } => target.fill_path(
             path,
             *fill_rule,
-            to_window * *transform,
+            to_frame * *transform,
             paint.clone(),
             *blend_mode,
             *aliasing_threshold,
@@ -1410,7 +1482,7 @@ fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Af
         } => target.stroke_path(
             path,
             stroke,
-            to_window * *transform,
+            to_frame * *transform,
             paint.clone(),
             *blend_mode,
             *aliasing_threshold,
@@ -1423,7 +1495,7 @@ fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Af
             blend_mode,
             mask,
         } => target.fill_rect_fast(
-            &(to_window * *transform).transform_rect_bbox(*rect),
+            &(to_frame * *transform).transform_rect_bbox(*rect),
             paint.clone(),
             *blend_mode,
             mask.clone(),
@@ -1431,7 +1503,7 @@ fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Af
         Command::PushLayer(layer) => target.push_layer(
             layer.clip_path.as_ref(),
             layer.fill_rule,
-            to_window * layer.clip_transform,
+            to_frame * layer.clip_transform,
             layer.blend_mode,
             layer.opacity,
             layer.aliasing_threshold,
@@ -1439,7 +1511,7 @@ fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Af
             None,
         ),
         Command::PopLayer => target.pop_layer(),
-        Command::PushClip(clip) => clip.push_into(target, to_window),
+        Command::PushClip(_) => unreachable!("windows push clips with their bounds"),
         Command::PopClip => target.pop_clip(),
     }
 }

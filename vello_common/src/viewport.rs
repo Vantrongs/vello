@@ -5,6 +5,7 @@
 
 use crate::clip::{ClipRef, ClipState, PushedClip};
 use crate::filter::FilterData;
+use crate::geometry::RectU16;
 use crate::kurbo::{Affine, BezPath, Rect};
 use crate::strip_generator::StripGenerator;
 use alloc::vec::Vec;
@@ -125,6 +126,22 @@ impl ViewportState {
             (narrow(shift_x), narrow(shift_y)),
             &mut self.strip_generator,
         );
+    }
+
+    /// Push a root viewport of `width` by `height`, with no clips of its own, whose
+    /// strips are generated in `window`, at its origin, see [`StripGenerator::new_window`].
+    pub fn push_window_viewport(&mut self, width: u16, height: u16, window: RectU16) {
+        let window_generator = StripGenerator::new_window(width, height, window, self.level);
+        let parent_generator = core::mem::replace(&mut self.strip_generator, window_generator);
+        self.strip_generator_stack.push(parent_generator);
+        self.clip_state
+            .push_root_viewport((0, 0), &mut self.strip_generator);
+    }
+
+    /// Set the bounds in the viewport of the strips of the next clip pushed, see
+    /// [`StripGenerator::set_clip_bounds`].
+    pub fn set_clip_bounds(&mut self, bounds: RectU16) {
+        self.strip_generator.set_clip_bounds(bounds);
     }
 
     /// Pop the last root viewport.

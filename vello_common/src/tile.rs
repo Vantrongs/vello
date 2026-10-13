@@ -426,6 +426,17 @@ impl PartialOrd for Tile {
 
 impl Eq for Tile {}
 
+/// The tiles of one line left of a window, in a row the tiler keeps: columns `x0` to
+/// before `x1` of the viewport, in the kept row `y`, all with `intersection_mask`.
+#[derive(Clone, Copy, Debug)]
+struct LeftTiles {
+    y: u16,
+    x0: u16,
+    x1: u16,
+    line_idx: u32,
+    intersection_mask: u32,
+}
+
 /// The tiles of a viewport a tiler keeps, in tile units: columns `x0` to `x_last` of
 /// rows `y0` to before `y1`, see [`Tiles::make_window_tiles_analytic_aa`].
 #[derive(Clone, Copy, Debug)]
@@ -444,12 +455,13 @@ impl Kept {
     }
 
     /// Push the tile at `x`, `y`, a kept row, moved to where the kept tiles start, if its
-    /// column is kept, or count its winding in `windings` if it lies left of them, as the
-    /// strip renderer would count it there.
+    /// column is kept, or, if it lies left of them, keep it in `left` and count its
+    /// winding in `windings`, as the strip renderer would count it there.
     #[inline(always)]
     fn push(
         self,
         tiles: &mut Vec<Tile>,
+        left: &mut Vec<LeftTiles>,
         windings: &mut CulledWindings,
         (x, y): (u16, u16),
         line_idx: u32,
@@ -462,6 +474,13 @@ impl Kept {
                 windings.mark_row_active(self.row(y));
                 windings.culled = true;
             }
+            left.push(LeftTiles {
+                y: y - self.y0,
+                x0: x,
+                x1: x + 1,
+                line_idx,
+                intersection_mask,
+            });
         } else if x <= self.x_last {
             tiles.push(Tile::new(
                 x - self.x0,
@@ -477,6 +496,7 @@ impl Kept {
     fn push_clamped(
         self,
         tiles: &mut Vec<Tile>,
+        left: &mut Vec<LeftTiles>,
         windings: &mut CulledWindings,
         (x, y): (u16, u16),
         line_idx: u32,
@@ -487,7 +507,15 @@ impl Kept {
             x.min(u16::MAX / Tile::WIDTH),
             y.min(u16::MAX / Tile::HEIGHT),
         );
-        self.push(tiles, windings, (x, y), line_idx, intersection_mask, dir);
+        self.push(
+            tiles,
+            left,
+            windings,
+            (x, y),
+            line_idx,
+            intersection_mask,
+            dir,
+        );
     }
 }
 
@@ -504,6 +532,11 @@ pub struct Tiles {
     origin: (u16, u16),
     /// Auxiliary data tracking row windings and active rows for early culling.
     pub windings: CulledWindings,
+    /// The tiles left of the window in the rows kept, while they are made.
+    left: Vec<LeftTiles>,
+    /// The tiles of the last strip left of the window in each row kept, sorted, see
+    /// [`Self::lead`].
+    lead: Vec<Tile>,
 }
 
 impl Tiles {
@@ -517,6 +550,8 @@ impl Tiles {
             height,
             origin: (0, 0),
             windings: CulledWindings::new(height),
+            left: Vec::new(),
+            lead: Vec::new(),
         }
     }
 
@@ -552,7 +587,47 @@ impl Tiles {
         self.width = width;
         self.height = height;
         self.tile_buf.clear();
+        self.left.clear();
+        self.lead.clear();
         self.sorted = false;
+    }
+
+    /// The tiles of the last strip of the viewport left of the window, in each row of
+    /// tiles the window keeps that has one, sorted, in columns of the viewport and rows
+    /// of the window, see [`Self::make_window_tiles_analytic_aa`].
+    pub(crate) fn lead(&self) -> &[Tile] {
+        &self.lead
+    }
+
+    /// Keep in [`Self::lead`] the tiles in `left` of the last strip in each row, the
+    /// run of columns with tiles that ends nearest the window.
+    fn find_lead(&mut self) {
+        if self.left.is_empty() {
+            return;
+        }
+        // The strip renderer starts the window's rows from them.
+        self.windings.culled = true;
+        self.left
+            .sort_unstable_by_key(|run| (run.y, core::cmp::Reverse(run.x1)));
+        for row in self.left.chunk_by(|a, b| a.y == b.y) {
+            let mut start = row[0].x0;
+            let mut count = 0;
+            for run in row {
+                if run.x1 < start {
+                    break;
+                }
+                start = start.min(run.x0);
+                count += 1;
+            }
+            for run in &row[..count] {
+                self.lead.extend(
+                    (run.x0..run.x1)
+                        .map(|x| Tile::new(x, run.y, run.line_idx, run.intersection_mask)),
+                );
+            }
+        }
+        self.left.clear();
+        self.lead.sort_unstable();
     }
 
     /// Sort the tiles in the container.
@@ -609,14 +684,15 @@ impl Tiles {
     }
 
     /// Generates the tiles [`Self::make_tiles_analytic_aa`] generates for a viewport of
-    /// `width` by `height`, of those in `window`, a part of it whose top left lies on a
-    /// tile corner, moved to the window's origin, with the work and memory of the window.
+    /// `width` by `height`, of those in `window`, a part of its tiles whose top left lies
+    /// on a tile corner, moved to the window's origin, with the memory of the window and
+    /// of a run of tiles per line left of it in each of its rows.
     ///
     /// Tiles right of the window are dropped, unless it reaches the right edge of the
-    /// viewport, and the coarse winding of those left of it is counted as that of lines
-    /// left of the viewport. [`crate::strip::render_window`] then renders the strips and
-    /// fills of the viewport in the window, but not their alphas right of what lies left
-    /// of it in the same row of tiles.
+    /// viewport. The coarse winding of those left of it is counted as that of lines left
+    /// of the viewport, and those of the last strip left of it in each row are kept, from
+    /// which [`crate::strip::render_window`] then renders the strips, fills and alphas of
+    /// the viewport in the window.
     pub fn make_window_tiles_analytic_aa(
         &mut self,
         level: Level,
@@ -674,14 +750,14 @@ impl Tiles {
                     !window.is_empty()
                         && window.x0 % Tile::WIDTH == 0
                         && window.y0 % Tile::HEIGHT == 0
-                        && window.x1 <= width
-                        && window.y1 <= height,
-                    "a window is a part of the viewport that starts on a tile corner"
+                        && window.x1 <= tile_columns.saturating_mul(Tile::WIDTH)
+                        && window.y1 <= tile_rows.saturating_mul(Tile::HEIGHT),
+                    "a window is a part of the viewport's tiles that starts on a tile corner"
                 );
                 Kept {
                     x0: window.x0 / Tile::WIDTH,
                     y0: window.y0 / Tile::HEIGHT,
-                    x_last: if window.x1 == width {
+                    x_last: if window.x1 >= width {
                         u16::MAX
                     } else {
                         window.x1.div_ceil(Tile::WIDTH).saturating_sub(1)
@@ -840,6 +916,7 @@ impl Tiles {
                             ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
                         kept.push_clamped(
                             &mut self.tile_buf,
+                            &mut self.left,
                             &mut self.windings,
                             (x, y_top_tiles),
                             line_idx,
@@ -859,6 +936,7 @@ impl Tiles {
                     for y_idx in y_start..y_bottom_tiles {
                         kept.push_clamped(
                             &mut self.tile_buf,
+                            &mut self.left,
                             &mut self.windings,
                             (x, y_idx),
                             line_idx,
@@ -880,6 +958,7 @@ impl Tiles {
                     let push_row_extents = {
                         #[inline(always)]
                         |tile_buf: &mut Vec<Tile>,
+                         left: &mut Vec<LeftTiles>,
                          windings: &mut CulledWindings,
                          y_idx: u16,
                          row_left_x: f32,
@@ -895,6 +974,7 @@ impl Tiles {
 
                                 kept.push(
                                     tile_buf,
+                                    left,
                                     windings,
                                     (x_start, y_idx),
                                     line_idx,
@@ -902,7 +982,18 @@ impl Tiles {
                                     dir,
                                 );
 
-                                // Those between carry no winding, so only those kept are made.
+                                // Those between carry no winding, so only those kept are made,
+                                // and those left of them kept as one run.
+                                let left_end = x_end.min(kept.x0);
+                                if x_start + 1 < left_end {
+                                    left.push(LeftTiles {
+                                        y: y_idx - kept.y0,
+                                        x0: x_start + 1,
+                                        x1: left_end,
+                                        line_idx,
+                                        intersection_mask: 0,
+                                    });
+                                }
                                 for x_idx in x_start.saturating_add(1).max(kept.x0)
                                     ..x_end.min(kept.x_last.saturating_add(1))
                                 {
@@ -917,6 +1008,7 @@ impl Tiles {
                                 if x_start < x_end {
                                     kept.push(
                                         tile_buf,
+                                        left,
                                         windings,
                                         (x_end, y_idx),
                                         line_idx,
@@ -1001,6 +1093,7 @@ impl Tiles {
 
                             push_row_extents(
                                 &mut self.tile_buf,
+                                &mut self.left,
                                 &mut self.windings,
                                 y_idx,
                                 row_left_x,
@@ -1028,6 +1121,7 @@ impl Tiles {
                             let mask = ((y >= line_top_y) as u32) << WINDING_SHIFT;
                             push_row_extents(
                                 &mut self.tile_buf,
+                                &mut self.left,
                                 &mut self.windings,
                                 y_top_tiles,
                                 f32::min(line_top_x, row_bottom_x),
@@ -1058,6 +1152,7 @@ impl Tiles {
                                 };
                                 push_row_extents(
                                     &mut self.tile_buf,
+                                    &mut self.left,
                                     &mut self.windings,
                                     y_idx,
                                     f32::min(row_top_x, row_bottom_x),
@@ -1101,6 +1196,7 @@ impl Tiles {
                 // Case line is fully contained within a single tile: These also cannot cross edges!
                 kept.push_clamped(
                     &mut self.tile_buf,
+                    &mut self.left,
                     &mut self.windings,
                     ((line_left_x as u16).min(tile_columns + 1), y_top_tiles),
                     line_idx,
@@ -1110,6 +1206,9 @@ impl Tiles {
             }
         }
 
+        if kept.x0 > 0 {
+            self.find_lead();
+        }
         self.windings.culled
     }
 

@@ -8,7 +8,7 @@ use crate::kurbo::{Affine, BezPath, PathEl, Rect};
 use crate::strip::Strip;
 use crate::strip_generator::{GenerationMode, StripGenerator, StripStorage};
 use crate::tile::Tile;
-use crate::util::{Clear, Pool, narrow, normalized_mul_u8, strip_bbox};
+use crate::util::{Clear, Pool, narrow, normalized_mul_u8};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -21,7 +21,8 @@ struct ClipData {
     strip_start: u32,
     /// The known geometric shape of this clip.
     shape: ClipShape,
-    /// A coarse bounding box of the clip path in pixel coordinates.
+    /// A coarse bounding box of the clip path in pixel coordinates of the viewport, see
+    /// [`StripGenerator::clip_bounds`].
     ///
     /// These bounds have already been intersected with the viewport.
     bbox: RectU16,
@@ -134,7 +135,7 @@ impl ClipContext {
 
         let shape = generate(strip_generator, &mut self.temp_storage, existing_clip);
 
-        let bbox = strip_bbox(&self.temp_storage.strips).unwrap_or(RectU16::ZERO);
+        let bbox = strip_generator.clip_bounds(&self.temp_storage.strips);
         let opaque_bbox = opaque_fill_bbox(&self.temp_storage.strips);
         self.storage.extend(&self.temp_storage);
         self.clip_stack.push(ClipData {
@@ -1173,6 +1174,37 @@ mod tests {
 
         clips.pop_root_viewport(&mut parent_generator);
         assert_eq!(clips.get().unwrap().shape, ClipShape::AxisAlignedRect(rect));
+    }
+
+    /// A clip in a window of a viewport keeps the bounds its strips have in the whole
+    /// viewport when they are set, or else those in the window, moved into the viewport.
+    #[test]
+    fn clip_bounds_in_a_window_are_those_of_the_viewport() {
+        let window = RectU16::new(40, 8, 100, 60);
+        let circle = crate::kurbo::Circle::new((50.3, 30.7), 21.4).to_path(0.1);
+        let clip = |generator: &mut StripGenerator, bounds: Option<RectU16>| {
+            let mut context = ClipContext::new();
+            context.push_clip_rect(&Rect::new(3.5, 2.25, 90.0, 70.0), generator);
+            if let Some(bounds) = bounds {
+                generator.set_clip_bounds(bounds);
+            }
+            context.push_clip_path(
+                circle.iter(),
+                generator,
+                Fill::NonZero,
+                Affine::IDENTITY,
+                None,
+            );
+            context.get().unwrap().path.bbox
+        };
+        let whole = clip(&mut StripGenerator::new(120, 100, Level::baseline()), None);
+        let part = |bounds| {
+            let mut generator = StripGenerator::new_window(120, 100, window, Level::baseline());
+            clip(&mut generator, bounds)
+        };
+        assert_eq!(whole, RectU16::new(28, 8, 72, 56));
+        assert_eq!(part(Some(whole)), whole);
+        assert_eq!(part(None), RectU16::new(40, 8, 72, 56));
     }
 
     #[test]
