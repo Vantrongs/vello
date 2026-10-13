@@ -28,8 +28,8 @@
 use super::{Clip, Command, FilterGraph, Layer, Step, WINDOW_SIZE};
 use crate::filter::placed::{Bounds, Coord, Padding, Position};
 use crate::kurbo::{
-    Affine, BezPath, CubicBez, Join, Line as Segment, ParamCurve, ParamCurveArclen,
-    ParamCurveExtrema, PathEl, PathSeg, Point, QuadBez, Rect, Stroke, StrokeCtx,
+    Affine, BezPath, Join, Line as Segment, ParamCurve, ParamCurveArclen, ParamCurveExtrema,
+    PathSeg, Point, Rect, Stroke, StrokeCtx,
 };
 use crate::peniko::Fill;
 #[cfg(not(feature = "std"))]
@@ -39,6 +39,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use vello_common::clip::{ClipRef, ClipShape, PathDataRef};
+use vello_common::dash::{self, DASH_ACCURACY, Pattern, Phase, Subpaths, Walk};
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{self, FlattenCtx, Line};
 use vello_common::geometry::RectU16;
@@ -215,11 +216,25 @@ impl<'a> Item<'a> {
             .inflate(reach, reach)
     }
 
-    /// Return the segments of the path in path coordinates, with the lines
-    /// that close each subpath of a fill, as the flattener walks them, each
-    /// with whether it starts a subpath, and the transform to root target
-    /// coordinates.
-    fn segments(&self) -> (Vec<(PathSeg, bool)>, Affine) {
+    /// Return the dash pattern of a dashed stroke, unless dashing draws it
+    /// whole.
+    fn dashes(&self) -> Option<Pattern<'a>> {
+        let Self::Stroke { stroke, .. } = self else {
+            return None;
+        };
+        let entries = &stroke.dash_pattern[..];
+        // Dashing walks a pattern with a negative entry back forever, see
+        // `Pattern::new`.
+        (!entries.is_empty() && entries.iter().all(|entry| *entry >= 0.0))
+            .then(|| Pattern::new(stroke.dash_offset, entries))
+    }
+
+    /// Return the segments of the path in path coordinates as the recorder
+    /// walks them, with the lines that close each subpath of a fill, see
+    /// `flatten_simd::flatten`, and those of a stroke dashed with `dashes`
+    /// each with the phase it starts at, see [`dash::phases`]; and the
+    /// transform to root target coordinates.
+    fn segments(&self, dashes: Option<&Pattern<'_>>) -> (Vec<(PathSeg, Option<Phase>)>, Affine) {
         let (path, transform, closes) = match self {
             Self::Rect(..) => return (Vec::new(), Affine::IDENTITY),
             Self::Fill {
@@ -229,72 +244,28 @@ impl<'a> Item<'a> {
                 path, transform, ..
             } => (path, transform, false),
         };
-        let mut segments = Vec::new();
-        let mut elements = path.iter();
-        let Some(PathEl::MoveTo(first)) = elements.next() else {
-            return (segments, *transform);
-        };
-        let (mut start, mut last, mut starts) = (first, first, true);
-        let push = |segments: &mut Vec<(PathSeg, bool)>, starts: &mut bool, segment: PathSeg| {
-            segments.push((segment, core::mem::take(starts)));
-        };
-        for element in elements {
-            match element {
-                PathEl::MoveTo(point) => {
-                    if closes && last != start {
-                        push(
-                            &mut segments,
-                            &mut starts,
-                            PathSeg::Line(Segment::new(last, start)),
-                        );
-                    }
-                    (start, last) = (point, point);
-                    starts = true;
-                }
-                PathEl::LineTo(point) => {
-                    push(
-                        &mut segments,
-                        &mut starts,
-                        PathSeg::Line(Segment::new(last, point)),
-                    );
-                    last = point;
-                }
-                PathEl::QuadTo(control, point) => {
-                    push(
-                        &mut segments,
-                        &mut starts,
-                        PathSeg::Quad(QuadBez::new(last, control, point)),
-                    );
-                    last = point;
-                }
-                PathEl::CurveTo(first_control, second_control, point) => {
-                    push(
-                        &mut segments,
-                        &mut starts,
-                        PathSeg::Cubic(CubicBez::new(last, first_control, second_control, point)),
-                    );
-                    last = point;
-                }
-                PathEl::ClosePath => {
-                    if last != start {
-                        push(
-                            &mut segments,
-                            &mut starts,
-                            PathSeg::Line(Segment::new(last, start)),
-                        );
-                    }
-                    last = start;
-                }
-            }
-        }
-        if closes && last != start {
-            push(
-                &mut segments,
-                &mut starts,
-                PathSeg::Line(Segment::new(last, start)),
+        if let Some(dashes) = dashes {
+            let segments = dash::phases(path.iter(), dashes);
+            return (
+                segments.map(|(seg, phase)| (seg, Some(phase))).collect(),
+                *transform,
             );
         }
-        (segments, *transform)
+        let mut segments = Vec::new();
+        let mut subpaths = Subpaths::default();
+        for element in path.iter() {
+            let opening = subpaths.open();
+            match subpaths.walk(element) {
+                Walk::Move => segments.extend(opening.filter(|_| closes)),
+                Walk::Segment(segment) | Walk::Close(Some(segment)) => segments.push(segment),
+                Walk::Close(None) => {}
+            }
+        }
+        segments.extend(subpaths.open().filter(|_| closes));
+        (
+            segments.into_iter().map(|seg| (seg, None)).collect(),
+            *transform,
+        )
     }
 }
 
@@ -1217,9 +1188,11 @@ impl<'a> Extents<'a> {
     /// segments do, where they cross the edges of `area`, the corners of
     /// `cut`, which a fill can cover, and where what lies left of the clips'
     /// strips is drawn along their left edge, see `fill_clip`, the points
-    /// left of it moved onto it. On a dashed stroke, where such a point
-    /// lies in a gap, the drawn point reaching furthest on its side of it is
-    /// where the dashes before and after it end and start. From the furthest,
+    /// left of it moved onto it. On a dashed stroke, where the dash or gap
+    /// such a point lies in starts and ends: the drawn points of a gap that
+    /// reach furthest on either side of it are there, and so are those where
+    /// dashing draws a line from one dash to another, see [`dash::phases`].
+    /// From the furthest,
     /// the path is flattened in a frame around each point not yet in one,
     /// with that side of the frame beyond the point by a stroke's reach,
     /// until no point is left that reaches further than the tiles found.
@@ -1252,69 +1225,56 @@ impl<'a> Extents<'a> {
                 Point::new(cull.x0, reached.y1),
             ));
         }
-        let dashes = match item {
-            Item::Stroke { stroke, .. } => Dashes::new(stroke),
-            Item::Rect(..) | Item::Fill { .. } => None,
-        };
-        let (segments, transform) = item.segments();
+        let dashes = item.dashes();
+        let (segments, transform) = item.segments(dashes.as_ref());
         let mut points: Vec<Point> = Vec::new();
-        // How far along its subpath the segment starts, for dashes.
-        let mut along = 0.0;
-        for (segment, starts) in segments {
-            if starts {
-                along = 0.0;
-            }
-            let length = dashes
-                .as_ref()
-                .map_or(0.0, |_| segment.arclen(DASH_ACCURACY));
+        for (segment, phase) in segments {
             let device = transform * segment;
-            if overlap(device.bounding_box(), reached) {
-                // Each parameter, with the point on an edge of `area` it
-                // crosses there.
-                let mut ends: Vec<(f64, Option<Point>)> = [0.0, 1.0]
-                    .into_iter()
-                    .chain(device.extrema())
-                    .map(|t| (t, None))
-                    .collect();
-                for edge in &edges {
-                    ends.extend(
-                        device
-                            .intersect_line(*edge)
-                            .iter()
-                            .map(|crossing| (crossing.segment_t, Some(edge.eval(crossing.line_t)))),
-                    );
-                }
-                for (t, crossing) in ends {
-                    match crossing {
-                        Some(point) => points.push(point),
-                        None => {
-                            let point = device.eval(t);
-                            points.extend(Some(point).filter(|point| reached.contains(*point)));
-                            if let Some(cull) = cull_rect
-                                && point.x < cull.x0
-                            {
-                                let moved = Point::new(cull.x0, point.y.clamp(cull.y0, cull.y1));
-                                points.extend(Some(moved).filter(|point| reached.contains(*point)));
-                            }
+            if !overlap(device.bounding_box(), reached) {
+                continue;
+            }
+            // Each parameter, with the point on an edge of `area` it crosses
+            // there.
+            let mut ends: Vec<(f64, Option<Point>)> = [0.0, 1.0]
+                .into_iter()
+                .chain(device.extrema())
+                .map(|t| (t, None))
+                .collect();
+            for edge in &edges {
+                ends.extend(
+                    device
+                        .intersect_line(*edge)
+                        .iter()
+                        .map(|crossing| (crossing.segment_t, Some(edge.eval(crossing.line_t)))),
+                );
+            }
+            let length = phase.map_or(0.0, |_| segment.arclen(DASH_ACCURACY));
+            for (t, crossing) in ends {
+                match crossing {
+                    Some(point) => points.push(point),
+                    None => {
+                        let point = device.eval(t);
+                        points.extend(Some(point).filter(|point| reached.contains(*point)));
+                        if let Some(cull) = cull_rect
+                            && point.x < cull.x0
+                        {
+                            let moved = Point::new(cull.x0, point.y.clamp(cull.y0, cull.y1));
+                            points.extend(Some(moved).filter(|point| reached.contains(*point)));
                         }
                     }
-                    let Some(dashes) = &dashes else {
-                        continue;
-                    };
-                    let at = along + segment.subsegment(0.0..t).arclen(DASH_ACCURACY);
-                    let Some((before, after)) = dashes.around(at) else {
-                        continue;
-                    };
-                    for stop in [before, after] {
-                        if (along..=along + length).contains(&stop) {
-                            let point =
-                                device.eval(segment.inv_arclen(stop - along, DASH_ACCURACY));
-                            points.extend(Some(point).filter(|point| reached.contains(*point)));
-                        }
+                }
+                let (Some(dashes), Some(phase)) = (&dashes, phase) else {
+                    continue;
+                };
+                let at = segment.subsegment(0.0..t).arclen(DASH_ACCURACY);
+                let (start, end, _) = dashes.entry_around(phase, at);
+                for stop in [start, end] {
+                    if (0.0..=length).contains(&stop) {
+                        let point = device.eval(segment.inv_arclen(stop, DASH_ACCURACY));
+                        points.extend(Some(point).filter(|point| reached.contains(*point)));
                     }
                 }
             }
-            along += length;
         }
         if cut.is_some() {
             points.extend(corners);
@@ -1618,64 +1578,6 @@ impl<'a> Extents<'a> {
     }
 }
 
-/// The accuracy `dash::dash` measures dashes to; the points found from it
-/// only place frames, which hold a dash that ends a little elsewhere.
-const DASH_ACCURACY: f64 = 1e-6;
-
-/// The dash pattern of a stroke as `dash::dash` walks each subpath: entries
-/// drawn and skipped in turn, the first drawn, from `offset` into the period.
-struct Dashes<'a> {
-    entries: &'a [f64],
-    /// The entries in a period: odd patterns are walked twice, the second
-    /// time with what is drawn and skipped swapped.
-    count: usize,
-    period: f64,
-    offset: f64,
-}
-
-impl<'a> Dashes<'a> {
-    /// Return the dashes of `stroke`, unless it is drawn solid.
-    fn new(stroke: &'a Stroke) -> Option<Self> {
-        let entries = &stroke.dash_pattern[..];
-        if entries.is_empty() {
-            return None;
-        }
-        let sum: f64 = entries.iter().sum();
-        let (period, count) = if entries.len() % 2 == 1 {
-            (2.0 * sum, 2 * entries.len())
-        } else {
-            (sum, entries.len())
-        };
-        // Other patterns place no gap a point could lie in.
-        let valid = period.is_finite()
-            && period > 0.0
-            && entries.iter().all(|entry| *entry >= 0.0)
-            && stroke.dash_offset.is_finite();
-        valid.then(|| Self {
-            entries,
-            count,
-            period,
-            offset: stroke.dash_offset.rem_euclid(period),
-        })
-    }
-
-    /// Return where the dashes before and after `at`, a length along a
-    /// subpath, end and start, if `at` lies in a gap.
-    fn around(&self, at: f64) -> Option<(f64, f64)> {
-        let position = (self.offset + at).rem_euclid(self.period);
-        let mut start = 0.0;
-        for index in 0..self.count {
-            let end = start + self.entries[index % self.entries.len()];
-            if position < end || index == self.count - 1 {
-                return (index % 2 == 1)
-                    .then_some((at - (position - start), at + (end - position)));
-            }
-            start = end;
-        }
-        None
-    }
-}
-
 /// Return the clip whose strips are in `clip`, culling to `bbox`.
 fn clip_ref(clip: &Option<(StripStorage, ClipShape)>, bbox: RectU16) -> Option<ClipRef<'_>> {
     clip.as_ref().map(|(storage, shape)| ClipRef {
@@ -1924,7 +1826,7 @@ fn is_axis_aligned_rect(item: &Item<'_>) -> bool {
     if !matches!(item, Item::Fill { .. }) {
         return false;
     }
-    let (segments, transform) = item.segments();
+    let (segments, transform) = item.segments(None);
     let [a, b, c, d, _, _] = transform.as_coeffs();
     if !(b == 0.0 && c == 0.0 || a == 0.0 && d == 0.0) {
         return false;

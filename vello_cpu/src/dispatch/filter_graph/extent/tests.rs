@@ -54,12 +54,16 @@ fn within(low: f64, high: f64, bits: Option<u32>) -> impl Fn(&mut Random) -> f64
 }
 
 /// Return a path of a few subpaths of lines and curves with coordinates from
-/// `coordinate`.
+/// `coordinate`; one after a closed subpath starts where it does at times,
+/// and a subpath is closed twice at times.
 fn random_path(random: &mut Random, coordinate: &dyn Fn(&mut Random) -> f64) -> BezPath {
     let point = |random: &mut Random| (coordinate(random), coordinate(random));
     let mut path = BezPath::new();
+    let mut closed = false;
     for _ in 0..1 + random.next() % 3 {
-        path.move_to(point(random));
+        if !closed || random.next().is_multiple_of(2) {
+            path.move_to(point(random));
+        }
         for _ in 0..1 + random.next() % 6 {
             match random.next() % 4 {
                 0 | 1 => path.line_to(point(random)),
@@ -73,8 +77,12 @@ fn random_path(random: &mut Random, coordinate: &dyn Fn(&mut Random) -> f64) -> 
                 }
             }
         }
-        if random.next().is_multiple_of(2) {
+        closed = random.next().is_multiple_of(2);
+        if closed {
             path.close_path();
+            if random.next().is_multiple_of(4) {
+                path.close_path();
+            }
         }
     }
     path
@@ -491,6 +499,17 @@ fn dashes_between_gaps_longer_than_a_frame_are_found() {
         (
             line((100_032.0, -500_000.0), (100_032.0, 500_000.0)),
             Stroke::new(2.0).with_dashes(500_000.0, [100_000.0, 900_000.0]),
+        ),
+        // The last line starts the pattern over from where the closed
+        // subpath starts, and draws its one dash far from its ends.
+        (
+            {
+                let mut path = line((-200_000.0, 100_000.0), (50_000.0, 100_000.0));
+                path.close_path();
+                path.line_to((800_000.0, 100_000.0));
+                path
+            },
+            Stroke::new(1.0).with_dashes(500_000.0, [10.0, 999_990.0]),
         ),
         // Dashes start and end inside a curve.
         (

@@ -63,7 +63,7 @@ extern crate std;
 pub mod blurred_rounded_rect;
 pub mod clip;
 pub(crate) mod cull;
-pub(crate) mod dash;
+pub mod dash;
 pub mod encode;
 pub(crate) mod fill_clip;
 pub mod filter;

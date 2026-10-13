@@ -26,7 +26,8 @@ use crate::kurbo::{
 };
 use alloc::vec::Vec;
 
-const DASH_ACCURACY: f64 = 1e-6;
+/// The accuracy dashing measures lengths along segments to.
+pub const DASH_ACCURACY: f64 = 1e-6;
 
 /// Pattern entries (dashes and gaps) per device pixel, on average along a segment,
 /// beyond which the segment is drawn solid: for a pattern of a dash and a gap, a
@@ -43,6 +44,235 @@ const DENSE_ENTRIES_PER_PX: f64 = 32.0;
 /// gap take about 64 bytes as a thin outline and 300 as an expanded one.
 const PATH_ENTRIES: f64 = (1 << 22) as f64;
 
+/// A dash pattern as dashing walks it along each subpath: its entries drawn and
+/// skipped in turn, the first drawn, from the offset on. A pattern of an odd number of
+/// entries is walked twice per period, the second time with what is drawn and what is
+/// skipped swapped.
+#[derive(Clone, Copy, Debug)]
+pub struct Pattern<'a> {
+    dashes: &'a [f64],
+    /// The length after which the dash state repeats.
+    period: f64,
+    /// The pattern entries walked along `period`.
+    entries_per_period: f64,
+    /// Where each subpath starts.
+    start: Phase,
+}
+
+/// Where dashing is in a [`Pattern`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Phase {
+    /// The entry.
+    ix: usize,
+    /// The length left of it.
+    remaining: f64,
+    /// Whether it is drawn.
+    active: bool,
+}
+
+impl<'a> Pattern<'a> {
+    /// The pattern of `dashes` from `dash_offset` on, which must not be empty.
+    ///
+    /// A pattern with a negative entry walks back forever; one whose entries are not
+    /// finite or sum to zero draws every segment whole.
+    pub fn new(dash_offset: f64, dashes: &'a [f64]) -> Self {
+        // Ensure that offset is positive and minimal by normalization using period
+        let period = dashes.iter().sum();
+        // The SVG spec requires odd-length dash arrays to be doubled to become even-length:
+        // <https://www.w3.org/TR/SVG2/painting.html#StrokeDasharrayProperty>
+        // This prevents gaps and dashes from swapping with one another as the offset increases.
+        let period = if dashes.len() % 2 == 1 {
+            2.0 * period
+        } else {
+            period
+        };
+        let dash_offset = dash_offset.rem_euclid(period);
+        let entries = if dashes.len() % 2 == 1 {
+            2 * dashes.len()
+        } else {
+            dashes.len()
+        };
+
+        let mut dash_ix = 0;
+        let mut dash_remaining = dashes[dash_ix] - dash_offset;
+        let mut is_active = true;
+        // Find place in dashes array for initial offset.
+        while dash_remaining < 0.0 {
+            dash_ix = (dash_ix + 1) % dashes.len();
+            dash_remaining += dashes[dash_ix];
+            is_active = !is_active;
+        }
+        Self {
+            dashes,
+            period,
+            entries_per_period: entries as f64,
+            start: Phase {
+                ix: dash_ix,
+                remaining: dash_remaining,
+                active: is_active,
+            },
+        }
+    }
+
+    /// Where each subpath starts.
+    pub fn start(&self) -> Phase {
+        self.start
+    }
+
+    /// Move `phase` to the start of the next entry.
+    fn next(&self, phase: &mut Phase) {
+        phase.active = !phase.active;
+        phase.ix += 1;
+        if phase.ix == self.dashes.len() {
+            phase.ix = 0;
+        }
+        phase.remaining = self.dashes[phase.ix];
+    }
+
+    /// Walk `len` along from `phase`, leave in `len` what is walked of the last entry
+    /// reached, and return whether a drawn entry ended on the way.
+    fn walk(&self, phase: &mut Phase, len: &mut f64) -> bool {
+        let mut ended = false;
+        while phase.remaining < *len {
+            ended |= phase.active;
+            *len -= phase.remaining;
+            self.next(phase);
+        }
+        phase.remaining -= *len;
+        ended
+    }
+
+    /// `len` less as many whole periods as leave it longer than what is left of the
+    /// entry at `phase`, so walking it gives the dash state walking `len` would.
+    fn less_whole_periods(&self, phase: &Phase, len: f64) -> f64 {
+        let (dash, period) = (phase.remaining, self.period);
+        if !(period > 0.0 && len - dash > period) {
+            return len;
+        }
+        // `len - dash` would round away the small remainder of a huge length: reduce
+        // `len` first, exactly (`%` is exact), then subtract.
+        dash + (len % period - dash).rem_euclid(period)
+    }
+
+    /// Walk `len` along from `phase` as dashing walks a segment it draws solid, in
+    /// work that does not grow with `len`.
+    pub fn skip(&self, phase: &mut Phase, len: f64) {
+        self.walk(phase, &mut self.less_whole_periods(phase, len));
+    }
+
+    /// Return where the entry dashing from `phase` reaches the point `at` along in
+    /// starts and ends, as lengths along from `phase`, and whether it is drawn; it
+    /// starts before `phase` if `phase` is inside it.
+    pub fn entry_around(&self, mut phase: Phase, at: f64) -> (f64, f64, bool) {
+        let mut left = self.less_whole_periods(&phase, at);
+        let mut walked = at - left;
+        let mut start = walked - (self.dashes[phase.ix] - phase.remaining);
+        while phase.remaining < left {
+            walked += phase.remaining;
+            left -= phase.remaining;
+            start = walked;
+            self.next(&mut phase);
+        }
+        (start, walked + phase.remaining, phase.active)
+    }
+}
+
+/// What dashing does with a path element.
+#[derive(Clone, Copy, Debug)]
+pub enum Walk {
+    /// Starts a subpath, and the pattern over.
+    Move,
+    /// Walks a segment.
+    Segment(PathSeg),
+    /// Closes the subpath, walking the line back to its start if it ends elsewhere; the
+    /// pattern starts over after it, see `DashIterator::handle_closepath`.
+    Close(Option<PathSeg>),
+}
+
+/// Where a path's subpath starts and its last segment ends, as dashing walks it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Subpaths {
+    start: Point,
+    last: Point,
+}
+
+impl Subpaths {
+    /// Return the line back to where the subpath starts, unless it ends there.
+    pub fn open(&self) -> Option<PathSeg> {
+        (self.last != self.start).then(|| PathSeg::Line(Line::new(self.last, self.start)))
+    }
+
+    /// Walk `el`.
+    pub fn walk(&mut self, el: PathEl) -> Walk {
+        let p0 = self.last;
+        match el {
+            PathEl::MoveTo(p) => {
+                self.start = p;
+                self.last = p;
+                Walk::Move
+            }
+            PathEl::LineTo(p1) => {
+                self.last = p1;
+                Walk::Segment(PathSeg::Line(Line::new(p0, p1)))
+            }
+            PathEl::QuadTo(p1, p2) => {
+                self.last = p2;
+                Walk::Segment(PathSeg::Quad(QuadBez::new(p0, p1, p2)))
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                self.last = p3;
+                Walk::Segment(PathSeg::Cubic(CubicBez::new(p0, p1, p2, p3)))
+            }
+            PathEl::ClosePath => {
+                let closing = self.open();
+                self.last = self.start;
+                Walk::Close(closing)
+            }
+        }
+    }
+}
+
+/// Return the segments dashing with `pattern` walks along `path`, each with the
+/// phase it starts at, in work that follows the number of segments: the phases are
+/// those dashing reaches up to rounding, as it walks most segments dash by dash.
+///
+/// A closing read before any segment since the last closing, or since the path's
+/// start, walks the last segment walked again from its start, see
+/// `DashIterator::get_input`, where `step` takes it up from the state the closing
+/// leaves; it is given whole, with the phase a subpath starts at, though dashing
+/// walks it only so far and joins what it draws to what it drew last.
+pub fn phases<'a>(
+    path: impl IntoIterator<Item = PathEl> + 'a,
+    pattern: &'a Pattern<'_>,
+) -> impl Iterator<Item = (PathSeg, Phase)> + 'a {
+    let mut subpaths = Subpaths::default();
+    let mut phase = pattern.start();
+    let mut last = PathSeg::Line(Line::new(Point::ORIGIN, Point::ORIGIN));
+    // Whether a closing walks `last` again.
+    let mut again = true;
+    path.into_iter().filter_map(move |el| {
+        let (seg, closes) = match subpaths.walk(el) {
+            Walk::Move => {
+                phase = pattern.start();
+                return None;
+            }
+            Walk::Segment(seg) => (seg, false),
+            Walk::Close(Some(seg)) => (seg, true),
+            Walk::Close(None) => {
+                phase = pattern.start();
+                return core::mem::replace(&mut again, true).then_some((last, phase));
+            }
+        };
+        let at = phase;
+        pattern.skip(&mut phase, seg.arclen(DASH_ACCURACY));
+        if closes {
+            phase = pattern.start();
+        }
+        (last, again) = (seg, closes);
+        Some((seg, at))
+    })
+}
+
 /// Dashes `inner` like `kurbo::dash`, skipping the dash periods of the segments
 /// flagged `true`; `affine` maps the path to device space.
 pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
@@ -51,54 +281,21 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
     dashes: &'a [f64],
     affine: Affine,
 ) -> DashIterator<'a, T> {
-    // Ensure that offset is positive and minimal by normalization using period
-    let period = dashes.iter().sum();
-    // The SVG spec requires odd-length dash arrays to be doubled to become even-length:
-    // <https://www.w3.org/TR/SVG2/painting.html#StrokeDasharrayProperty>
-    // This prevents gaps and dashes from swapping with one another as the offset increases.
-    let period = if dashes.len() % 2 == 1 {
-        2.0 * period
-    } else {
-        period
-    };
-    let dash_offset = dash_offset.rem_euclid(period);
-    let entries = if dashes.len() % 2 == 1 {
-        2 * dashes.len()
-    } else {
-        dashes.len()
-    };
-
-    let mut dash_ix = 0;
-    let mut dash_remaining = dashes[dash_ix] - dash_offset;
-    let mut is_active = true;
-    // Find place in dashes array for initial offset.
-    while dash_remaining < 0.0 {
-        dash_ix = (dash_ix + 1) % dashes.len();
-        dash_remaining += dashes[dash_ix];
-        is_active = !is_active;
-    }
+    let pattern = Pattern::new(dash_offset, dashes);
     DashIterator {
         inner,
         input_done: false,
         closepath_pending: false,
-        dashes,
-        dash_ix,
-        init_dash_ix: dash_ix,
-        init_dash_remaining: dash_remaining,
-        init_is_active: is_active,
-        is_active,
+        pattern,
+        phase: pattern.start(),
         state: DashState::NeedInput,
         current_seg: PathSeg::Line(Line::new(Point::ORIGIN, Point::ORIGIN)),
         t: 0.0,
-        dash_remaining,
         seg_remaining: 0.0,
-        start_pt: Point::ORIGIN,
-        last_pt: Point::ORIGIN,
+        subpaths: Subpaths::default(),
         stash: Vec::new(),
         stash_ix: 0,
         needs_moveto: true,
-        period,
-        entries_per_period: entries as f64,
         dense: None,
         affine,
         entries_left: PATH_ENTRIES,
@@ -110,26 +307,16 @@ pub(crate) struct DashIterator<'a, T> {
     inner: T,
     input_done: bool,
     closepath_pending: bool,
-    dashes: &'a [f64],
-    dash_ix: usize,
-    init_dash_ix: usize,
-    init_dash_remaining: f64,
-    init_is_active: bool,
-    is_active: bool,
+    pattern: Pattern<'a>,
+    phase: Phase,
     state: DashState,
     current_seg: PathSeg,
     t: f64,
-    dash_remaining: f64,
     seg_remaining: f64,
-    start_pt: Point,
-    last_pt: Point,
+    subpaths: Subpaths,
     stash: Vec<PathEl>,
     stash_ix: usize,
     needs_moveto: bool,
-    /// The length after which the dash state repeats.
-    period: f64,
-    /// The pattern entries walked along `period`.
-    entries_per_period: f64,
     /// Whether `current_seg` is drawn solid (`set_segment`), and if so how far it is
     /// out.
     dense: Option<Solid>,
@@ -218,36 +405,20 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
                 self.state = DashState::FromStash;
                 return;
             };
-            let p0 = self.last_pt;
-            match next_el {
-                PathEl::MoveTo(p) => {
+            match self.subpaths.walk(next_el) {
+                Walk::Move => {
                     if !self.stash.is_empty() {
                         self.state = DashState::FromStash;
                     }
-                    self.start_pt = p;
-                    self.last_pt = p;
                     self.reset_phase();
                     continue;
                 }
-                PathEl::LineTo(p1) => {
-                    self.set_segment(PathSeg::Line(Line::new(p0, p1)), skip);
-                    self.last_pt = p1;
-                }
-                PathEl::QuadTo(p1, p2) => {
-                    self.set_segment(PathSeg::Quad(QuadBez::new(p0, p1, p2)), skip);
-                    self.last_pt = p2;
-                }
-                PathEl::CurveTo(p1, p2, p3) => {
-                    self.set_segment(PathSeg::Cubic(CubicBez::new(p0, p1, p2, p3)), skip);
-                    self.last_pt = p3;
-                }
-                PathEl::ClosePath => {
+                Walk::Segment(seg) => self.set_segment(seg, skip),
+                Walk::Close(closing) => {
                     self.closepath_pending = true;
-                    if p0 != self.start_pt {
-                        self.set_segment(PathSeg::Line(Line::new(p0, self.start_pt)), false);
-                        self.last_pt = self.start_pt;
-                    } else {
-                        self.handle_closepath();
+                    match closing {
+                        Some(closing) => self.set_segment(closing, false),
+                        None => self.handle_closepath(),
                     }
                 }
             }
@@ -268,36 +439,25 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             // its depth limit for nothing.
             let len = seg.arclen(DASH_ACCURACY.max(1e-9 * control_length(&seg)));
             self.dense = Some(Solid::Start);
-            self.seg_remaining = self.less_whole_periods(len);
+            self.seg_remaining = self.pattern.less_whole_periods(&self.phase, len);
             self.current_seg = PathSeg::Line(Line::new(seg.start(), seg.end()));
             return;
         }
         let len = seg.arclen(DASH_ACCURACY);
         self.current_seg = seg;
-        let entries = len / self.period * self.entries_per_period;
-        if self.period > 0.0
+        let (period, entries_per_period) = (self.pattern.period, self.pattern.entries_per_period);
+        let entries = len / period * entries_per_period;
+        if period > 0.0
             && (entries > self.entries_left
                 || entries > DENSE_ENTRIES_PER_PX * (self.device_length(&seg) + 1.0))
         {
             self.dense = Some(Solid::Start);
-            self.seg_remaining = self.less_whole_periods(len);
+            self.seg_remaining = self.pattern.less_whole_periods(&self.phase, len);
         } else {
             self.dense = None;
             self.entries_left -= entries;
             self.seg_remaining = len;
         }
-    }
-
-    /// `len` less as many whole periods as leave it longer than the current dash, so
-    /// walking it gives the dash state walking `len` would.
-    fn less_whole_periods(&self, len: f64) -> f64 {
-        let (dash, period) = (self.dash_remaining, self.period);
-        if !(period > 0.0 && len - dash > period) {
-            return len;
-        }
-        // `len - dash` would round away the small remainder of a huge length: reduce
-        // `len` first, exactly (`%` is exact), then subtract.
-        dash + (len % period - dash).rem_euclid(period)
     }
 
     /// An upper bound on the device length of `seg`: its control polygon's.
@@ -310,7 +470,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
         let mut result = None;
         if self.state == DashState::ToStash && self.needs_moveto {
             self.needs_moveto = false;
-            if self.is_active {
+            if self.phase.active {
                 result = Some(PathEl::MoveTo(self.current_seg.start()));
             } else {
                 self.state = DashState::Working;
@@ -321,7 +481,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
                 self.get_input();
                 return Some(PathEl::MoveTo(end));
             }
-            if solid == Solid::Start && !self.is_active {
+            if solid == Solid::Start && !self.phase.active {
                 // A dash starts with the segment.
                 self.dense = Some(Solid::Moved);
                 return Some(PathEl::MoveTo(self.current_seg.start()));
@@ -329,29 +489,19 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             result = Some(crate::cull::seg_to_el(&self.current_seg));
             let stashing = self.state == DashState::ToStash;
             // The dash state at its end, as walking it would leave it.
-            while self.dash_remaining < self.seg_remaining {
-                if self.is_active {
-                    self.state = DashState::Working;
-                }
-                self.is_active = !self.is_active;
-                self.seg_remaining -= self.dash_remaining;
-                self.dash_ix += 1;
-                if self.dash_ix == self.dashes.len() {
-                    self.dash_ix = 0;
-                }
-                self.dash_remaining = self.dashes[self.dash_ix];
+            if self.pattern.walk(&mut self.phase, &mut self.seg_remaining) {
+                self.state = DashState::Working;
             }
-            self.dash_remaining -= self.seg_remaining;
-            if stashing && self.state == DashState::Working && self.is_active {
+            if stashing && self.state == DashState::Working && self.phase.active {
                 self.dense = Some(Solid::Stashed);
             } else {
                 self.get_input();
             }
-        } else if self.dash_remaining < self.seg_remaining {
+        } else if self.phase.remaining < self.seg_remaining {
             // next transition is a dash transition
             let seg = self.current_seg.subsegment(self.t..1.0);
-            let t1 = seg.inv_arclen(self.dash_remaining, DASH_ACCURACY);
-            if self.is_active {
+            let t1 = seg.inv_arclen(self.phase.remaining, DASH_ACCURACY);
+            if self.phase.active {
                 let subseg = seg.subsegment(0.0..t1);
                 result = Some(crate::cull::seg_to_el(&subseg));
                 self.state = DashState::Working;
@@ -359,20 +509,15 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
                 let p = seg.eval(t1);
                 result = Some(PathEl::MoveTo(p));
             }
-            self.is_active = !self.is_active;
             self.t += t1 * (1.0 - self.t);
-            self.seg_remaining -= self.dash_remaining;
-            self.dash_ix += 1;
-            if self.dash_ix == self.dashes.len() {
-                self.dash_ix = 0;
-            }
-            self.dash_remaining = self.dashes[self.dash_ix];
+            self.seg_remaining -= self.phase.remaining;
+            self.pattern.next(&mut self.phase);
         } else {
-            if self.is_active {
+            if self.phase.active {
                 let seg = self.current_seg.subsegment(self.t..1.0);
                 result = Some(crate::cull::seg_to_el(&seg));
             }
-            self.dash_remaining -= self.seg_remaining;
+            self.phase.remaining -= self.seg_remaining;
             self.get_input();
         }
         result
@@ -382,7 +527,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
         if self.state == DashState::ToStash {
             // Have looped back without breaking a dash, just play it back
             self.stash.push(PathEl::ClosePath);
-        } else if self.is_active {
+        } else if self.phase.active {
             // connect with path in stash, skip MoveTo.
             self.stash_ix = 1;
         }
@@ -391,9 +536,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
     }
 
     fn reset_phase(&mut self) {
-        self.dash_ix = self.init_dash_ix;
-        self.dash_remaining = self.init_dash_remaining;
-        self.is_active = self.init_is_active;
+        self.phase = self.pattern.start();
         self.needs_moveto = true;
     }
 }
@@ -671,5 +814,229 @@ mod tests {
         assert!(a.windows(2).any(|w| w == whole), "{a:?}");
         let b = kurbo(&p, 4.0, &dashes);
         same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
+    }
+
+    /// A source of pseudo-random numbers.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn number(&mut self, low: f64, high: f64) -> f64 {
+            low + (self.next() >> 11) as f64 / (1_u64 << 53) as f64 * (high - low)
+        }
+    }
+
+    /// A path of subpaths of lines and, unless `lines` is set, curves, some closed,
+    /// some drawn on from where a closed one starts, some closed again at once.
+    fn random_path(random: &mut Random, lines: bool) -> BezPath {
+        let point = |random: &mut Random| (random.number(0.0, 400.0), random.number(0.0, 400.0));
+        let mut path = BezPath::new();
+        path.move_to(point(random));
+        for _ in 0..2 + random.next() % 10 {
+            match random.next() % 7 {
+                2 if !lines => {
+                    let (control, end) = (point(random), point(random));
+                    path.quad_to(control, end);
+                }
+                3 if !lines => {
+                    let (first, second, end) = (point(random), point(random), point(random));
+                    path.curve_to(first, second, end);
+                }
+                4 => path.move_to(point(random)),
+                5 | 6 => path.close_path(),
+                _ => path.line_to(point(random)),
+            }
+        }
+        path
+    }
+
+    fn random_pattern(random: &mut Random) -> (Vec<f64>, f64) {
+        let entries = (0..1 + random.next() % 5)
+            .map(|_| match random.next() % 4 {
+                0 => 0.0,
+                _ => random.number(0.5, 60.0),
+            })
+            .collect();
+        let offset = match random.next() % 3 {
+            0 => 0.0,
+            1 => random.number(-100.0, 100.0),
+            _ => random.number(-1e6, 1e6),
+        };
+        (entries, offset)
+    }
+
+    /// The segments of `path` as dashing walks them.
+    fn segments(path: &BezPath) -> Vec<PathSeg> {
+        let mut subpaths = Subpaths::default();
+        path.iter()
+            .filter_map(|el| match subpaths.walk(el) {
+                Walk::Segment(seg) | Walk::Close(Some(seg)) => Some(seg),
+                Walk::Move | Walk::Close(None) => None,
+            })
+            .collect()
+    }
+
+    /// `phases` gives each segment of the path with the phase dashing walks it from,
+    /// wherever subpaths start and close, and segments are drawn on from where a
+    /// closed subpath starts. A closing that walks no line can make dashing walk a
+    /// segment again or join a dash to the one drawn last, which the test below
+    /// covers.
+    #[test]
+    fn phases_are_those_dashing_walks() {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        let mut checked = 0;
+        for case in 0..1000 {
+            let path = random_path(&mut random, false);
+            let (entries, offset) = random_pattern(&mut random);
+            if entries.iter().sum::<f64>() < 1.0 {
+                continue;
+            }
+            let pattern = Pattern::new(offset, &entries);
+            let walked: Vec<(PathSeg, Phase)> = phases(path.iter(), &pattern).collect();
+            let mut subpaths = Subpaths::default();
+            if path
+                .iter()
+                .any(|el| matches!(subpaths.walk(el), Walk::Close(None)))
+            {
+                continue;
+            }
+            let segments = segments(&path);
+            assert!(
+                walked
+                    .iter()
+                    .map(|(seg, _)| *seg)
+                    .eq(segments.iter().copied())
+            );
+            let out = dash(
+                path.iter().map(|el| (el, false)),
+                offset,
+                &entries,
+                Affine::IDENTITY,
+            );
+            let mut flat = Vec::new();
+            crate::kurbo::flatten(out, 1e-5, |el| flat.push(el));
+            let (lines, ends) = dash_lines(&flat);
+            for (index, (seg, phase)) in walked.iter().enumerate() {
+                let length = seg.arclen(DASH_ACCURACY);
+                // Where another segment passes, its dashes could be there.
+                let elsewhere = |p: Point| {
+                    segments.iter().enumerate().any(|(other, seg)| {
+                        other != index && seg.nearest(p, 1e-9).distance_sq < 1e-4
+                    })
+                };
+                for step in 1..40 {
+                    let at = length * f64::from(step) / 40.0;
+                    let p = seg.eval(seg.inv_arclen(at, 1e-9));
+                    if elsewhere(p) || ends.iter().any(|end| end.distance(p) < 1e-2) {
+                        continue;
+                    }
+                    checked += 1;
+                    let (start, end, drawn) = pattern.entry_around(*phase, at);
+                    assert!(start <= at && at <= end, "case {case}");
+                    assert_eq!(
+                        on_dash_within(&lines, p, 1e-3),
+                        drawn,
+                        "case {case}, segment {index} at {at}: {}",
+                        path.to_svg()
+                    );
+                    // The dashes around a gap end and start where it says.
+                    for stop in [start, end] {
+                        let q = seg.eval(seg.inv_arclen(stop.clamp(0.0, length), 1e-9));
+                        if !drawn && (0.0..=length).contains(&stop) && !elsewhere(q) {
+                            assert!(on_dash_within(&lines, q, 1e-3), "case {case}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 50_000, "{checked} points checked");
+    }
+
+    /// Every dash, also where a closing walks a segment again, starts and ends at an
+    /// end of a segment or of an entry of a segment `phases` gives.
+    #[test]
+    fn phases_give_every_end_of_a_dash() {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        let (mut checked, mut again) = (0, 0);
+        for case in 0..2000 {
+            let path = random_path(&mut random, true);
+            let (entries, offset) = random_pattern(&mut random);
+            if entries.iter().sum::<f64>() < 1.0 {
+                continue;
+            }
+            let pattern = Pattern::new(offset, &entries);
+            let walked: Vec<(PathSeg, Phase)> = phases(path.iter(), &pattern).collect();
+            again += usize::from(walked.len() > segments(&path).len());
+            let out = dash(
+                path.iter().map(|el| (el, false)),
+                offset,
+                &entries,
+                Affine::IDENTITY,
+            );
+            for el in out {
+                let (PathEl::MoveTo(q) | PathEl::LineTo(q)) = el else {
+                    continue;
+                };
+                checked += 1;
+                let found = walked.iter().any(|(seg, phase)| {
+                    let PathSeg::Line(line) = *seg else {
+                        unreachable!("lines only")
+                    };
+                    let length = line.length();
+                    if line.p0.distance(q) < 1e-6 || line.p1.distance(q) < 1e-6 {
+                        return true;
+                    }
+                    let at = (q - line.p0).dot(line.p1 - line.p0) / length;
+                    if !(0.0..=length).contains(&at) || line.eval(at / length).distance(q) > 1e-6 {
+                        return false;
+                    }
+                    let (start, end, _) = pattern.entry_around(*phase, at);
+                    (at - start).abs() < 1e-5 || (end - at).abs() < 1e-5
+                });
+                assert!(found, "case {case}: {q:?} of {}", path.to_svg());
+            }
+        }
+        assert!(
+            checked > 20_000 && again > 100,
+            "{checked} ends, {again} paths walked again"
+        );
+    }
+
+    /// The lines of `out`, dashes flattened to lines, and where each dash starts and
+    /// ends.
+    fn dash_lines(out: &[PathEl]) -> (Vec<Line>, Vec<Point>) {
+        let (mut lines, mut ends) = (Vec::new(), Vec::new());
+        let (mut start, mut last) = (Point::ORIGIN, Point::ORIGIN);
+        for el in out {
+            match *el {
+                PathEl::MoveTo(q) => {
+                    ends.extend([last, q]);
+                    (start, last) = (q, q);
+                }
+                PathEl::LineTo(q) => {
+                    lines.push(Line::new(last, q));
+                    last = q;
+                }
+                PathEl::ClosePath => {
+                    lines.push(Line::new(last, start));
+                    last = start;
+                }
+                _ => panic!("lines only: {el:?}"),
+            }
+        }
+        ends.push(last);
+        (lines, ends)
+    }
+
+    fn on_dash_within(lines: &[Line], p: Point, distance: f64) -> bool {
+        lines
+            .iter()
+            .any(|l| l.nearest(p, 1e-9).distance_sq < distance * distance)
     }
 }

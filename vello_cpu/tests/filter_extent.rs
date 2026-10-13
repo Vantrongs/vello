@@ -36,6 +36,17 @@ fn render(
     mode: RenderMode,
     draw: impl FnOnce(&mut RenderContext),
 ) -> Pixmap {
+    render_nested(size, core::slice::from_ref(filter), mode, draw)
+}
+
+/// Render `draw` in filter layers with `filters`, each nested in the one
+/// before, in a `size` by `size` view.
+fn render_nested(
+    size: u16,
+    filters: &[Filter],
+    mode: RenderMode,
+    draw: impl FnOnce(&mut RenderContext),
+) -> Pixmap {
     let mut context = RenderContext::new_with(
         size,
         size,
@@ -44,10 +55,14 @@ fn render(
             num_threads: 0,
         },
     );
-    context.push_filter_layer(filter.clone());
+    for filter in filters {
+        context.push_filter_layer(filter.clone());
+    }
     context.set_paint(BLUE);
     draw(&mut context);
-    context.pop_layer();
+    for _ in filters {
+        context.pop_layer();
+    }
     context.flush();
     let mut pixmap = Pixmap::new(size, size);
     context.render_with(
@@ -80,6 +95,35 @@ fn a_dash_between_gaps_at_both_ends_is_flooded() {
         let expected = render(256, &flood(), mode, |context| {
             context.set_stroke(Stroke::new(1.0));
             context.stroke_path(&line((0.0, 100.0), (10.0, 100.0)));
+        });
+        assert!(expected.data().iter().any(|pixel| pixel.a != 0));
+        assert!(actual.data() == expected.data(), "{mode:?}");
+    }
+}
+
+#[test]
+fn a_dash_drawn_on_from_a_closed_subpath_starts_the_pattern_over() {
+    let filters = [
+        Filter::from_primitive(FilterPrimitive::Offset {
+            dx: -300_000.0,
+            dy: 0.0,
+        }),
+        flood(),
+    ];
+    let dashed = Stroke::new(1.0).with_dashes(500_000.0, [10.0, 999_990.0]);
+    let mut path = line((-200_000.0, 100.0), (50_000.0, 100.0));
+    path.close_path();
+    path.line_to((800_000.0, 100.0));
+    for mode in modes() {
+        let actual = render_nested(256, &filters, mode, |context| {
+            context.set_stroke(dashed.clone());
+            context.stroke_path(&path);
+        });
+        // Its last line starts where the closed subpath does, at the start of
+        // the pattern, whose only dash it draws.
+        let expected = render_nested(256, &filters, mode, |context| {
+            context.set_stroke(Stroke::new(1.0));
+            context.stroke_path(&line((300_000.0, 100.0), (300_010.0, 100.0)));
         });
         assert!(expected.data().iter().any(|pixel| pixel.a != 0));
         assert!(actual.data() == expected.data(), "{mode:?}");
