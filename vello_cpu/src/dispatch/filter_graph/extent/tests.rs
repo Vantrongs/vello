@@ -602,3 +602,56 @@ fn rectangles_round_as_the_recorder_maps_them() {
     assert_eq!(found, recorded(&viewport, &drawn, &[]));
     assert_eq!(found.x0, Coord::from(20));
 }
+
+#[test]
+fn rectangles_without_bounds_are_cut_as_the_recorder_cuts_them() {
+    let (inf, nan) = (f64::INFINITY, f64::NAN);
+    let rects = [
+        Rect::new(-inf, 10.0, 30.0, 40.0),
+        Rect::new(10.0, -inf, 40.0, inf),
+        Rect::new(-inf, -inf, inf, inf),
+        Rect::new(inf, 10.0, -inf, 40.0),
+        Rect::new(10.0, 20.0, inf, 20.0),
+        Rect::new(nan, 10.0, 30.0, 40.0),
+    ];
+    let transforms = [
+        Affine::IDENTITY,
+        Affine::translate((0.3, -0.7)),
+        Affine::new([0.0, 2.0, -1.0, 0.0, 5.0, 3.0]),
+    ];
+    for viewport in [
+        Bounds::new(0, 0, 256, 128),
+        Bounds::new(-1000, -76, -744, 52),
+    ] {
+        let origin = viewport.origin();
+        let to_viewport = Affine::translate((origin.0.to_f64(), origin.1.to_f64()));
+        // Clips inside the viewport, beyond which the recorder draws nothing
+        // to compare with.
+        let clip = to_viewport.transform_rect_bbox(Rect::new(5.0, 15.0, 90.0, 70.0));
+        let clips = [
+            alloc::vec![],
+            alloc::vec![Clip::Rect(clip)],
+            alloc::vec![Clip::Path {
+                path: clip.to_path(0.1),
+                fill_rule: Fill::NonZero,
+                transform: to_viewport * Affine::rotate(0.1) * to_viewport.inverse(),
+                aliasing_threshold: None,
+            }],
+        ];
+        for rect in rects {
+            for transform in transforms {
+                for clips in &clips {
+                    let drawn = Drawn::Rect(rect, to_viewport * transform);
+                    let mut extents = Extents::new(Level::baseline(), &viewport);
+                    let (found, _) = found(&mut extents, &drawn, clips);
+                    assert_eq!(
+                        found,
+                        recorded(&viewport, &drawn, clips),
+                        "{viewport:?}: {}",
+                        describe(&drawn, clips)
+                    );
+                }
+            }
+        }
+    }
+}
