@@ -456,3 +456,100 @@ fn wide_blurs_match_the_blur_of_the_whole_pixmap() {
         }
     }
 }
+
+/// Return the regions a graph keeps for a square shadowed `depth` times by
+/// drop shadows that each keep their source and move it by a distinct power
+/// of two times 128 pixels, alternately right and left, so that the content
+/// has `2^depth` copies, of which the one moved by every shadow lies in a 64
+/// by 64 view.
+fn nested_shadow_regions(depth: u32) -> usize {
+    use super::super::Dispatcher;
+    use super::Recording;
+    use crate::filter::placed::Bounds;
+    use crate::kurbo::{Affine, Rect};
+    use crate::peniko::{BlendMode, Fill};
+    use vello_common::paint::{Paint, PremulColor};
+
+    let offset = |level: u32| {
+        let distance = 128.0 * 2_f32.powi(i32::try_from(level).unwrap());
+        if level.is_multiple_of(2) {
+            distance
+        } else {
+            -distance
+        }
+    };
+    let shadow = |level: u32| {
+        FilterData::new(
+            Filter::from_primitive(FilterPrimitive::DropShadow {
+                dx: offset(level),
+                dy: 0.0,
+                std_deviation: 0.0,
+                color: AlphaColor::from_rgba8(0, 0, 255, 255),
+                edge_mode: EdgeMode::None,
+            }),
+            Affine::IDENTITY,
+        )
+    };
+    let mut recording = Recording::new(
+        shadow(depth - 1),
+        Bounds::of_viewport(VIEW, VIEW),
+        Vec::new(),
+        false,
+    );
+    for level in (0..depth - 1).rev() {
+        recording.push_layer(
+            None,
+            Fill::NonZero,
+            Affine::IDENTITY,
+            BlendMode::default(),
+            1.0,
+            None,
+            None,
+            Some(shadow(level)),
+        );
+    }
+    let x = 16.0
+        - (0..depth)
+            .map(|level| f64::from(offset(level)))
+            .sum::<f64>();
+    recording.fill_rect_fast(
+        &Rect::new(x, 16.0, x + 1.0, 17.0),
+        Paint::Solid(PremulColor::from_alpha_color(AlphaColor::from_rgba8(
+            0, 0, 255, 255,
+        ))),
+        BlendMode::default(),
+        None,
+    );
+    for _ in 0..depth - 1 {
+        recording.pop_layer();
+    }
+    let graph = recording.finish(Level::baseline());
+    graph
+        .nodes
+        .iter()
+        .map(|node| {
+            [
+                &node.needed,
+                &node.source,
+                &node.blurred,
+                &node.filtered,
+                &node.content,
+            ]
+            .iter()
+            .map(|regions| regions.iter().count())
+            .sum::<usize>()
+        })
+        .sum()
+}
+
+#[test]
+fn nested_shadows_keep_regions_only_for_copies_the_view_depends_on() {
+    let regions: Vec<usize> = [20, 24].into_iter().map(nested_shadow_regions).collect();
+    // Each layer keeps a few regions, however many copies its content has.
+    for (depth, regions) in [20, 24].into_iter().zip(&regions) {
+        assert!(
+            *regions <= 8 * depth,
+            "{depth} layers keep {regions} regions"
+        );
+    }
+}

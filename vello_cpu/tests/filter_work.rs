@@ -198,6 +198,63 @@ fn nested_shadows_allocate_quadratically_in_depth() {
     }
 }
 
+/// Render a square shadowed `depth` times by drop shadows that each keep their
+/// source and move it by a distinct power of two times 128 pixels, alternately
+/// right and left, so that it has `2^depth` copies, of which only the one
+/// every shadow moves lies in a 64 by 64 view.
+fn spread_shadows(depth: u32) -> Vec<u8> {
+    let offset = |level: u32| {
+        let distance = 128.0 * 2_f32.powi(i32::try_from(level).unwrap());
+        if level.is_multiple_of(2) {
+            distance
+        } else {
+            -distance
+        }
+    };
+    let mut context = context(64, 64);
+    for level in (0..depth).rev() {
+        context.push_filter_layer(Filter::from_primitive(FilterPrimitive::DropShadow {
+            dx: offset(level),
+            dy: 0.0,
+            std_deviation: 0.0,
+            color: AlphaColor::from_rgba8(0, 0, 255, 255),
+            edge_mode: EdgeMode::None,
+        }));
+    }
+    context.set_paint(BLUE);
+    let x = 16.0
+        - (0..depth)
+            .map(|level| f64::from(offset(level)))
+            .sum::<f64>();
+    context.fill_rect(&Rect::new(x, 16.0, x + 32.0, 48.0));
+    for _ in 0..depth {
+        context.pop_layer();
+    }
+    render(context)
+}
+
+#[test]
+fn shadows_moving_by_distinct_distances_allocate_linearly_in_depth() {
+    let mut previous: Option<(u32, Usage)> = None;
+    for depth in [8, 16, 24] {
+        let (usage, pixels) = measure(|| spread_shadows(depth));
+        for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            let (x, y) = (index % 64, index / 64);
+            let inside = (16..48).contains(&x) && (16..48).contains(&y);
+            let expected = if inside { [0, 0, 255, 255] } else { [0; 4] };
+            assert_eq!(*pixel, expected, "depth {depth} at ({x}, {y})");
+        }
+        // Twice the layers allocate at most about twice as much.
+        if let Some((shallow, before)) = previous {
+            assert!(
+                usage.total <= 3 * before.total && usage.peak <= 3 * before.peak,
+                "depth {depth}: {usage:?}, at {shallow}: {before:?}"
+            );
+        }
+        previous = Some((depth, usage));
+    }
+}
+
 /// Render, in a 64 by 64 view, a source that lies `distance` pixels right of
 /// and below it, moved into view by an offset: a band reaching back to the
 /// origin and a blurred square nested in the layer.

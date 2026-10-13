@@ -391,7 +391,10 @@ fn recorded_paddings(filter: &FilterData) -> Option<(Padding, Padding)> {
             bottom: padding.bottom.into(),
         })
     };
-    Some((padding(filter.filter_padding)?, padding(filter.source_padding)?))
+    Some((
+        padding(filter.filter_padding)?,
+        padding(filter.source_padding)?,
+    ))
 }
 
 /// Return an offset by `(dx, dy)` under the linear part of `transform` in
@@ -598,4 +601,3 @@ mod tests {
         );
     }
 }
-

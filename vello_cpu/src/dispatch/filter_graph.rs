@@ -27,7 +27,7 @@ use crate::RasterizerSettings;
 use crate::filter::colorize_shadow;
 use crate::filter::context::ScratchBuffer;
 use crate::filter::pixmap::FilterPixmap;
-use crate::filter::placed::{Bounds, Coord, Padding, PlacedPixmap, Position, Regions};
+use crate::filter::placed::{Bounds, Coord, Index, Padding, PlacedPixmap, Position, Regions};
 use crate::filter::plan::{Effect, Reach};
 use crate::filter::pyramid::{Blur, Pyramid};
 use crate::fine::FineKernel;
@@ -682,6 +682,11 @@ pub(crate) struct FilterGraph {
 /// [`shows_area`], and to the layers these are nested in. The other pixmaps
 /// cover the bounds of what the commands can draw instead, which leaves the
 /// output as it is and saves replaying content that is not visible.
+///
+/// Each layer is placed with one rectangle around where its output can have
+/// content. Which parts of it the view depends on are then followed from the
+/// view down, so that copies of the content that no visible output depends on
+/// are never counted, see [`FilterGraph::plan`].
 #[derive(Debug)]
 struct Node {
     reach: Reach,
@@ -689,8 +694,18 @@ struct Node {
     /// parent; empty if the source has no content.
     pixmap: Bounds,
     /// Where the source can have content inside the pixmap.
+    source_box: Bounds,
+    /// Where the output can have content.
+    output_box: Bounds,
+    /// The bounds of what each of the layer's own commands that draws can
+    /// draw inside the pixmap, by command.
+    drawn: Index,
+    /// Where the visible output depends on the output.
+    needed: Regions,
+    /// Where the source can have content that the needed output depends on.
     source: Regions,
-    /// Where the source of the blur can have content, relative to the pixmap.
+    /// Where the source of the blur can have content that the needed output
+    /// depends on, relative to the pixmap.
     blurred: Regions,
     /// Where the output of the filter can have content, before a drop shadow
     /// puts the source over it.
@@ -742,6 +757,7 @@ impl FilterGraph {
             nodes[index] = Some(node);
         }
         graph.nodes = nodes.into_iter().map(Option::unwrap).collect();
+        graph.plan();
         graph
     }
 
@@ -782,62 +798,160 @@ impl FilterGraph {
                 .fold(bounds, |bounds, candidate| bounds.union(candidate))
         };
         let pixmap = bounds.expand(&reach.filter_padding).snap_to_tiles();
-        let mut source = Regions::default();
-        for drawn in drawn {
-            source.insert(drawn.map_or(pixmap.clone(), |drawn| drawn.intersect(&pixmap)));
+        let mut source_box = Bounds::EMPTY;
+        let mut drawn_index = Index::default();
+        for (command, drawn) in drawn.into_iter().enumerate() {
+            let drawn = drawn.map_or(pixmap.clone(), |drawn| drawn.intersect(&pixmap));
+            source_box = source_box.union(&drawn);
+            drawn_index.insert(command, drawn);
         }
         for nested in &layer.children {
             let node = child(nested);
             let shown = node.pixmap.clip(nested.clip).intersect(&pixmap);
-            for content in node.content.touching(&shown) {
-                source.insert(content.intersect(&shown));
-            }
+            source_box = source_box.union(&node.output_box.intersect(&shown));
         }
-        let local = |regions: &Regions| {
-            let origin = pixmap.origin();
-            let back = (-&origin.0, -&origin.1);
-            let mut local = Regions::default();
-            for region in regions.iter() {
-                local.insert(region.translate(&back));
-            }
-            local
+        let moved = |offset: &Position| source_box.translate(offset).intersect(&pixmap);
+        let blurred = |source: &Bounds, blur: &Blur| {
+            spread(source, blur, &pixmap)
+                .iter()
+                .fold(Bounds::EMPTY, |hull, spread| hull.union(spread))
         };
-        let moved = |offset: &Position| {
-            let mut moved = Regions::default();
-            for region in source.iter() {
-                moved.insert(region.translate(offset).intersect(&pixmap));
-            }
-            moved
-        };
-        let (blurred, filtered) = match &reach.effect {
-            Effect::Flood => (Regions::default(), Regions::of(pixmap.clone())),
-            Effect::Offset(offset) => (Regions::default(), moved(offset)),
-            Effect::Blur(None) => (Regions::default(), source.clone()),
-            Effect::Blur(Some(blur)) => (local(&source), spread(&source, blur, &pixmap)),
-            Effect::Shadow { offset, blur, .. } => {
-                let moved = moved(offset);
-                match blur {
-                    Some(blur) => (local(&moved), spread(&moved, blur, &pixmap)),
-                    None => (Regions::default(), moved),
+        let output_box = match &reach.effect {
+            Effect::Flood => pixmap.clone(),
+            Effect::Offset(offset) => moved(offset),
+            Effect::Blur(None) => source_box.clone(),
+            Effect::Blur(Some(blur)) => blurred(&source_box, blur),
+            Effect::Shadow {
+                offset,
+                blur,
+                keeps_source,
+                ..
+            } => {
+                let shadow = match blur {
+                    Some(blur) => blurred(&moved(offset), blur),
+                    None => moved(offset),
+                };
+                if *keeps_source {
+                    shadow.union(&source_box)
+                } else {
+                    shadow
                 }
             }
         };
-        let mut content = filtered.clone();
-        if let Effect::Shadow {
-            keeps_source: true, ..
-        } = &reach.effect
-        {
-            for region in source.iter() {
-                content.insert(region.clone());
-            }
-        }
         Node {
             reach,
             pixmap,
-            source,
-            blurred,
-            filtered,
-            content,
+            source_box,
+            output_box,
+            drawn: drawn_index,
+            needed: Regions::default(),
+            source: Regions::default(),
+            blurred: Regions::default(),
+            filtered: Regions::default(),
+            content: Regions::default(),
+        }
+    }
+
+    /// Find where the visible output depends on the output of each layer,
+    /// from the view down, and where the sources have content there, from the
+    /// children up.
+    ///
+    /// What a layer's needed output depends on in its source is followed into
+    /// each child only where the child's output can have content, so a part
+    /// is counted only if some content can reach the view through it.
+    fn plan(&mut self) {
+        let nodes = &mut self.nodes;
+        let placement = nodes[0].pixmap.intersect(&self.view);
+        nodes[0].needed = Regions::of(placement.intersect(&nodes[0].output_box));
+        let mut sources = Vec::with_capacity(nodes.len());
+        for index in 0..nodes.len() {
+            let node = &nodes[index];
+            let mut source = Regions::default();
+            for region in node.needed.iter() {
+                for read in reads(&node.reach.effect, region, &node.pixmap) {
+                    source.insert(read.intersect(&node.source_box));
+                }
+            }
+            for child in &self.layers[index].children {
+                let node = &nodes[child.layer];
+                let shown = node.pixmap.clip(child.clip).intersect(&node.output_box);
+                let mut needed = Regions::default();
+                for region in source.iter() {
+                    needed.insert(region.intersect(&shown));
+                }
+                nodes[child.layer].needed = needed;
+            }
+            sources.push(source);
+        }
+        for (index, needed_source) in sources.into_iter().enumerate().rev() {
+            let node = &nodes[index];
+            let mut source = Regions::default();
+            for region in needed_source.iter() {
+                for (_, drawn) in node.drawn.touching(region) {
+                    source.insert(drawn.intersect(region));
+                }
+                for child in &self.layers[index].children {
+                    let node = &nodes[child.layer];
+                    let shown = node.pixmap.clip(child.clip).intersect(region);
+                    for content in node.content.touching(&shown) {
+                        source.insert(content.intersect(&shown));
+                    }
+                }
+            }
+            let node = &nodes[index];
+            let pixmap = &node.pixmap;
+            let local = |regions: &Regions| {
+                let origin = pixmap.origin();
+                let back = (-&origin.0, -&origin.1);
+                let mut local = Regions::default();
+                for region in regions.iter() {
+                    local.insert(region.translate(&back));
+                }
+                local
+            };
+            let moved = |offset: &Position| {
+                let mut moved = Regions::default();
+                for region in source.iter() {
+                    moved.insert(region.translate(offset).intersect(pixmap));
+                }
+                moved
+            };
+            let spread = |content: &Regions, blur: &Blur| {
+                let mut spread_content = Regions::default();
+                for region in content.iter() {
+                    for spread_region in spread(region, blur, pixmap) {
+                        spread_content.insert(spread_region);
+                    }
+                }
+                spread_content
+            };
+            let (blurred, filtered) = match &node.reach.effect {
+                Effect::Flood => (Regions::default(), Regions::of(pixmap.clone())),
+                Effect::Offset(offset) => (Regions::default(), moved(offset)),
+                Effect::Blur(None) => (Regions::default(), source.clone()),
+                Effect::Blur(Some(blur)) => (local(&source), spread(&source, blur)),
+                Effect::Shadow { offset, blur, .. } => {
+                    let moved = moved(offset);
+                    match blur {
+                        Some(blur) => (local(&moved), spread(&moved, blur)),
+                        None => (Regions::default(), moved),
+                    }
+                }
+            };
+            let mut content = filtered.clone();
+            if let Effect::Shadow {
+                keeps_source: true, ..
+            } = &node.reach.effect
+            {
+                for region in source.iter() {
+                    content.insert(region.clone());
+                }
+            }
+            let node = &mut nodes[index];
+            node.source = source;
+            node.blurred = blurred;
+            node.filtered = filtered;
+            node.content = content;
         }
     }
 
@@ -1033,8 +1147,40 @@ impl FilterGraph {
     }
 }
 
-/// Return where the output of a blur of `content` on `pixmap` can have content.
-fn spread(content: &Regions, blur: &Blur, pixmap: &Bounds) -> Regions {
+/// Return the parts of the source that the output of `effect` on `pixmap`
+/// reads inside `region`.
+fn reads(effect: &Effect, region: &Bounds, pixmap: &Bounds) -> Vec<Bounds> {
+    let back = |(dx, dy): &Position| region.translate(&(-dx, -dy)).intersect(pixmap);
+    match effect {
+        Effect::Flood => Vec::new(),
+        Effect::Offset(offset) => vec![back(offset)],
+        Effect::Blur(None) => vec![region.clone()],
+        Effect::Blur(Some(blur)) => spread(region, blur, pixmap),
+        Effect::Shadow {
+            offset,
+            blur,
+            keeps_source,
+            ..
+        } => {
+            let mut reads = match blur {
+                Some(blur) => spread(region, blur, pixmap)
+                    .iter()
+                    .map(|read| read.translate(&(-&offset.0, -&offset.1)).intersect(pixmap))
+                    .collect(),
+                None => vec![back(offset)],
+            };
+            if *keeps_source {
+                reads.push(region.clone());
+            }
+            reads
+        }
+    }
+}
+
+/// Return the parts of `pixmap` that a blur of it reads inside `region`,
+/// which are also those where the blur of content inside `region` can have
+/// content.
+fn spread(region: &Bounds, blur: &Blur, pixmap: &Bounds) -> Vec<Bounds> {
     let mut support = blur.support();
     let mut shifts = vec![(Coord::ZERO, Coord::ZERO)];
     if blur.edge_mode == EdgeMode::Wrap {
@@ -1049,13 +1195,11 @@ fn spread(content: &Regions, blur: &Blur, pixmap: &Bounds) -> Regions {
             .collect();
     }
     let padding = Padding::uniform(support);
-    let mut spread = Regions::default();
-    for region in content.iter() {
-        for shift in &shifts {
-            spread.insert(region.translate(shift).expand(&padding).intersect(pixmap));
-        }
-    }
-    spread
+    shifts
+        .iter()
+        .map(|shift| region.translate(shift).expand(&padding).intersect(pixmap))
+        .filter(|spread| !spread.is_empty())
+        .collect()
 }
 
 /// The width and height of the cells replayed to find the bounds of content,
