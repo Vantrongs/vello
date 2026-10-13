@@ -9,7 +9,7 @@ use std::cell::Cell;
 use vello_cpu::color::AlphaColor;
 use vello_cpu::color::palette::css::BLUE;
 use vello_cpu::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_cpu::kurbo::{Affine, Rect};
+use vello_cpu::kurbo::{Affine, BezPath, Rect, Shape};
 use vello_cpu::{
     Level, Pixmap, RasterizerSettings, RenderContext, RenderMode, RenderSettings, Resources,
 };
@@ -310,31 +310,73 @@ fn offset_allocates_the_same_however_far_the_source_lies() {
 }
 
 /// Blur, in a 64 by 64 view, a band reaching `length` pixels down from its
-/// top, whose end the blur's edges depend on.
-fn blurred_band(length: f64, edge_mode: EdgeMode) -> Vec<u8> {
+/// top, whose end the blur's edges depend on, drawn as a rectangle or, if
+/// `as_path` is set, as a path.
+fn blurred_band(length: f64, edge_mode: EdgeMode, as_path: bool) -> Vec<u8> {
     let mut context = context(64, 64);
     context.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
         std_deviation: 4.0,
         edge_mode,
     }));
     context.set_paint(BLUE);
-    context.fill_rect(&Rect::new(20.5, 8.0, 40.5, length));
+    let band = Rect::new(20.5, 8.0, 40.5, length);
+    if as_path {
+        context.fill_path(&band.to_path(0.1));
+    } else {
+        context.fill_rect(&band);
+    }
     context.pop_layer();
     render(context)
 }
 
 #[test]
-fn blur_of_a_band_holds_the_same_memory_however_long_it_is() {
-    // Finding where the band ends replays its edges, so the work grows with
-    // its length, but the memory held does not.
+fn blur_of_a_band_costs_the_same_however_long_it_is() {
     for edge_mode in [EdgeMode::None, EdgeMode::Duplicate] {
-        let (short, expected) = measure(|| blurred_band(4_096.0, edge_mode));
-        for length in [65_536.0, 1_048_576.0, 16_777_216.0] {
-            let (usage, pixels) = measure(|| blurred_band(length, edge_mode));
-            assert!(pixels == expected, "{edge_mode:?} at length {length}");
+        for as_path in [false, true] {
+            let (short, expected) = measure(|| blurred_band(4_096.0, edge_mode, as_path));
+            for length in [65_536.0, 1_048_576.0, 16_777_216.0] {
+                let (usage, pixels) = measure(|| blurred_band(length, edge_mode, as_path));
+                let case = format!("{edge_mode:?}, as path {as_path}, at length {length}");
+                assert!(pixels == expected, "{case}");
+                assert!(
+                    usage.peak <= short.peak + short.peak / 4
+                        && usage.total <= short.total + short.total / 4,
+                    "{case}: {usage:?}, at 4096: {short:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Blur, in a 64 by 64 view, a square and a path that only moves, from the
+/// origin to `distance` pixels down and right of it, and so draws nothing.
+fn blurred_with_moves(distance: f64, edge_mode: EdgeMode) -> Vec<u8> {
+    let mut context = context(64, 64);
+    context.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
+        std_deviation: 4.0,
+        edge_mode,
+    }));
+    context.set_paint(BLUE);
+    context.fill_rect(&Rect::new(20.0, 20.0, 44.0, 44.0));
+    let mut moves = BezPath::new();
+    moves.move_to((0.0, 0.0));
+    moves.move_to((distance, distance));
+    context.fill_path(&moves);
+    context.pop_layer();
+    render(context)
+}
+
+#[test]
+fn moves_that_draw_nothing_cost_nothing_however_far_they_reach() {
+    for edge_mode in [EdgeMode::None, EdgeMode::Duplicate] {
+        let (near, expected) = measure(|| blurred_with_moves(64.0, edge_mode));
+        for distance in [16_384.0, 16_777_216.0, 1e15] {
+            let (usage, pixels) = measure(|| blurred_with_moves(distance, edge_mode));
+            assert!(pixels == expected, "{edge_mode:?} at distance {distance}");
             assert!(
-                usage.peak <= short.peak + short.peak / 4,
-                "{edge_mode:?} at length {length}: {usage:?}, at 4096: {short:?}"
+                usage.peak <= near.peak + near.peak / 4
+                    && usage.total <= near.total + near.total / 4,
+                "{edge_mode:?} at distance {distance}: {usage:?}, at 64: {near:?}"
             );
         }
     }

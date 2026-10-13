@@ -38,6 +38,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::marker::PhantomData;
+use extent::Extents;
 use vello_common::clip::PushedClip;
 use vello_common::encode::EncodedPaint;
 use vello_common::fearless_simd::{Level, Simd};
@@ -671,11 +672,10 @@ pub(crate) struct FilterGraph {
 /// layer's source draws and of the pixmaps of the nested layers, widened by
 /// the filter padding, and its output is composited into its parent where
 /// that pixmap lies. The bounds of the content are those of the strips the
-/// source draws, so they are found by replaying it in windows, see
-/// [`FilterGraph::content_bounds`]. A command that draws without bounds, such
-/// as a rectangle with an infinite side, is bounded by the viewport the
-/// recorder draws it in: the view widened by the source paddings of the
-/// layers down to this one.
+/// source draws, which are found from its geometry, see [`Extents`]. A
+/// command that draws without bounds, such as a rectangle with an infinite
+/// side, is bounded by the viewport the recorder draws it in: the view
+/// widened by the source paddings of the layers down to this one.
 ///
 /// Where the content ends matters only to a filter that reads past it, a
 /// blur or a flood, to a layer composited into an area that is visible, see
@@ -791,7 +791,7 @@ impl FilterGraph {
         }
         let pixmap_of = |node: usize| nodes[node].as_ref().unwrap().pixmap.clone();
         let bounds = if exact {
-            self.content_bounds(index, candidates, bounds, &pixmap_of)
+            Extents::new(self.simd_level, viewport).content(self, index, &pixmap_of)
         } else {
             candidates
                 .iter()
@@ -955,114 +955,6 @@ impl FilterGraph {
         }
     }
 
-    /// Return the bounds of the content of the source of layer `index`, given
-    /// `bounds` that it covers: the union of the content bounds of windows
-    /// over the cells of a grid that hold `candidates`, which hold everything
-    /// it draws that can widen `bounds`. `pixmap` returns the pixmap of each
-    /// nested layer.
-    ///
-    /// Cells inside the bounds found so far cannot widen them, so the
-    /// candidates that reach furthest are replayed first, and a candidate
-    /// spanning several cells is replayed at its corners before the halves of
-    /// what remains of it: content that fills a candidate is bounded by its
-    /// corners, so the cells replayed follow the extent of the content rather
-    /// than its area.
-    fn content_bounds(
-        &self,
-        index: usize,
-        mut candidates: Vec<Bounds>,
-        mut bounds: Bounds,
-        pixmap: &dyn Fn(usize) -> Bounds,
-    ) -> Bounds {
-        candidates.retain(|candidate| !candidate.is_empty());
-        let extent = candidates
-            .iter()
-            .fold(Bounds::EMPTY, |extent, candidate| extent.union(candidate));
-        if extent.is_empty() {
-            return bounds;
-        }
-        let replay = |cell: &(Coord, Coord), bounds: &mut Bounds| {
-            let area = cell_bounds(cell).intersect(&extent).snap_to_tiles();
-            if !bounds.contains(&area) {
-                let window = self.window(index, &area, pixmap);
-                *bounds = bounds.union(&window.window_content());
-            }
-        };
-        // The stack pops the candidates reaching furthest first.
-        let reaching = |side: fn(&Bounds) -> &Coord, last: bool| {
-            let mut ordered: Vec<usize> = (0..candidates.len()).collect();
-            ordered.sort_by(|&a, &b| side(&candidates[a]).cmp(side(&candidates[b])));
-            if last {
-                ordered.last().copied()
-            } else {
-                ordered.first().copied()
-            }
-        };
-        let mut extremes: Vec<usize> = [
-            reaching(|bounds| &bounds.x0, false),
-            reaching(|bounds| &bounds.y0, false),
-            reaching(|bounds| &bounds.x1, true),
-            reaching(|bounds| &bounds.y1, true),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        extremes.sort_unstable();
-        extremes.dedup();
-        // Each area with the corners already replayed: top left, top right,
-        // bottom left and bottom right.
-        let mut pending: Vec<(Bounds, [bool; 4])> = Vec::with_capacity(candidates.len());
-        for (index, candidate) in candidates.iter().enumerate() {
-            if extremes.binary_search(&index).is_err() {
-                pending.push((candidate.clone(), [false; 4]));
-            }
-        }
-        pending.extend(
-            extremes
-                .iter()
-                .map(|&index| (candidates[index].clone(), [false; 4])),
-        );
-        while let Some((area, replayed)) = pending.pop() {
-            if bounds.contains(&area) {
-                continue;
-            }
-            let first = cell_of(&area.x0, &area.y0);
-            let last = cell_of(&(&area.x1 - 1), &(&area.y1 - 1));
-            let corners = [
-                (first.0.clone(), first.1.clone()),
-                (last.0.clone(), first.1.clone()),
-                (first.0.clone(), last.1.clone()),
-                (last.0.clone(), last.1.clone()),
-            ];
-            for (corner, cell) in corners.iter().enumerate() {
-                if !replayed[corner] && !corners[..corner].contains(cell) {
-                    replay(cell, &mut bounds);
-                }
-            }
-            if first == last || bounds.contains(&area) {
-                continue;
-            }
-            // Split at a cell edge across the axis with more cells; each half
-            // keeps two of the corners.
-            let (mut low, mut high) = (area.clone(), area.clone());
-            let middle = |first: &Coord, last: &Coord| {
-                ((first + last).div_floor(&Coord::from(2_i64)) + 1).mul(&Coord::from(PROBE_SIZE))
-            };
-            let kept = if &last.0 - &first.0 >= &last.1 - &first.1 {
-                low.x1 = middle(&first.0, &last.0);
-                high.x0 = low.x1.clone();
-                [[true, false, true, false], [false, true, false, true]]
-            } else {
-                low.y1 = middle(&first.1, &last.1);
-                high.y0 = low.y1.clone();
-                [[true, true, false, false], [false, false, true, true]]
-            };
-            pending.push((low, kept[0]));
-            pending.push((high, kept[1]));
-        }
-        bounds
-    }
-
     /// Replay layer `index` into a window covering `area`, which starts on a
     /// tile corner and spans at most [`WINDOW_SIZE`] pixels on each side, with
     /// nested layers composited where `pixmap` says.
@@ -1200,23 +1092,6 @@ fn spread(region: &Bounds, blur: &Blur, pixmap: &Bounds) -> Vec<Bounds> {
         .map(|shift| region.translate(shift).expand(&padding).intersect(pixmap))
         .filter(|spread| !spread.is_empty())
         .collect()
-}
-
-/// The width and height of the cells replayed to find the bounds of content,
-/// small so that finding the bounds of a large area of content takes little memory.
-const PROBE_SIZE: i64 = 256;
-
-/// Return the cell replayed to find the bounds of content that holds `(x, y)`.
-fn cell_of(x: &Coord, y: &Coord) -> (Coord, Coord) {
-    let size = Coord::from(PROBE_SIZE);
-    (x.div_floor(&size), y.div_floor(&size))
-}
-
-/// Return the bounds of the cell `(column, row)` replayed to find the bounds of content.
-fn cell_bounds((column, row): &(Coord, Coord)) -> Bounds {
-    let size = Coord::from(PROBE_SIZE);
-    let (x0, y0) = (column.mul(&size), row.mul(&size));
-    Bounds::new(x0.clone(), y0.clone(), &x0 + &size, &y0 + &size)
 }
 
 /// The state of rendering a filter graph.
@@ -1478,6 +1353,8 @@ fn apply(target: &mut SingleThreadedDispatcher, command: &Command, to_window: Af
         Command::PopClip => target.pop_clip(),
     }
 }
+
+mod extent;
 
 #[cfg(all(test, feature = "std"))]
 mod tests;
