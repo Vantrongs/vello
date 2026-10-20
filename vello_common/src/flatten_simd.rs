@@ -119,21 +119,27 @@ pub(crate) fn flatten<S: Simd>(
             }
             PathEl::QuadTo(p1, p2) => {
                 let p0 = last_pt;
-                if exceeds_split_extent(&[p0, p1, p2]) {
+                let b = control_box([p0, p1, p2]);
+                if culled(b, rect) {
+                    callback.callback(LinePathEl::MoveTo(p2));
+                } else if exceeds_split_extent(b) {
                     let q = PathSeg::Quad(QuadBez::new(p0, p1, p2));
                     fill_clip::flatten_seg(simd, q, rect, callback, flatten_ctx);
                 } else {
-                    flatten_quad(p0, p1, p2, rect, callback);
+                    flatten_unculled_quad(p0, p1, p2, b, rect, callback);
                 }
                 last_pt = p2;
             }
             PathEl::CurveTo(p1, p2, p3) => {
                 let p0 = last_pt;
-                if exceeds_split_extent(&[p0, p1, p2, p3]) {
+                let b = control_box([p0, p1, p2, p3]);
+                if culled(b, rect) {
+                    callback.callback(LinePathEl::MoveTo(p3));
+                } else if exceeds_split_extent(b) {
                     let c = PathSeg::Cubic(CubicBez::new(p0, p1, p2, p3));
                     fill_clip::flatten_seg(simd, c, rect, callback, flatten_ctx);
                 } else {
-                    flatten_cubic(simd, p0, p1, p2, p3, rect, callback, flatten_ctx);
+                    flatten_unculled_cubic(simd, p0, p1, p2, p3, b, rect, callback, flatten_ctx);
                 }
                 last_pt = p3;
             }
@@ -161,25 +167,63 @@ pub(crate) fn flatten<S: Simd>(
 /// than `cull::SPLIT_EXTENT`: as `f32` its position in the view would be lost.
 #[inline(always)]
 fn line_to(p0: Point, p: Point, rect: [f64; 4], callback: &mut impl Callback) {
-    if (p.x - p0.x).abs().max((p.y - p0.y).abs()) > SPLIT_EXTENT {
+    if line_exceeds_split_extent(p0, p) {
         fill_clip::line(p0, p, rect, callback);
     } else {
         callback.callback(LinePathEl::LineTo(p));
     }
 }
 
-/// Whether a curve with these device control points is clipped before flattening
-/// (`cull::SPLIT_EXTENT`, `fill_clip`): the lines below grow with its size.
+/// Whether the line `p0 p` is wider or taller than `cull::SPLIT_EXTENT`.
 #[inline(always)]
-fn exceeds_split_extent(pts: &[Point]) -> bool {
-    let (mut x0, mut y0, mut x1, mut y1) = (pts[0].x, pts[0].y, pts[0].x, pts[0].y);
+fn line_exceeds_split_extent(p0: Point, p: Point) -> bool {
+    // Plain comparisons, as `f64::max` costs a NaN check per call on this hot path;
+    // `|` evaluates both, as one vector comparison.
+    let d = p - p0;
+    (d.x.abs() > SPLIT_EXTENT) | (d.y.abs() > SPLIT_EXTENT)
+}
+
+/// The control box of a curve's device points: left, top, right, bottom. Plain
+/// comparisons, as `f64::min` and `max` cost a NaN check per call on this hot path,
+/// skip a NaN coordinate after the first point; a NaN first coordinate makes its
+/// bounds NaN, which no test passes.
+#[inline(always)]
+fn control_box<const N: usize>(pts: [Point; N]) -> [f64; 4] {
+    let (mut x0, mut y0) = (pts[0].x, pts[0].y);
+    let (mut x1, mut y1) = (x0, y0);
     for p in &pts[1..] {
-        x0 = x0.min(p.x);
-        y0 = y0.min(p.y);
-        x1 = x1.max(p.x);
-        y1 = y1.max(p.y);
+        if p.x < x0 {
+            x0 = p.x;
+        }
+        if p.x > x1 {
+            x1 = p.x;
+        }
+        if p.y < y0 {
+            y0 = p.y;
+        }
+        if p.y > y1 {
+            y1 = p.y;
+        }
     }
-    (x1 - x0).max(y1 - y0) > SPLIT_EXTENT
+    [x0, y0, x1, y1]
+}
+
+/// Whether a curve with this device control box is clipped before flattening
+/// (`cull::SPLIT_EXTENT`, `fill_clip`): the lines below grow with its size. Tested
+/// only on curves not `culled`, which `fill_clip` would reduce to the same move.
+#[inline(always)]
+fn exceeds_split_extent([x0, y0, x1, y1]: [f64; 4]) -> bool {
+    x1 - x0 > SPLIT_EXTENT || y1 - y0 > SPLIT_EXTENT
+}
+
+/// Whether a curve with device control box `b` lies fully right of, above or below
+/// `rect`.
+///
+/// If so, it does not impact pixel coverage or winding. We can ignore it. This
+/// is conservative, as the curve lies in the box of its control points.
+#[inline(always)]
+fn culled([x0, y0, _, y1]: [f64; 4], [_, top, right, bottom]: [f64; 4]) -> bool {
+    x0 > right || y1 < top || y0 > bottom
 }
 
 /// Flattens the quadratic `p0 p1 p2` (device space), culled against `rect`.
@@ -191,18 +235,28 @@ pub(crate) fn flatten_quad(
     rect: [f64; 4],
     callback: &mut impl Callback,
 ) {
-    let [left, top, right, bottom] = rect;
-    let line = Line::new(p0, p2);
-    // If the quadratic Bézier is fully to the right, top, or bottom of the culling
-    // bbox, it does not impact pixel coverage or winding. We can ignore it. The
-    // following checks that conservatively by checking whether the bounding box of the
-    // Bézier's control points is fully outside the culling bbox.
-    if [p0, p1, p2].into_iter().all(|p| p.x > right)
-        || [p0, p1, p2].into_iter().all(|p| p.y < top)
-        || [p0, p1, p2].into_iter().all(|p| p.y > bottom)
-    {
+    let b = control_box([p0, p1, p2]);
+    if culled(b, rect) {
         callback.callback(LinePathEl::MoveTo(p2));
+    } else {
+        flatten_unculled_quad(p0, p1, p2, b, rect, callback);
     }
+}
+
+/// Flattens the quadratic `p0 p1 p2` (device space) with control box `b`
+/// (`control_box`), not `culled` against `rect`.
+#[inline(always)]
+fn flatten_unculled_quad(
+    p0: Point,
+    p1: Point,
+    p2: Point,
+    b: [f64; 4],
+    rect: [f64; 4],
+    callback: &mut impl Callback,
+) {
+    let left = rect[0];
+    let x1 = b[2];
+    let line = Line::new(p0, p2);
     // The following checks two things. First, if the quadratic Bézier is fully to the
     // left of the culling bbox, it may affect pixel coverage and winding, but its
     // exact shape does not matter. It can be emitted as a line segment [p0, p2].
@@ -223,9 +277,7 @@ pub(crate) fn flatten_quad(
     //
     // The following takes the square to elide the square root of the Euclidean
     // distance.
-    else if [p0, p1, p2].into_iter().all(|p| p.x < left)
-        || line.nearest(p1, 0.).distance_sq <= 4. * TOL_2
-    {
+    if x1 < left || line.nearest(p1, 0.).distance_sq <= 4. * TOL_2 {
         callback.callback(LinePathEl::LineTo(p2));
     } else {
         let q = QuadBez::new(p0, p1, p2);
@@ -242,31 +294,24 @@ pub(crate) fn flatten_quad(
     }
 }
 
-/// Flattens the cubic `p0 p1 p2 p3` (device space), culled against `rect`.
+/// Flattens the cubic `p0 p1 p2 p3` (device space) with control box `b`
+/// (`control_box`), not `culled` against `rect`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments, reason = "the loop's state, passed as is")]
-fn flatten_cubic<S: Simd>(
+fn flatten_unculled_cubic<S: Simd>(
     simd: S,
     p0: Point,
     p1: Point,
     p2: Point,
     p3: Point,
+    b: [f64; 4],
     rect: [f64; 4],
     callback: &mut impl Callback,
     flatten_ctx: &mut FlattenCtx,
 ) {
-    let [left, top, right, bottom] = rect;
+    let left = rect[0];
+    let x1 = b[2];
     let line = Line::new(p0, p3);
-    // If the cubic Bézier is fully to the right, top, or bottom of the culling bbox,
-    // it does not impact pixel coverage or winding. We can ignore it. The following
-    // checks that conservatively by checking whether the bounding box of the Bézier's
-    // control points is fully outside the culling bbox.
-    if [p0, p1, p2, p3].into_iter().all(|p| p.x > right)
-        || [p0, p1, p2, p3].into_iter().all(|p| p.y < top)
-        || [p0, p1, p2, p3].into_iter().all(|p| p.y > bottom)
-    {
-        callback.callback(LinePathEl::MoveTo(p3));
-    }
     // The following checks two things. First, if the cubic Bézier is fully to the left
     // of the culling bbox, it may affect pixel coverage and winding, but its exact
     // shape does not matter. It can be emitted as a line segment [p0, p3].
@@ -290,7 +335,7 @@ fn flatten_cubic<S: Simd>(
     //
     // The following takes the square to elide the square root of the Euclidean
     // distance.
-    else if [p0, p1, p2, p3].into_iter().all(|p| p.x < left)
+    if x1 < left
         || f64::max(
             line.nearest(p1, 0.).distance_sq,
             line.nearest(p2, 0.).distance_sq,
@@ -787,7 +832,76 @@ const QUADS_ERR_DIV: [f64; MAX_QUADS] = [
 
 #[cfg(test)]
 mod tests {
-    use crate::flatten_simd::{MAX_QUADS, estimate};
+    use crate::cull::SPLIT_EXTENT;
+    use crate::flatten_simd::{
+        MAX_QUADS, control_box, culled, estimate, exceeds_split_extent, line_exceeds_split_extent,
+    };
+    use crate::kurbo::Point;
+
+    /// Coordinates around the view `RECT`, `SPLIT_EXTENT`, and beyond.
+    const VALUES: [f64; 12] = [
+        0.0,
+        50.0,
+        150.0,
+        -50.0,
+        SPLIT_EXTENT,
+        SPLIT_EXTENT + 1.0,
+        -SPLIT_EXTENT - 1.0,
+        1e300,
+        -1e300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    const RECT: [f64; 4] = [0.0, 0.0, 100.0, 100.0];
+
+    /// The extent test with `f64::min` and `max`, which skip NaN.
+    fn reference_exceeds(pts: &[Point]) -> bool {
+        let (mut x0, mut y0, mut x1, mut y1) = (pts[0].x, pts[0].y, pts[0].x, pts[0].y);
+        for p in &pts[1..] {
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x);
+            y1 = y1.max(p.y);
+        }
+        (x1 - x0).max(y1 - y0) > SPLIT_EXTENT
+    }
+
+    /// The cull test point by point.
+    fn reference_culled(pts: &[Point], [_, top, right, bottom]: [f64; 4]) -> bool {
+        pts.iter().all(|p| p.x > right)
+            || pts.iter().all(|p| p.y < top)
+            || pts.iter().all(|p| p.y > bottom)
+    }
+
+    /// The plain comparisons decide as the reference tests: the extent test whatever
+    /// NaN lies after the first point, the cull test without NaN.
+    #[test]
+    fn control_box_tests_match_references() {
+        let n = VALUES.len();
+        for i in 0..n.pow(6) {
+            let v = |k: u32| VALUES[i / n.pow(k) % n];
+            let pts = [
+                Point::new(v(0), v(1)),
+                Point::new(v(2), v(3)),
+                Point::new(v(4), v(5)),
+            ];
+            let [p0, p1, ..] = pts;
+            assert_eq!(
+                line_exceeds_split_extent(p0, p1),
+                (p1.x - p0.x).abs().max((p1.y - p0.y).abs()) > SPLIT_EXTENT,
+                "{pts:?}"
+            );
+            if p0.is_nan() {
+                continue;
+            }
+            let b = control_box(pts);
+            assert_eq!(exceeds_split_extent(b), reference_exceeds(&pts), "{pts:?}");
+            if !pts.iter().any(|p| p.is_nan()) {
+                assert_eq!(culled(b, RECT), reference_culled(&pts, RECT), "{pts:?}");
+            }
+        }
+    }
 
     fn old_estimate(err_div: f64) -> usize {
         let n_quads = (err_div.powf(1. / 6.0).ceil() as usize).max(1);
