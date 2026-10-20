@@ -44,14 +44,14 @@ use crate::{
     copy::GpuCopyInstance,
     filter::{FilterContext, FilterInstanceData, FilterPassPlan},
     gradient_cache::GradientRampCache,
-    paint::{PaintResolver, TextureSourceId},
+    paint::{ExternalSampler, PaintResolver, SamplerAddress, SamplerFilter, TextureSourceId},
     render::{
         Config,
         common::{
             DeviceLimits, GpuBlurredRoundedRect, GpuEncodedImage, GpuEncodedPaint,
-            GpuLinearGradient, GpuRadialGradient, GpuSweepGradient, ScratchBuffers, ScratchTexture,
-            pack_image_offset, pack_image_params, pack_image_size, pack_radial_kind_and_swapped,
-            pack_texture_width_and_extend_mode, pack_tint,
+            GpuLinearGradient, GpuSweepGradient, ScratchBuffers, ScratchTexture,
+            encode_native_image_paint, encode_radial_gradient, pack_image_offset,
+            pack_image_params, pack_image_size, pack_texture_width_and_extend_mode, pack_tint,
         },
     },
     scene::Scene,
@@ -66,10 +66,13 @@ use crate::{
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::time::Duration;
 #[cfg(feature = "text")]
 use glifo::PendingClearRect;
-use hashbrown::HashMap;
-use resource::{Buffer, FragmentShader, Framebuffer, Program, Texture, VertexArray, VertexShader};
+use hashbrown::{HashMap, hash_map::Entry};
+use resource::{
+    Buffer, FragmentShader, Framebuffer, Program, Sampler, Texture, VertexArray, VertexShader,
+};
 use vello_common::color::{AlphaColor, Srgb};
 use vello_common::image_cache::{ImageCache, ImageResource};
 use vello_common::multi_atlas::{AtlasConfig, AtlasId};
@@ -77,20 +80,26 @@ use vello_common::{
     TextureId,
     encode::{
         EncodedBlurredRoundedRectangle, EncodedGradient, EncodedKind, EncodedPaint,
-        MAX_GRADIENT_LUT_SIZE, RadialKind,
+        MAX_GRADIENT_LUT_SIZE,
     },
     geometry::{RectU16, SizeU16},
-    paint::{ImageId, ImageSource},
+    paint::{ImageId, ImageSource, TextureRegion},
     peniko::{self},
     pixmap::Pixmap,
     tile::Tile,
 };
 use vello_gpu_shaders::{blend, copy, filter as filter_shader, render};
-use web_sys::wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use web_sys::{
     HtmlCanvasElement, WebGl2RenderingContext, WebGlBuffer, WebGlFramebuffer, WebGlProgram,
-    WebGlShader, WebGlTexture, WebGlUniformLocation, WebGlVertexArrayObject,
+    WebGlSampler, WebGlShader, WebGlTexture, WebGlUniformLocation, WebGlVertexArrayObject,
 };
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn performance_now() -> f64;
+}
 
 /// Placeholder value for uninitialized GPU encoded paints.
 const GPU_PAINT_PLACEHOLDER: GpuEncodedPaint = GpuEncodedPaint::LinearGradient(GpuLinearGradient {
@@ -172,7 +181,7 @@ pub struct WebGlRendererInit {
 /// Runtime bindings for [externally owned textures](`TextureId`) sampled by image paints.
 #[derive(Debug, Default, Clone)]
 pub struct WebGlTextureBindings {
-    textures: HashMap<TextureId, WebGlTexture>,
+    textures: HashMap<TextureId, WebGlTextureWithDimensions>,
 }
 
 impl WebGlTextureBindings {
@@ -186,23 +195,39 @@ impl WebGlTextureBindings {
     ///
     /// The texture must satisfy the following requirements.
     ///
-    /// - It is sampled as a `sampler2D`, so its internal format must be float-sampleable (e.g.
-    ///   `RGBA8`). Integer formats do not match the sampler's type.
-    /// - It is read with `texelFetch`, which requires the texture to be complete. For a texture
-    ///   without mipmaps this means `TEXTURE_MIN_FILTER` must be set to `NEAREST` or `LINEAR`;
-    ///   the WebGL default of `NEAREST_MIPMAP_LINEAR` leaves it incomplete and it will sample as
-    ///   transparent black. Only mip level 0 is read.
+    /// - It must be complete for sampling, with a defined mip level 0 in a linearly filterable
+    ///   `sampler2D` format (e.g. `RGBA8`). Integer and unfilterable float formats are unsupported.
     /// - Its contents are treated as premultiplied alpha, and are sampled in texel space with
     ///   the origin at the first uploaded texel. A texture uploaded with `UNPACK_FLIP_Y_WEBGL`
     ///   enabled therefore samples vertically flipped.
+    /// - `width` and `height` must match the dimensions of its mip level 0, otherwise rendering
+    ///   might be corrupted.
     #[inline]
-    pub fn insert(&mut self, texture_id: TextureId, texture: WebGlTexture) {
-        self.textures.insert(texture_id, texture);
+    pub fn insert(
+        &mut self,
+        texture_id: TextureId,
+        texture: WebGlTexture,
+        width: u16,
+        height: u16,
+    ) {
+        assert!(
+            width > 0 && height > 0,
+            "external texture dimensions must not be zero"
+        );
+
+        self.textures.insert(
+            texture_id,
+            WebGlTextureWithDimensions {
+                texture,
+                width,
+                height,
+            },
+        );
     }
 
     /// Get a texture binding.
     #[inline]
-    fn get(&self, texture_id: TextureId) -> Option<&WebGlTexture> {
+    fn get(&self, texture_id: TextureId) -> Option<&WebGlTextureWithDimensions> {
         self.textures.get(&texture_id)
     }
 
@@ -211,8 +236,30 @@ impl WebGlTextureBindings {
     /// This returns the removed texture binding if it existed.
     #[inline]
     pub fn remove(&mut self, texture_id: TextureId) -> Option<WebGlTexture> {
-        self.textures.remove(&texture_id)
+        self.textures
+            .remove(&texture_id)
+            .map(|binding| binding.texture)
     }
+}
+
+/// Shader compilation statistics recorded while creating a [`WebGlRenderer`].
+///
+/// Only the WebGL backend reports these, because `KHR_parallel_shader_compile` lets it detect
+/// when compilation actually finishes. WebGPU signals completion through
+/// `createRenderPipelineAsync`, but wgpu exposes only synchronous pipeline creation, which may
+/// return before the driver finishes compiling. Timing those calls would underreport the cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShaderCompilationStats {
+    /// Number of vertex and fragment shaders compiled.
+    pub shader_count: u32,
+    /// Number of non-blocking completion-status polls.
+    ///
+    /// This is zero when initialization is completed through [`WebGlRendererInit::finish`]
+    /// without first calling [`WebGlRendererInit::try_finish`].
+    pub poll_count: u32,
+    /// Wall-clock time from issuing the first compilation until all programs were confirmed
+    /// linked.
+    pub elapsed: Duration,
 }
 
 /// Current allocation state of the WebGL image/glyph atlas textures.
@@ -425,6 +472,14 @@ impl WebGlRenderer {
         Ok((init, resources))
     }
 
+    /// Returns the shaders compiled while creating this renderer and the time spent.
+    ///
+    /// When initialization is polled with [`WebGlRendererInit::try_finish`], `elapsed` also
+    /// includes time between polls, so its resolution is limited by the polling frequency.
+    pub fn shader_compilation_stats(&self) -> ShaderCompilationStats {
+        self.programs.shader_compilation_stats
+    }
+
     /// Render `scene` using WebGL2
     ///
     /// This method creates GPU resources as needed and schedules potentially multiple draw calls.
@@ -634,7 +689,8 @@ impl WebGlRenderer {
         let current_allocations = self.current_allocations();
 
         let paint_resolver =
-            PaintResolver::new(encoded_paints, &self.paint_idxs).with_image_cache(image_cache);
+            PaintResolver::new(encoded_paints, &self.paint_idxs, &self.encoded_paints)
+                .with_image_cache(image_cache);
         let schedule = Schedule::try_new(
             &mut self.schedule_storage,
             scene,
@@ -717,6 +773,11 @@ impl WebGlRenderer {
     ///
     /// This is the WebGL analogue of the wgpu Renderer's `upload_image` method.
     /// It allocates space in the image cache and uploads the image data to the atlas texture.
+    ///
+    /// # Errors
+    /// Returns [`WebGlError::FullImageSupportDisabled`] if the `full_image_support` feature
+    /// is disabled, or an error if allocating or uploading the image fails.
+    #[track_caller]
     pub fn upload_image<T: WebGlAtlasWriter>(
         &mut self,
         resources: &mut Resources,
@@ -725,12 +786,17 @@ impl WebGlRenderer {
         self.upload_image_with(&mut resources.image_cache, writer, IMAGE_PADDING)
     }
 
+    #[track_caller]
     pub(crate) fn upload_image_with<T: WebGlAtlasWriter>(
         &mut self,
         image_cache: &mut ImageCache,
         writer: &T,
         padding: u16,
     ) -> Result<ImageId, WebGlError> {
+        if !cfg!(feature = "full_image_support") {
+            return Err(WebGlError::FullImageSupportDisabled);
+        }
+
         let width = writer.width();
         let height = writer.height();
         let image_id = image_cache
@@ -891,13 +957,18 @@ impl WebGlRenderer {
                     ImageSource::ExternalTexture {
                         id, source_region, ..
                     } => {
-                        let texture = texture_bindings
+                        let binding = texture_bindings
                             .get(*id)
                             .ok_or(RenderError::MissingTextureBinding(*id))?;
-                        if render_target_texture.is_some_and(|target| target == texture) {
+                        if render_target_texture.is_some_and(|target| *target == binding.texture) {
                             return Err(WebGlError::Render(RenderError::TextureFeedbackLoop(*id)));
                         }
-                        Self::encode_external_texture_paint(img, *source_region)
+                        Self::encode_external_texture_paint(
+                            img,
+                            *source_region,
+                            binding.width,
+                            binding.height,
+                        )
                     }
                     ImageSource::Pixmap(_) => {
                         panic!("pixmap image sources are not supported by Vello GPU")
@@ -948,8 +1019,19 @@ impl WebGlRenderer {
 
     fn encode_external_texture_paint(
         image: &vello_common::encode::EncodedImage,
-        region: RectU16,
+        source_region: TextureRegion,
+        texture_width: u16,
+        texture_height: u16,
     ) -> GpuEncodedPaint {
+        if let Some(native_paint) = encode_native_image_paint(image, texture_width, texture_height)
+        {
+            return native_paint;
+        }
+
+        let region = match source_region {
+            TextureRegion::Full => RectU16::new(0, 0, texture_width, texture_height),
+            TextureRegion::Rect(rect) => rect,
+        };
         let transform = image.transform.as_coeffs().map(|x| x as f32);
         let image_size = pack_image_size(region.width(), region.height());
         let image_offset = pack_image_offset(region.x0, region.y0);
@@ -992,45 +1074,12 @@ impl WebGlRenderer {
                 gradient_start,
                 transform,
             }),
-            EncodedKind::Radial(radial) => {
-                let (kind, bias, scale, fp0, fp1, fr1, f_focal_x, f_is_swapped, scaled_r0_squared) =
-                    match radial {
-                        RadialKind::Radial { bias, scale } => {
-                            (0, *bias, *scale, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
-                        }
-                        RadialKind::Strip { scaled_r0_squared } => {
-                            (1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, *scaled_r0_squared)
-                        }
-                        RadialKind::Focal {
-                            focal_data,
-                            fp0,
-                            fp1,
-                        } => (
-                            2,
-                            *fp0,
-                            *fp1,
-                            *fp0,
-                            *fp1,
-                            focal_data.fr1,
-                            focal_data.f_focal_x,
-                            focal_data.f_is_swapped as u32,
-                            0.0,
-                        ),
-                    };
-                GpuEncodedPaint::RadialGradient(GpuRadialGradient {
-                    texture_width_and_extend_mode,
-                    gradient_start,
-                    transform,
-                    kind_and_f_is_swapped: pack_radial_kind_and_swapped(kind, f_is_swapped),
-                    bias,
-                    scale,
-                    fp0,
-                    fp1,
-                    fr1,
-                    f_focal_x,
-                    scaled_r0_squared,
-                })
-            }
+            EncodedKind::Radial(radial) => GpuEncodedPaint::RadialGradient(encode_radial_gradient(
+                texture_width_and_extend_mode,
+                gradient_start,
+                transform,
+                radial,
+            )),
             EncodedKind::Sweep(sweep) => GpuEncodedPaint::SweepGradient(GpuSweepGradient {
                 texture_width_and_extend_mode,
                 gradient_start,
@@ -1066,7 +1115,8 @@ impl WebGlRendererInit {
     ///
     /// On browsers without the extension, this synchronously finishes initialization and returns
     /// [`WebGlRendererInitStatus::Complete`].
-    pub fn try_finish(self) -> Result<WebGlRendererInitStatus, WebGlError> {
+    pub fn try_finish(mut self) -> Result<WebGlRendererInitStatus, WebGlError> {
+        self.programs.poll_count += 1;
         if self.programs.is_complete(&self.gl) {
             Ok(WebGlRendererInitStatus::Complete(self.finish()?))
         } else {
@@ -1131,6 +1181,8 @@ pub(crate) struct WebGlPrograms {
     copy_program: Program,
     /// Uniform locations for the copy program.
     copy_uniforms: CopyUniforms,
+    /// Shader compilation stats.
+    shader_compilation_stats: ShaderCompilationStats,
     /// WebGL resources for rendering.
     pub(crate) resources: WebGlResources,
     /// Dimensions of the rendering target.
@@ -1266,6 +1318,8 @@ pub(crate) struct WebGlResources {
     gradient_texture: Texture,
     /// Placeholder texture bound to unoccupied external texture slots.
     placeholder_external_texture: Texture,
+    /// Native image samplers shared by external texture slots.
+    external_samplers: HashMap<ExternalSampler, Sampler>,
     /// Height of gradient texture.
     gradient_texture_height: u32,
 
@@ -1362,6 +1416,9 @@ struct PendingShaderProgram {
 }
 
 impl PendingShaderProgram {
+    /// One vertex and one fragment shader.
+    const SHADER_COUNT: u32 = 2;
+
     fn new(
         gl: &WebGl2RenderingContext,
         vertex_src: &str,
@@ -1458,6 +1515,8 @@ impl PendingShaderProgram {
 #[derive(Debug)]
 struct PendingWebGlPrograms {
     parallel_shader_compile: bool,
+    compilation_start_ms: f64,
+    poll_count: u32,
     strip_program: PendingShaderProgram,
     filter_program: PendingShaderProgram,
     blend_program: PendingShaderProgram,
@@ -1467,6 +1526,8 @@ struct PendingWebGlPrograms {
 }
 
 impl PendingWebGlPrograms {
+    const PROGRAM_COUNT: u32 = 4;
+
     /// Starts compiling all programs before performing any blocking status queries.
     fn new(
         gl: WebGl2RenderingContext,
@@ -1480,6 +1541,7 @@ impl PendingWebGlPrograms {
             .map_js_error(WebGlOperation::Context(WebGlContextOperation::Extension))?
             .is_some();
 
+        let compilation_start_ms = performance_now();
         let strip_program =
             PendingShaderProgram::new(&gl, render::VERTEX_SOURCE, render::FRAGMENT_SOURCE)?;
         let filter_program = PendingShaderProgram::new(
@@ -1509,6 +1571,8 @@ impl PendingWebGlPrograms {
 
         Ok(Self {
             parallel_shader_compile,
+            compilation_start_ms,
+            poll_count: 0,
             strip_program,
             filter_program,
             blend_program,
@@ -1537,6 +1601,13 @@ impl PendingWebGlPrograms {
         let filter_program = self.filter_program.finish(gl)?;
         let blend_program = self.blend_program.finish(gl)?;
         let copy_program = self.copy_program.finish(gl)?;
+        let shader_compilation_stats = ShaderCompilationStats {
+            shader_count: Self::PROGRAM_COUNT * PendingShaderProgram::SHADER_COUNT,
+            poll_count: self.poll_count,
+            elapsed: Duration::from_secs_f64(
+                (performance_now() - self.compilation_start_ms) / 1_000.0,
+            ),
+        };
 
         let filter_uniforms = get_filter_pass_uniforms(gl, &filter_program)?;
         let blend_uniforms = get_blend_uniforms(gl, &blend_program)?;
@@ -1558,6 +1629,7 @@ impl PendingWebGlPrograms {
             blend_uniforms,
             copy_program,
             copy_uniforms,
+            shader_compilation_stats,
             resources: self.resources,
             render_size: RenderSize {
                 width: 0,
@@ -2418,6 +2490,39 @@ fn upload_layer_config_buffer(
 }
 
 /// Create all WebGL resources needed for rendering.
+fn create_external_sampler(
+    gl: &WebGl2RenderingContext,
+    key: ExternalSampler,
+) -> Result<Sampler, WebGlError> {
+    let sampler = Sampler::new(gl)?;
+
+    let filter = match key.filter {
+        SamplerFilter::Nearest => WebGl2RenderingContext::NEAREST,
+        SamplerFilter::Linear => WebGl2RenderingContext::LINEAR,
+    } as i32;
+
+    let address = |mode| match mode {
+        SamplerAddress::Pad => WebGl2RenderingContext::CLAMP_TO_EDGE,
+        SamplerAddress::Repeat => WebGl2RenderingContext::REPEAT,
+        SamplerAddress::Reflect => WebGl2RenderingContext::MIRRORED_REPEAT,
+    } as i32;
+
+    gl.sampler_parameteri(&sampler, WebGl2RenderingContext::TEXTURE_MIN_FILTER, filter);
+    gl.sampler_parameteri(&sampler, WebGl2RenderingContext::TEXTURE_MAG_FILTER, filter);
+    gl.sampler_parameteri(
+        &sampler,
+        WebGl2RenderingContext::TEXTURE_WRAP_S,
+        address(key.address_x),
+    );
+    gl.sampler_parameteri(
+        &sampler,
+        WebGl2RenderingContext::TEXTURE_WRAP_T,
+        address(key.address_y),
+    );
+
+    Ok(sampler)
+}
+
 fn create_webgl_resources(
     gl: &WebGl2RenderingContext,
     image_cache: &ImageCache,
@@ -2487,6 +2592,7 @@ fn create_webgl_resources(
     // Create and configure gradient texture.
     let gradient_texture = create_placeholder_rgba8_texture(gl)?;
     let placeholder_external_texture = create_placeholder_rgba8_texture(gl)?;
+    let external_samplers = HashMap::new();
 
     let layer_textures: [Vec<WebGlIntermediateTexture>; 2] = core::array::from_fn(|_| Vec::new());
     let scratch_texture = None;
@@ -2504,6 +2610,7 @@ fn create_webgl_resources(
         encoded_paints_texture_height: 0,
         gradient_texture,
         placeholder_external_texture,
+        external_samplers,
         gradient_texture_height: 0,
         view_config_buffer,
         view_framebuffer: ViewFramebuffer::default(use_depth_buffer),
@@ -2657,7 +2764,7 @@ impl WebGlRendererContext<'_> {
     ///
     /// Strip attribute offsets are restored to the start of the buffer before returning.
     fn draw_strips(
-        &self,
+        &mut self,
         external_texture_runs: &[ExternalTextureRun],
         first_instance: i32,
         count: i32,
@@ -2708,25 +2815,43 @@ impl WebGlRendererContext<'_> {
     }
 
     /// Bind the external texture slots.
-    fn bind_external_textures(&self, bindings: &ExternalTextureBindings) -> Result<(), WebGlError> {
+    fn bind_external_textures(
+        &mut self,
+        bindings: &ExternalTextureBindings,
+    ) -> Result<(), WebGlError> {
         for (slot, texture_source) in bindings.as_array().into_iter().enumerate() {
-            self.gl.active_texture(
-                WebGl2RenderingContext::TEXTURE0
-                    + EXTERNAL_TEXTURE_UNIT_START
-                    + u32::try_from(slot).unwrap(),
-            );
-            let texture: &WebGlTexture = match texture_source {
-                Some(TextureSourceId::Atlas(atlas_id)) => {
-                    &self.programs.resources.atlas_textures[atlas_id.as_u32() as usize]
-                }
-                Some(TextureSourceId::External(texture_id)) => self
-                    .texture_bindings
-                    .get(texture_id)
-                    .ok_or(RenderError::MissingTextureBinding(texture_id))?,
-                None => &self.programs.resources.placeholder_external_texture,
+            let texture_unit = EXTERNAL_TEXTURE_UNIT_START + u32::try_from(slot).unwrap();
+
+            self.gl
+                .active_texture(WebGl2RenderingContext::TEXTURE0 + texture_unit);
+            let (texture, sampler_key): (&WebGlTexture, ExternalSampler) = match texture_source {
+                Some(TextureSourceId::Atlas(atlas_id)) => (
+                    &self.programs.resources.atlas_textures[atlas_id.as_u32() as usize],
+                    ExternalSampler::DEFAULT,
+                ),
+                Some(TextureSourceId::External(texture_id, sampler)) => (
+                    &self
+                        .texture_bindings
+                        .get(texture_id)
+                        .ok_or(RenderError::MissingTextureBinding(texture_id))?
+                        .texture,
+                    sampler,
+                ),
+                None => (
+                    &self.programs.resources.placeholder_external_texture,
+                    ExternalSampler::DEFAULT,
+                ),
             };
             self.gl
                 .bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(texture));
+            let sampler = match self.programs.resources.external_samplers.entry(sampler_key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    entry.insert(create_external_sampler(self.gl, sampler_key)?)
+                }
+            };
+
+            self.gl.bind_sampler(texture_unit, Some(sampler));
         }
 
         Ok(())
@@ -3430,7 +3555,7 @@ impl WebGlAtlasWriter for WebGlTexture {
 }
 
 /// Wrapper for `WebGlTexture` with known dimensions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WebGlTextureWithDimensions {
     /// The WebGL texture.
     pub texture: WebGlTexture,
