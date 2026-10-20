@@ -99,10 +99,20 @@ impl RowState {
             RenderCmd::PushBuf(push_span) => *push_span = layer.span,
             _ => unreachable!("layer stack must point to a PushBuf command"),
         }
+        // The popped layer is composited within its span, into the buffer beneath.
+        if let Some(span) = layer.span {
+            self.include_current_span(span);
+        }
 
         self.render_cmds.push(RenderCmd::PopBuf);
 
         self.layer_depth -= 1;
+    }
+
+    /// The span the innermost layer of this row has drawn into so far.
+    #[inline]
+    fn current_span(&self) -> Option<TileAlignedSpan> {
+        self.layer_stack.last().and_then(|layer| layer.span)
     }
 
     #[inline]
@@ -499,14 +509,21 @@ impl CommandBucketer {
                 thread_idx: 0,
             });
 
+            let destructive = blend_mode.is_destructive();
             for row_idx in layer.occupied_rows.drain(..) {
                 let row = &mut self.rows[row_idx];
 
-                // TODO: Instead of always pushing the full layer bbox across all rows, it
-                // would be nice to instead only emit the per-row bounding box.
-                row.push_cmd(RenderCmd::LayerFill(LayerFill::new(
-                    layer.span, None, attrs_idx,
-                )));
+                // A blend mode that is not destructive leaves a pixel the layer drew nothing
+                // into as it was, so the layer is only composited where this row drew.
+                let span = if destructive {
+                    Some(layer.span)
+                } else {
+                    row.current_span()
+                        .and_then(|span| span.intersect(layer.span))
+                };
+                if let Some(span) = span {
+                    row.push_cmd(RenderCmd::LayerFill(LayerFill::new(span, None, attrs_idx)));
+                }
                 row.pop_buf();
             }
 
@@ -761,6 +778,8 @@ mod tests {
     use crate::coarse::CommandBucketer;
     use crate::coarse::cmd::{PaintFillAttrs, RenderCmd};
     use crate::coarse::depth::{BucketRange, DEPTH_BUCKET_WIDTH};
+    use alloc::vec;
+    use alloc::vec::Vec;
     use vello_common::color::palette::css::{BLUE, RED};
     use vello_common::color::{AlphaColor, Srgb};
     use vello_common::geometry::RectU16;
@@ -886,6 +905,80 @@ mod tests {
         bucketer.generate_fill(&strips, &fill_attrs(Paint::Solid(color(RED))), &[]);
 
         assert!(bucketer.rows().iter().all(|row| row.render_cmds.is_empty()));
+    }
+
+    /// Pixel ranges, `start..end` each.
+    type Spans = Vec<(usize, usize)>;
+
+    /// The pixel spans of the `PushBuf` and `LayerFill` commands of row 0.
+    fn layer_spans(bucketer: &CommandBucketer) -> (Spans, Spans) {
+        let span = |span: crate::span::TileAlignedSpan| (span.pixel_x(), span.pixel_end());
+        let cmds = &bucketer.rows()[0].render_cmds;
+        let pushes = cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCmd::PushBuf(push) => Some(span(push.unwrap())),
+                _ => None,
+            })
+            .collect();
+        let fills = cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RenderCmd::LayerFill(fill) => Some(span(fill.span)),
+                _ => None,
+            })
+            .collect();
+        (pushes, fills)
+    }
+
+    /// A solid fill of row 0 over the pixels `x0..x1`.
+    fn solid_strips(x0: u16, x1: u16) -> [Strip; 2] {
+        [Strip::new(x0, 0, 0, false), Strip::new(x1, 0, 0, true)]
+    }
+
+    #[test]
+    fn unclipped_layer_is_cleared_and_composited_where_it_draws() {
+        let mut bucketer = CommandBucketer::from_wh(64, 4);
+        let strips = solid_strips(8, 16);
+
+        bucketer.push_layer(&layer_props());
+        bucketer.generate_fill(&strips, &fill_attrs(Paint::Solid(color(RED))), &[]);
+        bucketer.pop_layer(&strips);
+
+        assert_eq!(layer_spans(&bucketer), (vec![(8, 16)], vec![(8, 16)]));
+    }
+
+    #[test]
+    fn unclipped_layer_composites_what_a_nested_layer_drew() {
+        let mut bucketer = CommandBucketer::from_wh(64, 4);
+        let (outer, inner) = (solid_strips(8, 16), solid_strips(40, 48));
+
+        bucketer.push_layer(&layer_props());
+        bucketer.generate_fill(&outer, &fill_attrs(Paint::Solid(color(RED))), &[]);
+        bucketer.push_layer(&layer_props());
+        bucketer.generate_fill(&inner, &fill_attrs(Paint::Solid(color(BLUE))), &[]);
+        bucketer.pop_layer(&inner);
+        bucketer.pop_layer(&outer);
+
+        assert_eq!(
+            layer_spans(&bucketer),
+            (vec![(8, 48), (40, 48)], vec![(40, 48), (8, 48)])
+        );
+    }
+
+    #[test]
+    fn unclipped_destructive_layer_is_composited_across_its_bounds() {
+        let mut bucketer = CommandBucketer::from_wh(64, 4);
+        let strips = solid_strips(8, 16);
+
+        bucketer.push_layer(&LayerProps {
+            blend_mode: BlendMode::new(Mix::Normal, Compose::SrcIn),
+            ..layer_props()
+        });
+        bucketer.generate_fill(&strips, &fill_attrs(Paint::Solid(color(RED))), &[]);
+        bucketer.pop_layer(&strips);
+
+        assert_eq!(layer_spans(&bucketer), (vec![(0, 64)], vec![(0, 64)]));
     }
 
     #[test]
