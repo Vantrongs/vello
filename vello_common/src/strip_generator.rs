@@ -411,6 +411,13 @@ pub(crate) fn within_opaque_clip(clip: &PathDataRef<'_>, strips: &[Strip]) -> bo
 
 /// Appends the strips of `source` to `target`, rebasing their alpha indices.
 fn append_rebased(target: &mut StripStorage, source: &StripStorage) {
+    // The room pushing the strips one at a time, as intersecting them with the clip
+    // does, would reach, each growth doubling, rather than what extending reserves.
+    let len = target.strips.len() + source.strips.len();
+    while target.strips.capacity() < len {
+        let full = target.strips.capacity() - target.strips.len();
+        target.strips.reserve(full + 1);
+    }
     let alpha_offset = target.alphas.len() as u32;
     target.strips.extend(source.strips.iter().map(|strip| {
         let mut strip = *strip;
@@ -472,8 +479,9 @@ mod tests {
     use crate::geometry::RectU16;
     use crate::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
     use crate::peniko::Fill;
+    use crate::strip::Strip;
     use crate::strip::visit_strip_fill_segments;
-    use crate::strip_generator::{StripGenerator, StripStorage};
+    use crate::strip_generator::{StripGenerator, StripStorage, append_rebased};
     use crate::tile::Tile;
     use crate::util::strip_bbox;
 
@@ -717,6 +725,33 @@ mod tests {
             compared[0] > 300 && compared[1] > 50 && compared[2] > 300,
             "{compared:?}"
         );
+    }
+
+    /// Strips appended inside an opaque clip take the room that pushing them one at a
+    /// time, as intersecting them with the clip does, would take.
+    #[test]
+    fn appended_strips_take_the_room_pushed_ones_would() {
+        let strip = |i: usize| Strip::new(i as u16, 0, 0, false);
+        for (before, added) in [(0, 1), (3, 2), (6, 7), (5, 100), (1000, 3000)] {
+            let mut target = StripStorage::default();
+            for i in 0..before {
+                target.strips.push(strip(i));
+            }
+            let mut source = StripStorage::default();
+            source.strips.extend((0..added).map(strip));
+            let mut pushed = target.strips.clone();
+            pushed.reserve_exact(target.strips.capacity() - pushed.capacity());
+            for i in 0..added {
+                pushed.push(strip(i));
+            }
+            append_rebased(&mut target, &source);
+            assert_eq!(target.strips.len(), before + added);
+            assert_eq!(
+                target.strips.capacity(),
+                pushed.capacity(),
+                "{before} strips, {added} added"
+            );
+        }
     }
 
     #[test]
