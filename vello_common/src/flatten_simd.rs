@@ -33,6 +33,7 @@ use fearless_simd::*;
 /// of the viewport do not need to be drawn.
 ///
 /// See [`PathEl`] for a more general-purpose path element type.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum LinePathEl {
     MoveTo(Point),
     LineTo(Point),
@@ -43,6 +44,37 @@ pub(crate) enum LinePathEl {
 // a closure and turned out to have a noticeable overhead.
 pub(crate) trait Callback {
     fn callback(&mut self, el: LinePathEl);
+}
+
+/// Where the paths of `fill_clip`, which are not inlined, emit lines. A flattening
+/// loop's own callback must not be handed to them: its state would then stay in
+/// memory through the whole loop, with a store and a reload of a different width per
+/// line, which stalls store forwarding. They write to a buffer instead (`clipped`).
+pub(crate) trait ClipOutput: Callback {}
+
+impl Callback for Vec<LinePathEl> {
+    fn callback(&mut self, el: LinePathEl) {
+        self.push(el);
+    }
+}
+
+impl ClipOutput for Vec<LinePathEl> {}
+
+/// Runs `clip` (a `fill_clip` path) into `flatten_ctx`'s buffer, then passes its lines
+/// to `callback`; see `ClipOutput`.
+#[inline(always)]
+fn clipped(
+    callback: &mut impl Callback,
+    flatten_ctx: &mut FlattenCtx,
+    clip: impl FnOnce(&mut Vec<LinePathEl>, &mut FlattenCtx),
+) {
+    let mut out = core::mem::take(&mut flatten_ctx.clipped);
+    clip(&mut out, flatten_ctx);
+    for &el in &out {
+        callback.callback(el);
+    }
+    out.clear();
+    flatten_ctx.clipped = out;
 }
 
 /// See the docs for the kurbo implementation of flattening:
@@ -107,14 +139,14 @@ pub(crate) fn flatten<S: Simd>(
         match affine * el {
             PathEl::MoveTo(p) => {
                 if last_pt != start_pt {
-                    line_to(last_pt, start_pt, rect, callback);
+                    line_to(last_pt, start_pt, rect, callback, flatten_ctx);
                 }
                 last_pt = p;
                 start_pt = p;
                 callback.callback(LinePathEl::MoveTo(p));
             }
             PathEl::LineTo(p) => {
-                line_to(last_pt, p, rect, callback);
+                line_to(last_pt, p, rect, callback, flatten_ctx);
                 last_pt = p;
             }
             PathEl::QuadTo(p1, p2) => {
@@ -124,7 +156,9 @@ pub(crate) fn flatten<S: Simd>(
                     callback.callback(LinePathEl::MoveTo(p2));
                 } else if exceeds_split_extent(b) {
                     let q = PathSeg::Quad(QuadBez::new(p0, p1, p2));
-                    fill_clip::flatten_seg(simd, q, rect, callback, flatten_ctx);
+                    clipped(callback, flatten_ctx, |out, ctx| {
+                        fill_clip::flatten_seg(simd, q, rect, out, ctx);
+                    });
                 } else {
                     flatten_unculled_quad(p0, p1, p2, b, rect, callback);
                 }
@@ -137,7 +171,9 @@ pub(crate) fn flatten<S: Simd>(
                     callback.callback(LinePathEl::MoveTo(p3));
                 } else if exceeds_split_extent(b) {
                     let c = PathSeg::Cubic(CubicBez::new(p0, p1, p2, p3));
-                    fill_clip::flatten_seg(simd, c, rect, callback, flatten_ctx);
+                    clipped(callback, flatten_ctx, |out, ctx| {
+                        fill_clip::flatten_seg(simd, c, rect, out, ctx);
+                    });
                 } else {
                     flatten_unculled_cubic(simd, p0, p1, p2, p3, b, rect, callback, flatten_ctx);
                 }
@@ -145,7 +181,7 @@ pub(crate) fn flatten<S: Simd>(
             }
             PathEl::ClosePath => {
                 if last_pt != start_pt {
-                    line_to(last_pt, start_pt, rect, callback);
+                    line_to(last_pt, start_pt, rect, callback, flatten_ctx);
 
                     // Kurbo says: "If `quad_to` [or another drawing op] is called immediately
                     // after `close_path` then the current subpath starts at the initial point of
@@ -159,16 +195,24 @@ pub(crate) fn flatten<S: Simd>(
     }
 
     if last_pt != start_pt {
-        line_to(last_pt, start_pt, rect, callback);
+        line_to(last_pt, start_pt, rect, callback, flatten_ctx);
     }
 }
 
 /// The line `p0 p` of a fill (device space), clipped to `rect` in `f64` if it is longer
 /// than `cull::SPLIT_EXTENT`: as `f32` its position in the view would be lost.
 #[inline(always)]
-fn line_to(p0: Point, p: Point, rect: [f64; 4], callback: &mut impl Callback) {
+fn line_to(
+    p0: Point,
+    p: Point,
+    rect: [f64; 4],
+    callback: &mut impl Callback,
+    flatten_ctx: &mut FlattenCtx,
+) {
     if line_exceeds_split_extent(p0, p) {
-        fill_clip::line(p0, p, rect, callback);
+        clipped(callback, flatten_ctx, |out, _| {
+            fill_clip::line(p0, p, rect, out);
+        });
     } else {
         callback.callback(LinePathEl::LineTo(p));
     }
@@ -347,7 +391,9 @@ fn flatten_unculled_cubic<S: Simd>(
         let err_div = quad_err_div(c, TOL as f32);
         // Too curved for `MAX_QUADS` quadratics within the tolerance: in blocks.
         if err_div > QUADS_ERR_DIV[MAX_QUADS - 1] {
-            fill_clip::flatten_seg(simd, PathSeg::Cubic(c), rect, callback, flatten_ctx);
+            clipped(callback, flatten_ctx, |out, ctx| {
+                fill_clip::flatten_seg(simd, PathSeg::Cubic(c), rect, out, ctx);
+            });
         } else {
             emit_cubic(simd, c, estimate(err_div), callback, flatten_ctx);
         }
@@ -513,6 +559,8 @@ pub struct FlattenCtx {
     flattened_cubics: Vec<Point32>,
     /// Reusable buffers for the two sides of a hairline outline (`flatten::stroke`).
     pub(crate) hairline_sides: [Vec<Point>; 2],
+    /// Reusable buffer for the lines of a clipped segment (`clipped`).
+    clipped: Vec<LinePathEl>,
 }
 
 #[inline(always)]
