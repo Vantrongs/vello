@@ -72,7 +72,7 @@ fn run(name: &str, path: &BezPath, draw: &Draw, affine: Affine) -> Vec<Line> {
     match draw {
         Draw::Fill => fill(
             level,
-            path.iter(),
+            path.elements(),
             affine,
             &mut lines,
             &mut flatten_ctx,

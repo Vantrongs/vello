@@ -82,7 +82,7 @@ impl DataItem {
         for path in &self.fills {
             flatten::fill(
                 Level::new(),
-                &path.path,
+                path.path.elements(),
                 path.transform,
                 &mut temp_buf,
                 &mut FlattenCtx::default(),

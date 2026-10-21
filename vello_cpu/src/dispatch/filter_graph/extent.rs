@@ -1166,7 +1166,7 @@ impl<'a> Extents<'a> {
                 path, transform, ..
             } => flatten::fill(
                 level,
-                path.iter(),
+                path.elements(),
                 to_frame * *transform,
                 &mut self.lines,
                 &mut self.flatten,
@@ -1579,7 +1579,7 @@ impl<'a> Extents<'a> {
                     aliasing_threshold,
                 } => {
                     generator.generate_filled_path(
-                        path,
+                        path.elements(),
                         *fill_rule,
                         to_frame * *transform,
                         *aliasing_threshold,
@@ -1607,7 +1607,7 @@ impl<'a> Extents<'a> {
                 transform,
                 aliasing_threshold,
             } => generator.generate_filled_path(
-                path,
+                path.elements(),
                 fill_rule,
                 to_frame * transform,
                 aliasing_threshold,

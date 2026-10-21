@@ -182,7 +182,7 @@ impl Line {
 /// ```
 pub fn fill(
     level: Level,
-    path: impl IntoIterator<Item = PathEl> + Clone,
+    path: &[PathEl],
     affine: Affine,
     line_buf: &mut Vec<Line>,
     ctx: &mut FlattenCtx,
@@ -197,7 +197,7 @@ pub fn fill(
 #[inline(always)]
 pub fn fill_impl<S: Simd>(
     simd: S,
-    path: impl IntoIterator<Item = PathEl> + Clone,
+    path: &[PathEl],
     affine: Affine,
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
@@ -210,7 +210,7 @@ pub fn fill_impl<S: Simd>(
     // that call, which would otherwise keep its state in memory through the loop.
     let huge = crate::flatten_simd::flatten::<S, false>(
         simd,
-        path.clone(),
+        path.iter().copied(),
         affine,
         &mut lb,
         flatten_ctx,
@@ -236,7 +236,7 @@ pub fn fill_impl<S: Simd>(
 #[inline(never)]
 fn fill_clipped<S: Simd>(
     simd: S,
-    path: impl IntoIterator<Item = PathEl>,
+    path: &[PathEl],
     affine: Affine,
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
@@ -244,7 +244,14 @@ fn fill_clipped<S: Simd>(
 ) -> bool {
     line_buf.clear();
     let mut lb = FlattenerCallback::new(line_buf);
-    crate::flatten_simd::flatten::<S, true>(simd, path, affine, &mut lb, flatten_ctx, cull_bbox);
+    crate::flatten_simd::flatten::<S, true>(
+        simd,
+        path.iter().copied(),
+        affine,
+        &mut lb,
+        flatten_ctx,
+        cull_bbox,
+    );
     lb.is_nan
 }
 
@@ -416,7 +423,7 @@ fn stroke_impl(
     }
     fill(
         level,
-        stroke_ctx.output(),
+        stroke_ctx.output().elements(),
         affine,
         line_buf,
         flatten_ctx,

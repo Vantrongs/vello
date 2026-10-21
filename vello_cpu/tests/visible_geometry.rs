@@ -633,3 +633,24 @@ fn huge_lines_long_in_one_direction_only() {
         }
     }
 }
+
+/// A rectangle whose sides are huge horizontal lines covers its rows, filled or as a
+/// clip: both flatten it twice, the second time clipping its sides.
+#[test]
+fn huge_rectangle_fills_and_clips_its_rows() {
+    let rect = Rect::new(-1e12, 10.0, 1e12, 90.0).to_path(0.1);
+    let view = Rect::new(0.0, 0.0, f64::from(SIZE), f64::from(SIZE)).to_path(0.1);
+    let filled = render(&rect, Fill::NonZero, Affine::IDENTITY);
+    let clipped = draw(|ctx| {
+        ctx.push_clip_path(&rect);
+        ctx.fill_path(&view);
+        ctx.pop_clip();
+    });
+    for (name, alpha) in [("filled", &filled), ("clipped", &clipped)] {
+        for (i, &actual) in alpha.iter().enumerate() {
+            let y = i / usize::from(SIZE);
+            let expected = if (10..90).contains(&y) { 255 } else { 0 };
+            assert_eq!(actual, expected, "{name}: pixel {i} in row {y}");
+        }
+    }
+}

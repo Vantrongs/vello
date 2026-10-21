@@ -189,9 +189,10 @@ impl StripGenerator {
     }
 
     /// Generate the strips for a filled path.
+    #[inline]
     pub fn generate_filled_path(
         &mut self,
-        path: impl IntoIterator<Item = PathEl> + Clone,
+        path: &[PathEl],
         fill_rule: Fill,
         transform: Affine,
         aliasing_threshold: Option<u8>,
@@ -585,7 +586,7 @@ mod tests {
             Drawn::Rect(rect) => generator.generate_filled_rect_fast(rect, &mut storage, clip),
             Drawn::Fill(path, fill_rule) => {
                 generator.generate_filled_path(
-                    path,
+                    path.elements(),
                     *fill_rule,
                     Affine::IDENTITY,
                     None,
@@ -725,7 +726,7 @@ mod tests {
         let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
 
         generator.generate_filled_path(
-            rect.to_path(0.1),
+            rect.to_path(0.1).elements(),
             Fill::NonZero,
             Affine::IDENTITY,
             None,
@@ -751,7 +752,7 @@ mod tests {
         let mut storage_rect = StripStorage::default();
 
         generator.generate_filled_path(
-            rect.to_path(0.1),
+            rect.to_path(0.1).elements(),
             Fill::NonZero,
             Affine::IDENTITY,
             None,

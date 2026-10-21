@@ -107,7 +107,7 @@ impl Worker {
                         [path_range.start as usize..path_range.end as usize];
 
                     self.strip_generator.generate_filled_path(
-                        path.iter().copied(),
+                        path,
                         fill_rule,
                         transform,
                         aliasing_threshold,
@@ -179,7 +179,7 @@ impl Worker {
                             [path_range.start as usize..path_range.end as usize];
 
                         self.strip_generator.generate_filled_path(
-                            path.iter().copied(),
+                            path,
                             fill_rule,
                             transform,
                             aliasing_threshold,

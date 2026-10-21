@@ -44,7 +44,7 @@ fn main() {
         if !args.stroke {
             flatten::fill(
                 Level::new(),
-                &args.path,
+                args.path.elements(),
                 Affine::IDENTITY,
                 &mut line_buf,
                 &mut FlattenCtx::default(),

@@ -94,7 +94,7 @@ impl ClipContext {
     #[inline]
     pub fn push_clip_path(
         &mut self,
-        clip_path: impl IntoIterator<Item = PathEl> + Clone,
+        clip_path: &[PathEl],
         strip_generator: &mut StripGenerator,
         fill_rule: Fill,
         transform: Affine,
@@ -316,7 +316,7 @@ impl ClipState {
         let clip_transform = self.active_shift() * transform;
 
         self.context.push_clip_path(
-            self.path_elements[elements.clone()].iter().copied(),
+            &self.path_elements[elements.clone()],
             strip_generator,
             fill_rule,
             clip_transform,
@@ -382,7 +382,7 @@ impl ClipState {
                     transform,
                     aliasing_threshold,
                 } => self.context.push_clip_path(
-                    self.path_elements[elements.clone()].iter().copied(),
+                    &self.path_elements[elements.clone()],
                     strip_generator,
                     *fill_rule,
                     active_shift * *transform,
@@ -997,14 +997,14 @@ mod tests {
                     let mut reference_clip = ClipContext::new();
                     for path in &clip_paths {
                         actual_clip.push_clip_path(
-                            path.iter(),
+                            path.elements(),
                             &mut generator,
                             fill,
                             Affine::IDENTITY,
                             threshold,
                         );
                         reference_clip.push_clip_path(
-                            path.iter(),
+                            path.elements(),
                             &mut generator,
                             fill,
                             Affine::IDENTITY,
@@ -1055,7 +1055,7 @@ mod tests {
                                     );
                                 } else {
                                     generator.generate_filled_path(
-                                        rect.to_path(0.1),
+                                        rect.to_path(0.1).elements(),
                                         fill,
                                         Affine::IDENTITY,
                                         threshold,
@@ -1138,7 +1138,7 @@ mod tests {
         triangle.line_to((50.0, 100.0));
         triangle.close_path();
         clips.push_clip_path(
-            triangle.iter(),
+            triangle.elements(),
             &mut generator,
             Fill::NonZero,
             Affine::IDENTITY,
@@ -1189,7 +1189,7 @@ mod tests {
                 generator.set_clip_bounds(bounds);
             }
             context.push_clip_path(
-                circle.iter(),
+                circle.elements(),
                 generator,
                 Fill::NonZero,
                 Affine::IDENTITY,

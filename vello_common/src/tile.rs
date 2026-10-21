@@ -1977,7 +1977,7 @@ mod tests {
         let mut line_buf: Vec<Line> = Vec::new();
         fill(
             Level::try_detect().unwrap_or(Level::baseline()),
-            &path,
+            path.elements(),
             Affine::IDENTITY,
             &mut line_buf,
             &mut FlattenCtx::default(),

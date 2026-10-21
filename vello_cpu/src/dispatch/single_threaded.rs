@@ -391,7 +391,7 @@ impl SingleThreadedDispatcher {
         self.viewport
             .with_generator_and_clip(|strip_generator, existing_clip| {
                 strip_generator.generate_filled_path(
-                    path,
+                    path.elements(),
                     fill_rule,
                     transform,
                     aliasing_threshold,
@@ -516,7 +516,7 @@ impl Dispatcher for SingleThreadedDispatcher {
         self.viewport
             .with_generator_and_clip(|strip_generator, clip_path| {
                 strip_generator.generate_filled_path(
-                    path,
+                    path.elements(),
                     fill_rule,
                     transform,
                     aliasing_threshold,

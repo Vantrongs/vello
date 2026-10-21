@@ -152,7 +152,7 @@ pub fn render_rect(c: &mut Criterion) {
             b.iter(|| {
                 storage.clear();
                 generator.generate_filled_path(
-                    rect.to_path(0.1),
+                    rect.to_path(0.1).elements(),
                     Fill::NonZero,
                     Affine::IDENTITY,
                     None,

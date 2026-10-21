@@ -385,7 +385,7 @@ impl Scene {
     ) {
         self.record_generated_path(paint, |strip_generator, strip_storage, clip_path| {
             strip_generator.generate_filled_path(
-                path,
+                path.elements(),
                 fill_rule,
                 transform,
                 aliasing_threshold,
@@ -709,7 +709,7 @@ impl Scene {
             self.viewport_state
                 .with_generator_and_clip(|strip_generator, existing_clip| {
                     strip_generator.generate_filled_path(
-                        path,
+                        path.elements(),
                         self.render_state.fill_rule,
                         layer_transform,
                         self.aliasing_threshold,

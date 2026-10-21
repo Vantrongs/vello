@@ -694,7 +694,7 @@ impl Dispatcher for MultiThreadedDispatcher {
     ) {
         self.flush_tasks();
         self.clip_context.push_clip_path(
-            path.iter(),
+            path.elements(),
             &mut self.strip_generator,
             fill_rule,
             transform,
