@@ -590,3 +590,46 @@ fn huge_slanted_lines_match_small_geometry() {
         }
     }
 }
+
+/// A huge line nearly horizontal or nearly vertical through the view, huge in one
+/// direction only: either is enough for it to be clipped before it becomes `f32`.
+#[test]
+fn huge_lines_long_in_one_direction_only() {
+    for m in [1e12, 1e20, 1e100, 1e300] {
+        // Its only edge in the view runs from (-m, 30) to (m, 70): y = 50 there.
+        let mut horizontal = BezPath::new();
+        horizontal.move_to((-m, 30.0));
+        horizontal.line_to((m, 70.0));
+        horizontal.line_to((m, 1000.0));
+        horizontal.line_to((-m, 1000.0));
+        horizontal.close_path();
+        // Its only edge in the view runs from (30, -m) to (70, m): x = 50 there.
+        let mut vertical = BezPath::new();
+        vertical.move_to((30.0, -m));
+        vertical.line_to((70.0, m));
+        vertical.line_to((1000.0, m));
+        vertical.line_to((1000.0, -m));
+        vertical.close_path();
+        for (name, path, edge_is_horizontal) in [
+            ("horizontal", &horizontal, true),
+            ("vertical", &vertical, false),
+        ] {
+            for path in [path, &path.reverse_subpaths()] {
+                for rule in RULES {
+                    let alpha = render(path, rule, Affine::IDENTITY);
+                    for y in 0..usize::from(SIZE) {
+                        for x in 0..usize::from(SIZE) {
+                            let beyond_edge = if edge_is_horizontal { y } else { x } >= 50;
+                            let expected = if beyond_edge { 255 } else { 0 };
+                            let actual = alpha[y * usize::from(SIZE) + x];
+                            assert!(
+                                actual.abs_diff(expected) <= 1,
+                                "{name} {m:e} {rule:?}: pixel ({x}, {y}), expected {expected}, actual {actual}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
