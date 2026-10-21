@@ -191,7 +191,7 @@ impl StripGenerator {
     /// Generate the strips for a filled path.
     pub fn generate_filled_path(
         &mut self,
-        path: impl IntoIterator<Item = PathEl>,
+        path: impl IntoIterator<Item = PathEl> + Clone,
         fill_rule: Fill,
         transform: Affine,
         aliasing_threshold: Option<u8>,

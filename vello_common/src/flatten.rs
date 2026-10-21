@@ -182,7 +182,7 @@ impl Line {
 /// ```
 pub fn fill(
     level: Level,
-    path: impl IntoIterator<Item = PathEl>,
+    path: impl IntoIterator<Item = PathEl> + Clone,
     affine: Affine,
     line_buf: &mut Vec<Line>,
     ctx: &mut FlattenCtx,
@@ -197,30 +197,57 @@ pub fn fill(
 #[inline(always)]
 pub fn fill_impl<S: Simd>(
     simd: S,
-    path: impl IntoIterator<Item = PathEl>,
+    path: impl IntoIterator<Item = PathEl> + Clone,
     affine: Affine,
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
     cull_bbox: RectU16,
 ) {
     line_buf.clear();
-    let mut lb = FlattenerCallback {
-        line_buf,
-        start: Point::ZERO,
-        p0: Point::ZERO,
-        is_nan: false,
+    let mut lb = FlattenerCallback::new(line_buf);
+    // Segments `fill_clip` clips are rare: a loop without its calls keeps its state in
+    // registers, and only a path that has one is flattened again. `lb` stays out of
+    // that call, which would otherwise keep its state in memory through the loop.
+    let huge = crate::flatten_simd::flatten::<S, false>(
+        simd,
+        path.clone(),
+        affine,
+        &mut lb,
+        flatten_ctx,
+        cull_bbox,
+    );
+    let is_nan = if huge {
+        fill_clipped(simd, path, affine, lb.line_buf, flatten_ctx, cull_bbox)
+    } else {
+        lb.is_nan
     };
 
-    // `flatten_simd::flatten` splits huge curves itself.
-    crate::flatten_simd::flatten(simd, path, affine, &mut lb, flatten_ctx, cull_bbox);
-
     // A path that contains NaN is ill-defined, so ignore it.
-    if lb.is_nan {
+    if is_nan {
         warn!("A path contains NaN, ignoring it.");
 
         line_buf.clear();
     }
 }
+
+/// Flattens `path` into `line_buf` again, with the segments `fill_clip` clips, and
+/// returns whether it contains NaN.
+#[cold]
+#[inline(never)]
+fn fill_clipped<S: Simd>(
+    simd: S,
+    path: impl IntoIterator<Item = PathEl>,
+    affine: Affine,
+    line_buf: &mut Vec<Line>,
+    flatten_ctx: &mut FlattenCtx,
+    cull_bbox: RectU16,
+) -> bool {
+    line_buf.clear();
+    let mut lb = FlattenerCallback::new(line_buf);
+    crate::flatten_simd::flatten::<S, true>(simd, path, affine, &mut lb, flatten_ctx, cull_bbox);
+    lb.is_nan
+}
+
 /// Flatten a stroked Bézier path into line segments.
 ///
 /// See the note about open subpaths and culling on [`fill`].
@@ -744,6 +771,17 @@ struct FlattenerCallback<'a> {
     start: Point,
     p0: Point,
     is_nan: bool,
+}
+
+impl<'a> FlattenerCallback<'a> {
+    fn new(line_buf: &'a mut Vec<Line>) -> Self {
+        Self {
+            line_buf,
+            start: Point::ZERO,
+            p0: Point::ZERO,
+            is_nan: false,
+        }
+    }
 }
 
 impl Callback for FlattenerCallback<'_> {

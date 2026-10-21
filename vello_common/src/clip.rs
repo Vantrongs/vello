@@ -94,7 +94,7 @@ impl ClipContext {
     #[inline]
     pub fn push_clip_path(
         &mut self,
-        clip_path: impl IntoIterator<Item = PathEl>,
+        clip_path: impl IntoIterator<Item = PathEl> + Clone,
         strip_generator: &mut StripGenerator,
         fill_rule: Fill,
         transform: Affine,

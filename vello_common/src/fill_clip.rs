@@ -29,9 +29,7 @@
 //! between them is drawn as the line joining them, clipped like any line.
 
 use crate::flatten::TOL;
-use crate::flatten_simd::{
-    Callback, ClipOutput, FlattenCtx, LinePathEl, flatten_block, flatten_quad,
-};
+use crate::flatten_simd::{Callback, FlattenCtx, LinePathEl, flatten_block, flatten_quad};
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
 use crate::kurbo::{CubicBez, ParamCurve, ParamCurveExtrema, PathSeg, Point};
@@ -52,7 +50,7 @@ pub(crate) fn flatten_seg<S: Simd>(
     simd: S,
     seg: PathSeg,
     rect: [f64; 4],
-    callback: &mut impl ClipOutput,
+    callback: &mut impl Callback,
     ctx: &mut FlattenCtx,
 ) {
     let mut clip = Clip {
@@ -77,7 +75,7 @@ pub(crate) fn flatten_seg<S: Simd>(
 /// current point at `p1`.
 #[cold]
 #[inline(never)]
-pub(crate) fn line(p0: Point, p1: Point, rect: [f64; 4], callback: &mut impl ClipOutput) {
+pub(crate) fn line(p0: Point, p1: Point, rect: [f64; 4], callback: &mut impl Callback) {
     let mut out = Out { callback, at: None };
     clip_line(&mut out, rect, p0, p1);
     out.move_to(p1);
@@ -444,8 +442,6 @@ mod tests {
         at: Point,
         lines: usize,
     }
-
-    impl ClipOutput for CheckedOutput {}
 
     impl Callback for CheckedOutput {
         fn callback(&mut self, el: LinePathEl) {
