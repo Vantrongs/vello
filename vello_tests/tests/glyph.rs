@@ -1000,7 +1000,7 @@ fn draw_sbix_grid(ctx: &mut impl Renderer, enable_caching: bool, font_data: &'st
 }
 
 // In case anything changes here, compare to https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/web_tests/platform/linux/virtual/text-antialias/colrv1-expected.png
-#[vello_test(width = 400, height = 960, gpu_tolerance = 1, diff_pixels = 55, glyph)]
+#[vello_test(width = 400, height = 960, gpu_tolerance = 1, diff_pixels = 123, glyph)]
 fn glyphs_colr_test_glyphs(ctx: &mut impl Renderer, enable_caching: bool) {
     const TEST_FONT: &[u8] =
         include_bytes!("../../assets/colr_test_glyphs/test_glyphs-glyf_colr_1.ttf");

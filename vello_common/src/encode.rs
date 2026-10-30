@@ -1083,13 +1083,21 @@ impl<T: GradientLutExt> GradientLut<T> {
         let mut lut = vec![[T::ZERO; 4]; lut_size];
         let lut_flat = bytemuck::cast_slice_mut::<[T; 4], T>(&mut lut);
 
-        // Calculate how many indices are covered by each range.
+        let scale = lut_size as f32 - 1.0;
+
+        // Entry `idx` holds the color at `idx / scale`, so it belongs to the
+        // range whose `[x0, x1)` holds that place: up to `ceil(x1 * scale)`, and
+        // the last range to the end of the table.
         let ramps = {
             let mut ramps = Vec::with_capacity(ranges.len());
             let mut prev_idx = 0;
 
-            for range in ranges {
-                let max_idx = (range.x1 * lut_size as f32) as usize;
+            for (i, range) in ranges.iter().enumerate() {
+                let max_idx = if i + 1 == ranges.len() {
+                    lut_size
+                } else {
+                    ((range.x1 * scale).ceil() as usize).clamp(prev_idx, lut_size)
+                };
 
                 ramps.push((prev_idx..max_idx, range));
                 prev_idx = max_idx;
@@ -1097,8 +1105,6 @@ impl<T: GradientLutExt> GradientLut<T> {
 
             ramps
         };
-
-        let scale = lut_size as f32 - 1.0;
 
         let inv_lut_scale = f32x4::splat(simd, 1.0 / scale);
         let add_factor = f32x4::from_slice(simd, &[0.0, 1.0, 2.0, 3.0]) * inv_lut_scale;
@@ -1238,6 +1244,62 @@ mod tests {
         RadialGradientPosition,
     };
     use smallvec::smallvec;
+
+    /// Each entry of a gradient's table holds the color of its stops at its own
+    /// place, `idx / (len - 1)`: an entry just before a short steep range is
+    /// the flat color there, not the range's line drawn back past its start.
+    #[test]
+    fn gradient_lut_entries_hold_the_color_at_their_place() {
+        use crate::fearless_simd::Level;
+        let gray = |offset: f32, level: f32| ColorStop {
+            offset,
+            color: Color::new([level / 255.0, level / 255.0, level / 255.0, 1.0]).into(),
+        };
+        // A rise of three levels nine tenths of an entry of 4096 wide, starting
+        // past the 1638th entry's place.
+        let rise = 1638.9 / 4096.0;
+        let stops = [
+            gray(0.0, 100.0),
+            gray(1.0 / 4095.0, 100.0),
+            gray(rise, 100.0),
+            gray(rise + 0.9 / 4095.0, 103.0),
+            gray(1.0, 103.0),
+        ];
+        let gradient = Gradient {
+            kind: LinearGradientPosition {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(1.0, 0.0),
+            }
+            .into(),
+            stops: ColorStops(stops.iter().copied().collect()),
+            ..Default::default()
+        };
+        let mut paints = vec![];
+        gradient.encode_into(&mut paints, Affine::IDENTITY, None);
+        let [EncodedPaint::Gradient(encoded)] = paints.as_slice() else {
+            panic!("expected a gradient paint");
+        };
+        let lut = crate::fearless_simd::dispatch!(Level::new(), simd => encoded.u8_lut(simd).lut().to_vec());
+        assert_eq!(lut.len(), 4096);
+        let at = |t: f32| {
+            let next = stops
+                .iter()
+                .position(|s| s.offset > t)
+                .unwrap_or(stops.len() - 1);
+            let (a, b) = (&stops[next - 1], &stops[next]);
+            let ga = a.color.components[0] * 255.0;
+            let gb = b.color.components[0] * 255.0;
+            ga + (gb - ga) * (t - a.offset) / (b.offset - a.offset)
+        };
+        for (idx, entry) in lut.iter().enumerate() {
+            let want = at(idx as f32 / 4095.0);
+            assert!(
+                (f32::from(entry[0]) - want).abs() <= 0.5 + 1e-3,
+                "entry {idx}: {}, the stops' {want}",
+                entry[0]
+            );
+        }
+    }
 
     #[test]
     fn gradient_missing_stops() {
