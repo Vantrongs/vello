@@ -21,6 +21,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 use bytemuck::{Pod, Zeroable};
+use core::ops::ControlFlow;
 use fearless_simd::*;
 
 /// The element of a path made of lines.
@@ -53,8 +54,9 @@ pub(crate) trait Callback {
 /// <https://docs.rs/kurbo/latest/kurbo/fn.flatten.html>
 ///
 /// This version works using a similar approach but using f32x4/f32x8 SIMD instead.
+/// Without `CLIP`, it breaks at a curve or a line requiring clipping so the caller can replay the path.
 #[inline(always)]
-pub(crate) fn flatten<S: Simd>(
+pub(crate) fn flatten<S: Simd, const CLIP: bool>(
     simd: S,
     path: impl IntoIterator<Item = PathEl>,
     // Note: we explicitly pass the `Affine` here instead of using `map` on
@@ -65,7 +67,7 @@ pub(crate) fn flatten<S: Simd>(
     callback: &mut impl Callback,
     flatten_ctx: &mut FlattenCtx,
     cull_bbox: RectU16,
-) {
+) -> ControlFlow<()> {
     flatten_ctx.flattened_cubics.clear();
 
     // For the culling performed here to be correct, the top y coordinate of the cull bbox must be
@@ -92,7 +94,7 @@ pub(crate) fn flatten<S: Simd>(
 
     let mut path = path.into_iter();
     let Some(first_el) = path.next() else {
-        return;
+        return ControlFlow::Continue(());
     };
     let first_el = affine * first_el;
     let PathEl::MoveTo(start_pt) = first_el else {
@@ -100,7 +102,7 @@ pub(crate) fn flatten<S: Simd>(
             matches!(first_el, PathEl::MoveTo(_)),
             "Non-empty paths must begin with `PathEl::MoveTo`, got {first_el:?}"
         );
-        return;
+        return ControlFlow::Continue(());
     };
 
     let mut start_pt = start_pt;
@@ -109,21 +111,22 @@ pub(crate) fn flatten<S: Simd>(
 
     for el in path {
         if callback.meter().failed() {
-            return;
+            return ControlFlow::Continue(());
         }
         match affine * el {
             PathEl::MoveTo(p) => {
                 if last_pt != start_pt {
-                    line_to(last_pt, start_pt, rect, callback);
+                    line_to::<CLIP>(last_pt, start_pt, rect, callback)?;
                 }
                 last_pt = p;
                 start_pt = p;
                 callback.callback(LinePathEl::MoveTo(p));
             }
             PathEl::LineTo(p) => {
-                line_to(last_pt, p, rect, callback);
+                line_to::<CLIP>(last_pt, p, rect, callback)?;
                 last_pt = p;
             }
+            PathEl::QuadTo(..) | PathEl::CurveTo(..) if !CLIP => return ControlFlow::Break(()),
             PathEl::QuadTo(p1, p2) => {
                 let p0 = last_pt;
                 let b = control_box([p0, p1, p2]);
@@ -152,7 +155,7 @@ pub(crate) fn flatten<S: Simd>(
             }
             PathEl::ClosePath => {
                 if last_pt != start_pt {
-                    line_to(last_pt, start_pt, rect, callback);
+                    line_to::<CLIP>(last_pt, start_pt, rect, callback)?;
 
                     // Kurbo says: "If `quad_to` [or another drawing op] is called immediately
                     // after `close_path` then the current subpath starts at the initial point of
@@ -166,24 +169,32 @@ pub(crate) fn flatten<S: Simd>(
     }
 
     if last_pt != start_pt {
-        line_to(last_pt, start_pt, rect, callback);
+        line_to::<CLIP>(last_pt, start_pt, rect, callback)?;
     }
+    ControlFlow::Continue(())
 }
 
 #[inline(always)]
-fn line_to(p0: Point, p: Point, rect: [f64; 4], callback: &mut impl Callback) {
+fn line_to<const CLIP: bool>(
+    p0: Point,
+    p: Point,
+    rect: [f64; 4],
+    callback: &mut impl Callback,
+) -> ControlFlow<()> {
     if (p0.x > rect[2] && p.x > rect[2])
         || (p0.y < rect[1] && p.y < rect[1])
         || (p0.y > rect[3] && p.y > rect[3])
     {
         callback.callback(LinePathEl::MoveTo(p));
-        return;
-    }
-    if line_exceeds_split_extent(p0, p) {
+    } else if line_exceeds_split_extent(p0, p) {
+        if !CLIP {
+            return ControlFlow::Break(());
+        }
         fill_clip::line(p0, p, rect, callback);
-        return;
+    } else {
+        callback.callback(LinePathEl::LineTo(p));
     }
-    callback.callback(LinePathEl::LineTo(p));
+    ControlFlow::Continue(())
 }
 
 /// Whether the line `p0 p` is wider or taller than `cull::SPLIT_EXTENT`.

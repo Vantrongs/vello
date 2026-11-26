@@ -188,7 +188,7 @@ impl StripGenerator {
         let bbox = self.clip_bounds(clip);
         let fill = match style {
             PathStyle::Fill(fill) => {
-                fearless_simd::dispatch!(self.level, simd => flatten::fill_path(
+                fearless_simd::dispatch!(self.level, simd => flatten::fill_path::<_, true>(
                     simd, path, transform, &mut self.line_buf, &mut self.flatten_ctx, bbox, meter
                 ));
                 fill

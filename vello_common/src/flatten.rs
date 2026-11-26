@@ -206,7 +206,7 @@ pub fn fill_impl<S: Simd>(
     flatten_ctx: &mut FlattenCtx,
     cull_bbox: RectU16,
 ) {
-    fill_path(
+    fill_path::<_, true>(
         simd,
         path,
         affine,
@@ -218,7 +218,7 @@ pub fn fill_impl<S: Simd>(
 }
 
 #[inline(always)]
-pub(crate) fn fill_path<S: Simd>(
+pub(crate) fn fill_path<S: Simd, const CLIP: bool>(
     simd: S,
     path: impl IntoIterator<Item = PathEl>,
     affine: Affine,
@@ -226,17 +226,26 @@ pub(crate) fn fill_path<S: Simd>(
     flatten_ctx: &mut FlattenCtx,
     cull_bbox: RectU16,
     meter: Meter<'_>,
-) {
+) -> bool {
     line_buf.clear();
     let mut lb = FlattenerCallback::new(line_buf, meter, cull_bbox);
-    crate::flatten_simd::flatten(simd, path, affine, &mut lb, flatten_ctx, cull_bbox);
+    let replay = crate::flatten_simd::flatten::<_, CLIP>(
+        simd,
+        path,
+        affine,
+        &mut lb,
+        flatten_ctx,
+        cull_bbox,
+    )
+    .is_break();
 
     // A path that contains NaN is ill-defined, so ignore it.
-    if lb.is_nan {
+    if !replay && lb.is_nan {
         warn!("A path contains NaN, ignoring it.");
 
         line_buf.clear();
     }
+    replay
 }
 
 /// Flatten a stroked Bézier path into line segments.
@@ -330,7 +339,37 @@ pub(crate) fn stroke_metered(
         };
         expand_stroke(dashed, &solid, tolerance, stroke_ctx);
     }
-    dispatch!(level, simd => fill_path(simd, stroke_ctx.output().iter(), affine, line_buf, flatten_ctx, cull_bbox, meter));
+    fill_outline(
+        level,
+        stroke_ctx.output(),
+        affine,
+        line_buf,
+        flatten_ctx,
+        cull_bbox,
+        meter,
+    );
+}
+
+fn fill_outline(
+    level: Level,
+    outline: &kurbo::BezPath,
+    affine: Affine,
+    line_buf: &mut Vec<Line>,
+    flatten_ctx: &mut FlattenCtx,
+    cull_bbox: RectU16,
+    meter: Meter<'_>,
+) {
+    // Only the full flattener uses SIMD. Metered outlines must charge once.
+    if meter.0.is_none()
+        && !dispatch!(Level::baseline(), simd => fill_path::<_, false>(
+            simd, outline.iter(), affine, line_buf, flatten_ctx, cull_bbox, Meter::default(),
+        ))
+    {
+        return;
+    }
+    dispatch!(level, simd => fill_path::<_, true>(
+        simd, outline.iter(), affine, line_buf, flatten_ctx, cull_bbox, meter,
+    ));
 }
 
 /// Strokes at most this wide in device pixels skip stroke expansion and are outlined
@@ -450,6 +489,60 @@ impl Callback for FlattenerCallback<'_> {
                     self.line_buf.push(Line::new(self.p0.into(), p.into()));
                 }
                 self.p0 = p;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stroke_edges_match_one_pass_fill_of_the_outline() {
+        let level = Level::baseline();
+        let bbox = RectU16::new(0, 0, 100, 100);
+        let style = Stroke::new(4.0)
+            .with_caps(kurbo::Cap::Butt)
+            .with_join(kurbo::Join::Bevel);
+        for (far, curve) in [
+            (80.0, false),
+            (crate::cull::SPLIT_EXTENT * 4.0, false),
+            (80.0, true),
+        ] {
+            let mut path = kurbo::BezPath::new();
+            path.move_to((10.0, 10.0));
+            path.line_to((20.0, 45.0));
+            if curve {
+                path.quad_to((24.0, 30.0), (30.0, 25.0));
+            }
+            path.line_to((far, 60.0));
+            let mut ctx = FlattenCtx::default();
+            let mut outline = StrokeCtx::default();
+            let mut actual = Vec::new();
+            stroke(
+                level,
+                &path,
+                &style,
+                Affine::IDENTITY,
+                &mut actual,
+                &mut ctx,
+                &mut outline,
+                bbox,
+            );
+            let mut expected = Vec::new();
+            fill(
+                level,
+                outline.output(),
+                Affine::IDENTITY,
+                &mut expected,
+                &mut ctx,
+                bbox,
+            );
+            assert!(!expected.is_empty());
+            assert_eq!(actual.len(), expected.len());
+            for (a, b) in actual.iter().zip(expected) {
+                assert_eq!((a.p0, a.p1), (b.p0, b.p1));
             }
         }
     }
