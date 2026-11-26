@@ -229,10 +229,10 @@ fn draw_strip_areas(document: &mut Document, strips: &[Strip], alphas: &[u8]) {
 
         let end = strips
             .get(i + 1)
-            .map(|s| s.alpha_idx() / u32::from(Tile::HEIGHT))
-            .unwrap_or(alphas.len() as u32);
+            .map(Strip::alpha_column)
+            .unwrap_or_else(|| Strip::column_from_byte_offset(alphas.len()));
 
-        let width = end - strip.alpha_idx() / u32::from(Tile::HEIGHT);
+        let width = end - strip.alpha_column();
 
         // TODO: Account for even-odd?
         let color = if strip.fill_gap() { "red" } else { "limegreen" };
@@ -258,17 +258,17 @@ fn draw_strips(document: &mut Document, strips: &[Strip], alphas: &[u8]) {
 
         let end = strips
             .get(s + 1)
-            .map(|st| st.alpha_idx() / u32::from(Tile::HEIGHT))
-            .unwrap_or(alphas.len() as u32);
+            .map(Strip::alpha_column)
+            .unwrap_or_else(|| Strip::column_from_byte_offset(alphas.len()));
 
-        let width = u16::try_from(end - strip.alpha_idx() / u32::from(Tile::HEIGHT)).unwrap();
+        let width = u16::try_from(end - strip.alpha_column()).unwrap();
 
         // TODO: Account for even-odd?
         let color = if strip.fill_gap() { "red" } else { "limegreen" };
 
         for x in 0..width {
             for y in 0..Tile::HEIGHT {
-                let alpha = alphas[strip.alpha_idx() as usize
+                let alpha = alphas[strip.alpha_byte_offset()
                     + usize::from(x) * usize::from(Tile::HEIGHT)
                     + usize::from(y)];
                 let rect = Rectangle::new()
@@ -322,7 +322,7 @@ fn draw_alpha_fill_segment(
 
     for x in x0..x1 {
         for y in y0..y1 {
-            let alpha_idx = segment.alpha_idx as usize
+            let alpha_idx = segment.alpha_column as usize * usize::from(Tile::HEIGHT)
                 + usize::from(x - x0) * usize::from(Tile::HEIGHT)
                 + usize::from(y - y0);
             let rect = Rectangle::new()

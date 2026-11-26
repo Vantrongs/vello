@@ -20,6 +20,8 @@ This release has an [MSRV][] of 1.89.
 
 ### Changed
 
+- Breaking change: `vello_common::strip` stores coverage positions in four-byte columns. `Strip` takes aligned `usize` byte offsets and exposes `alpha_column` and `alpha_byte_offset`, allowing offsets through 8 GiB − 4 bytes on 64-bit targets. Rename calls to `Strip::set_alpha_idx` to `Strip::set_alpha_byte_offset`. The field `StripAlphaFillSegment::alpha_idx` is now `alpha_column` and counts four-byte columns instead of bytes. ([#2037](https://github.com/linebender/vello/issues/2037) by [@Vantrongs](https://github.com/Vantrongs))
+
 - `FilterGraph::add` and `FilterGraph::set_output` panic unless the graph stays a linear chain. (by [@LaurenzV][])
 - Breaking change: `FilterGraph::primitives` and `FilterGraph::output` are private; use the accessor methods of the same name. (by [@LaurenzV][])
 - Breaking change: `ProbeFeature::Filter` is renamed to `ProbeFeature::GaussianBlur`. (by [@LaurenzV][])

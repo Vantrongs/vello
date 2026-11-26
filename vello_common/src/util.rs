@@ -583,8 +583,8 @@ mod tests {
     use crate::tile::Tile;
     use peniko::kurbo::{Affine, Rect};
 
-    fn sentinel(y: u16, alpha_idx: u32) -> Strip {
-        Strip::new(u16::MAX, y, alpha_idx, false)
+    fn sentinel(y: u16, alpha_byte_offset: usize) -> Strip {
+        Strip::new(u16::MAX, y, alpha_byte_offset, false)
     }
 
     #[test]
@@ -644,7 +644,7 @@ mod tests {
     fn single_strip_bbox() {
         let strips = [
             Strip::new(8, 4, 0, false),
-            sentinel(4, u32::from(Tile::HEIGHT) * 4),
+            sentinel(4, usize::from(Tile::HEIGHT) * 4),
         ];
 
         assert_eq!(strip_bbox(&strips), Some(RectU16::new(8, 4, 12, 8)));
@@ -654,8 +654,8 @@ mod tests {
     fn strip_with_fill_bbox() {
         let strips = [
             Strip::new(4, 0, 0, false),
-            Strip::new(20, 0, u32::from(Tile::HEIGHT) * 4, true),
-            sentinel(0, u32::from(Tile::HEIGHT) * 8),
+            Strip::new(20, 0, usize::from(Tile::HEIGHT) * 4, true),
+            sentinel(0, usize::from(Tile::HEIGHT) * 8),
         ];
 
         assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 24, 4)));
@@ -665,8 +665,8 @@ mod tests {
     fn strip_with_row_end_fill_gap_bbox_is_clamped_to_viewport() {
         let strips = [
             Strip::new(4, 0, 0, false),
-            Strip::new(32, 0, u32::from(Tile::HEIGHT) * 4, true),
-            sentinel(0, u32::from(Tile::HEIGHT) * 4),
+            Strip::new(32, 0, usize::from(Tile::HEIGHT) * 4, true),
+            sentinel(0, usize::from(Tile::HEIGHT) * 4),
         ];
 
         assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 32, 4)));
@@ -676,8 +676,8 @@ mod tests {
     fn strips_with_multiple_rows_bbox() {
         let strips = [
             Strip::new(12, 0, 0, false),
-            Strip::new(4, 8, u32::from(Tile::HEIGHT) * 4, false),
-            sentinel(8, u32::from(Tile::HEIGHT) * 8),
+            Strip::new(4, 8, usize::from(Tile::HEIGHT) * 4, false),
+            sentinel(8, usize::from(Tile::HEIGHT) * 8),
         ];
 
         assert_eq!(strip_bbox(&strips), Some(RectU16::new(4, 0, 16, 12)));

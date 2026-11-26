@@ -31,21 +31,21 @@ pub(crate) enum RenderCmd {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaintFill {
     pub(crate) span: TileAlignedSpan,
-    alpha_idx: Option<AlphaIdx>,
+    alpha_column: Option<AlphaColumn>,
     pub(crate) attrs_idx: u32,
 }
 
 impl PaintFill {
-    pub(crate) fn new(span: TileAlignedSpan, alpha_idx: Option<u32>, attrs_idx: u32) -> Self {
+    pub(crate) fn new(span: TileAlignedSpan, alpha_column: Option<u32>, attrs_idx: u32) -> Self {
         Self {
             span,
-            alpha_idx: alpha_idx.map(AlphaIdx::new),
+            alpha_column: alpha_column.map(AlphaColumn::new),
             attrs_idx,
         }
     }
 
-    pub(crate) fn alpha_idx(self) -> Option<u32> {
-        self.alpha_idx.map(AlphaIdx::get)
+    pub(crate) fn alpha_column(self) -> Option<u32> {
+        self.alpha_column.map(AlphaColumn::get)
     }
 }
 
@@ -78,31 +78,31 @@ impl DepthFill {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LayerFill {
     pub(crate) span: TileAlignedSpan,
-    alpha_idx: Option<AlphaIdx>,
+    alpha_column: Option<AlphaColumn>,
     pub(crate) attrs_idx: u32,
 }
 
 impl LayerFill {
-    pub(crate) fn new(span: TileAlignedSpan, alpha_idx: Option<u32>, attrs_idx: u32) -> Self {
+    pub(crate) fn new(span: TileAlignedSpan, alpha_column: Option<u32>, attrs_idx: u32) -> Self {
         Self {
             span,
-            alpha_idx: alpha_idx.map(AlphaIdx::new),
+            alpha_column: alpha_column.map(AlphaColumn::new),
             attrs_idx,
         }
     }
 
-    pub(crate) fn alpha_idx(self) -> Option<u32> {
-        self.alpha_idx.map(AlphaIdx::get)
+    pub(crate) fn alpha_column(self) -> Option<u32> {
+        self.alpha_column.map(AlphaColumn::get)
     }
 }
 
-// We use `NonZeroU32` so that `Option<AlphaIdx>` still only needs 4 bytes.
+// We use `NonZeroU32` so that `Option<AlphaColumn>` still only needs 4 bytes.
 #[derive(Debug, Clone, Copy)]
-struct AlphaIdx(NonZeroU32);
+struct AlphaColumn(NonZeroU32);
 
-impl AlphaIdx {
-    fn new(alpha_idx: u32) -> Self {
-        Self(NonZeroU32::new(alpha_idx.checked_add(1).expect("alpha index overflow")).unwrap())
+impl AlphaColumn {
+    fn new(alpha_column: u32) -> Self {
+        Self(NonZeroU32::new(alpha_column.checked_add(1).expect("alpha index overflow")).unwrap())
     }
 
     fn get(self) -> u32 {
@@ -135,12 +135,12 @@ pub(crate) struct LayerFillAttrs {
 
 #[cfg(test)]
 mod tests {
-    use super::{AlphaIdx, RenderCmd};
+    use super::{AlphaColumn, RenderCmd};
     use core::mem::{needs_drop, size_of};
 
     #[test]
-    fn alpha_idx_size() {
-        assert_eq!(size_of::<Option<AlphaIdx>>(), 4);
+    fn alpha_column_size() {
+        assert_eq!(size_of::<Option<AlphaColumn>>(), 4);
     }
 
     #[test]

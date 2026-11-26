@@ -17,7 +17,7 @@ use vello_common::geometry::RectU16;
 use vello_common::kurbo::Rect;
 use vello_common::paint::Paint;
 use vello_common::record::LayerClip;
-use vello_common::strip::{StripAlphaFillSegment, StripFillSegment, visit_strip_fill_segments};
+use vello_common::strip::{StripFillSegment, visit_strip_fill_segments};
 use vello_common::strip_generator::StripStorage;
 use vello_common::tile::Tile;
 use vello_common::util::Clear;
@@ -190,7 +190,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                 let shifted = segment.shift(geometry_shift);
                 let strip = GpuStrip::from_fill_segment(
                     shifted,
-                    Some(segment.col_idx()),
+                    Some(segment.alpha_column),
                     // The paint needs to be sampled at the x/y of the _original_ segment, not
                     // the shifted one. The shifted accounts for where the segment needs to be
                     // placed based on the layer bbox and texture region, but the location of
@@ -297,7 +297,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                     builder.push_layer_fill_segment(
                         sample,
                         *segment,
-                        Some(segment.col_idx()),
+                        Some(segment.alpha_column),
                         paint,
                         depth_index,
                     );
@@ -559,17 +559,6 @@ impl RectU16Ext for RectU16 {
             self.x1 / Tile::WIDTH,
             self.y1 / Tile::HEIGHT,
         )
-    }
-}
-
-trait StripAlphaFillSegmentExt {
-    fn col_idx(self) -> u32;
-}
-
-impl StripAlphaFillSegmentExt for StripAlphaFillSegment {
-    #[inline(always)]
-    fn col_idx(self) -> u32 {
-        self.alpha_idx / u32::from(Tile::HEIGHT)
     }
 }
 

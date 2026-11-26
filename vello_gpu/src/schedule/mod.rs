@@ -149,7 +149,6 @@ use vello_common::peniko::BlendMode;
 use vello_common::record::{CommandRecorder, LayerProps, Node, RecordedLayer, RecordedLayerKind};
 use vello_common::strip::visit_strip_fill_segments;
 use vello_common::strip_generator::StripStorage;
-use vello_common::tile::Tile;
 use vello_common::util::RectExt;
 
 const REGULAR_LAYER_KIND: RecordedLayerKind = RecordedLayerKind::Regular;
@@ -675,7 +674,7 @@ impl<'a, 'p> Scheduler<'a, 'p> {
                 |blend_strips, segment| {
                     blend_strips.push(BlendStrip::from_fill_segment(
                         segment.shift(geometry_shift),
-                        Some(segment.alpha_idx / u32::from(Tile::HEIGHT)),
+                        Some(segment.alpha_column),
                     ));
                 },
                 |blend_strips, segment| {

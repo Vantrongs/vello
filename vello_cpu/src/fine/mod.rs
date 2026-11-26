@@ -719,10 +719,10 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                 };
 
                 let paint_fill = |fine: &mut Self, span: TileAlignedSpan| {
-                    let alphas = cmd.alpha_idx().map(|alpha_idx| {
-                        let alpha_offset = alpha_idx as usize
-                            + usize::from(span.pixel_x() - cmd.span.pixel_x())
-                                * Tile::HEIGHT as usize;
+                    let alphas = cmd.alpha_column().map(|column| {
+                        let alpha_offset = (column as usize
+                            + usize::from(span.pixel_x() - cmd.span.pixel_x()))
+                            * Tile::HEIGHT as usize;
                         &alpha_buffer[alpha_offset..]
                     });
 
@@ -751,10 +751,10 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                 let alpha_buffer = resources.alpha_buffers[attrs.thread_idx as usize];
 
                 let layer_fill = |fine: &mut Self, span: TileAlignedSpan| {
-                    let alphas = cmd.alpha_idx().map(|alpha_idx| {
-                        let alpha_offset = alpha_idx as usize
-                            + usize::from(span.pixel_x() - cmd.span.pixel_x())
-                                * Tile::HEIGHT as usize;
+                    let alphas = cmd.alpha_column().map(|column| {
+                        let alpha_offset = (column as usize
+                            + usize::from(span.pixel_x() - cmd.span.pixel_x()))
+                            * Tile::HEIGHT as usize;
                         &alpha_buffer[alpha_offset..]
                     });
 
