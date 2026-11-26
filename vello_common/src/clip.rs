@@ -17,7 +17,7 @@ use peniko::Fill;
 
 #[derive(Debug)]
 struct ClipData {
-    alpha_start: u32,
+    alpha_start: usize,
     strip_start: u32,
     /// The known geometric shape of this clip.
     shape: ClipShape,
@@ -36,10 +36,7 @@ impl ClipData {
                     .strips
                     .get(self.strip_start as usize..)
                     .unwrap_or(&[]),
-                alphas: storage
-                    .alphas
-                    .get(self.alpha_start as usize..)
-                    .unwrap_or(&[]),
+                alphas: storage.alphas.get(self.alpha_start..).unwrap_or(&[]),
                 bbox: self.bbox,
                 opaque_bbox: self.opaque_bbox,
             },
@@ -127,7 +124,7 @@ impl ClipContext {
     ) {
         self.temp_storage.clear();
 
-        let alpha_start = self.storage.alphas.len() as u32;
+        let alpha_start = self.storage.alphas.len();
         let strip_start = self.storage.strips.len() as u32;
 
         let existing_clip = self.clip_stack.last().map(|c| c.to_clip_ref(&self.storage));
@@ -151,7 +148,7 @@ impl ClipContext {
     pub fn pop_clip(&mut self) {
         let data = self.clip_stack.pop().expect("clip stack underflowed");
         self.storage.strips.truncate(data.strip_start as usize);
-        self.storage.alphas.truncate(data.alpha_start as usize);
+        self.storage.alphas.truncate(data.alpha_start);
     }
 }
 
@@ -596,10 +593,9 @@ fn intersect_impl<S: Simd>(
 
     // Push the sentinel strip if the intersection is not empty.
     if !target.strips.is_empty() {
-        target.strips.push(Strip::sentinel(
-            end_y * Tile::HEIGHT,
-            target.alphas.len() as u32,
-        ));
+        target
+            .strips
+            .push(Strip::sentinel(end_y * Tile::HEIGHT, target.alphas.len()));
     }
 }
 
@@ -755,7 +751,7 @@ impl<'a> RowIterator<'a> {
     fn cur_strip_alphas(&self) -> &'a [u8] {
         let cur = self.cur_strip();
         let next = self.next_strip();
-        &self.input.alphas[cur.alpha_idx() as usize..next.alpha_idx() as usize]
+        &self.input.alphas[cur.alpha_byte_offset()..next.alpha_byte_offset()]
     }
 
     fn cur_strip_fill_area(&self) -> Option<FillRegion> {
@@ -840,7 +836,7 @@ impl<'a> Iterator for RowIterator<'a> {
 /// The data of the current strip we are building.
 struct StripState {
     x: u16,
-    alpha_idx: u32,
+    alpha_byte_offset: usize,
     fill_gap: bool,
 }
 
@@ -849,7 +845,7 @@ fn flush_strip(strip_state: &mut Option<StripState>, strips: &mut Vec<Strip>, cu
         strips.push(Strip::new(
             state.x,
             cur_y * Tile::HEIGHT,
-            state.alpha_idx,
+            state.alpha_byte_offset,
             state.fill_gap,
         ));
     }
@@ -859,7 +855,7 @@ fn flush_strip(strip_state: &mut Option<StripState>, strips: &mut Vec<Strip>, cu
 fn start_strip(strip_data: &mut Option<StripState>, alphas: &[u8], x: u32, fill_gap: bool) {
     *strip_data = Some(StripState {
         x: u16::try_from(x).expect("strip starts must remain in the physical coordinate domain"),
-        alpha_idx: alphas.len() as u32,
+        alpha_byte_offset: alphas.len(),
         fill_gap,
     });
 }
@@ -871,7 +867,7 @@ fn should_create_new_strip(
 ) -> bool {
     // Returns false in case we can append to the currently built strip.
     strip_state.as_ref().is_none_or(|state| {
-        let width = (alphas.len() as u32 - state.alpha_idx) / u32::from(Tile::HEIGHT);
+        let width = Strip::column_from_byte_offset(alphas.len() - state.alpha_byte_offset);
         let strip_end = u32::from(state.x) + width;
 
         strip_end + 1 < overlap_start
@@ -921,7 +917,7 @@ mod tests {
                 for dy in 0..Tile::HEIGHT {
                     let y = strip.y + dy;
                     if y < 100 {
-                        pixels[y as usize * 100 + x as usize] = alphas[strip.alpha_idx() as usize
+                        pixels[y as usize * 100 + x as usize] = alphas[strip.alpha_byte_offset()
                             + (x - u32::from(strip.x)) as usize * Tile::HEIGHT as usize
                             + dy as usize];
                     }
@@ -1451,7 +1447,7 @@ mod tests {
             let idx = self.storage.alphas.len();
             self.storage
                 .strips
-                .push(Strip::new(x, strip_y * Tile::HEIGHT, idx as u32, fill_gap));
+                .push(Strip::new(x, strip_y * Tile::HEIGHT, idx, fill_gap));
             self.storage.alphas.extend_from_slice(alphas);
 
             self
@@ -1461,9 +1457,7 @@ mod tests {
             let last_y = self.storage.strips.last().unwrap().y;
             let idx = self.storage.alphas.len();
 
-            self.storage
-                .strips
-                .push(Strip::sentinel(last_y, idx as u32));
+            self.storage.strips.push(Strip::sentinel(last_y, idx));
 
             self.storage
         }
@@ -1472,7 +1466,7 @@ mod tests {
             let idx = self.storage.alphas.len();
             self.storage
                 .strips
-                .push(Strip::new(x, strip_y * Tile::HEIGHT, idx as u32, fill_gap));
+                .push(Strip::new(x, strip_y * Tile::HEIGHT, idx, fill_gap));
 
             self
         }

@@ -569,7 +569,7 @@ trait StripAlphaFillSegmentExt {
 impl StripAlphaFillSegmentExt for StripAlphaFillSegment {
     #[inline(always)]
     fn col_idx(self) -> u32 {
-        self.alpha_idx / u32::from(Tile::HEIGHT)
+        self.alpha_column
     }
 }
 

@@ -739,7 +739,7 @@ fn coverage<const W: usize, const H: usize>(
                 .enumerate()
             {
                 for (dx, alpha) in row[x0..(seg.x1() as usize).min(W)].iter_mut().enumerate() {
-                    *alpha = storage.alphas[seg.alpha_idx as usize + dx * 4 + dy];
+                    *alpha = storage.alphas[seg.alpha_column as usize * 4 + dx * 4 + dy];
                 }
             }
         },

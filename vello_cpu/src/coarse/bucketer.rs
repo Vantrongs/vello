@@ -486,7 +486,7 @@ impl CommandBucketer {
                     if bucketer.occupied_rows_bool_scratch[fill.row_idx] {
                         bucketer.rows[fill.row_idx].push_cmd(RenderCmd::LayerFill(LayerFill::new(
                             fill.span,
-                            Some(fill.alpha_idx),
+                            Some(fill.alpha_column),
                             attrs_idx,
                         )));
                     }
@@ -643,7 +643,7 @@ impl CommandBucketer {
                 bucketer.ensure_row_layers(row_idx);
                 bucketer.rows[row_idx].push_cmd(RenderCmd::PaintFill(PaintFill::new(
                     fill.span,
-                    Some(fill.alpha_idx),
+                    Some(fill.alpha_column),
                     attrs_idx,
                 )));
             },
@@ -702,7 +702,7 @@ impl CommandBucketer {
                             segment.tile_x0 - origin_tile_x,
                             segment.tile_x1 - segment.tile_x0,
                         ),
-                        alpha_idx: segment.alpha_idx,
+                        alpha_column: segment.alpha_column,
                     },
                 );
             },
@@ -772,7 +772,7 @@ pub(crate) struct GeneratedFill {
 pub(crate) struct GeneratedAlphaFill {
     pub(crate) row_idx: usize,
     pub(crate) span: TileAlignedSpan,
-    pub(crate) alpha_idx: u32,
+    pub(crate) alpha_column: u32,
 }
 
 #[cfg(test)]
@@ -894,7 +894,7 @@ mod tests {
             RenderCmd::PaintFill(cmd)
                 if cmd.span.pixel_x() == 4
                     && cmd.span.pixel_width() == 4
-                    && cmd.alpha_idx() == Some(u32::from(4 * Tile::HEIGHT))
+                    && cmd.alpha_column() == Some(4)
         ));
     }
 
@@ -1046,7 +1046,7 @@ mod tests {
         // A 32px-wide alpha strip at scene (40, 32) => local (8, 0), fully inside the clip.
         let strips = [
             Strip::new(40, 32, 0, false),
-            Strip::new(72, 32, 32 * u32::from(Tile::HEIGHT), false),
+            Strip::new(72, 32, 32 * usize::from(Tile::HEIGHT), false),
         ];
         bucketer.generate_fill(&strips, &fill_attrs(Paint::Solid(color(RED))), &[]);
 
@@ -1059,7 +1059,7 @@ mod tests {
             RenderCmd::PaintFill(cmd)
                 if cmd.span.pixel_x() == 8
                     && cmd.span.pixel_width() == 32
-                    && cmd.alpha_idx() == Some(0)
+                    && cmd.alpha_column() == Some(0)
         ));
     }
 
@@ -1068,7 +1068,7 @@ mod tests {
         // Viewport spans scene (0, 32) to (64, 96). Local space is 64x64, the origin at (0, 32).
         let mut bucketer = CommandBucketer::new(RectU16::new(0, 32, 64, 96));
 
-        let alpha = u32::from(Tile::HEIGHT);
+        let alpha = usize::from(Tile::HEIGHT);
         let strips = [
             // Content: 16px alpha strip at scene (0, 32) => local row 0.
             Strip::new(0, 32, 0, false),

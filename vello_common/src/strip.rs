@@ -23,8 +23,8 @@ pub struct Strip {
     ///
     /// Bit layout (u32):
     /// - bit 31: `fill_gap` (See `Strip::fill_gap()`).
-    /// - bits 0..=30: `alpha_idx` (See `Strip::alpha_idx()`).
-    packed_alpha_idx_fill_gap: u32,
+    /// - bits 0..=30: `alpha_column` (See `Strip::alpha_column()`).
+    packed_alpha_column_fill_gap: u32,
 }
 
 /// A fill region with alpha coverage.
@@ -32,8 +32,8 @@ pub struct Strip {
 pub struct StripAlphaFillSegment {
     /// The fill region covered by this alpha segment.
     pub fill: StripFillSegment,
-    /// The index into the alpha buffer of the segment.
-    pub alpha_idx: u32,
+    /// The index of the first four-byte coverage column of the segment.
+    pub alpha_column: u32,
 }
 
 impl Deref for StripAlphaFillSegment {
@@ -171,10 +171,8 @@ pub fn visit_strip_fill_segments<C>(
                         tile_y,
                     },
                     // Make sure to recalculate the index in case we had to clip.
-                    alpha_idx: strip.alpha_idx()
-                        + u32::from(tile_x0 - strip_tile_x0)
-                            * u32::from(Tile::WIDTH)
-                            * u32::from(Tile::HEIGHT),
+                    alpha_column: strip.alpha_column()
+                        + u32::from(tile_x0 - strip_tile_x0) * u32::from(Tile::WIDTH),
                 },
             );
         }
@@ -200,27 +198,36 @@ pub fn visit_strip_fill_segments<C>(
 }
 
 impl Strip {
-    /// The bit mask for `fill_gap` packed into `packed_alpha_idx_fill_gap`.
+    /// The bit mask for `fill_gap` packed into `packed_alpha_column_fill_gap`.
     const FILL_GAP_MASK: u32 = 1 << 31;
 
-    /// Creates a new strip.
-    pub fn new(x: u16, y: u16, alpha_idx: u32, fill_gap: bool) -> Self {
-        // Ensure `alpha_idx` does not collide with the fill flag bit.
+    /// Convert an aligned coverage buffer length to its packed column position.
+    #[inline]
+    pub fn column_from_byte_offset(bytes: usize) -> u32 {
+        let height = usize::from(Tile::HEIGHT);
+        assert!(bytes.is_multiple_of(height), "unaligned alpha byte offset");
+        let column = bytes / height;
         assert!(
-            alpha_idx & Self::FILL_GAP_MASK == 0,
-            "`alpha_idx` too large"
+            column < Self::FILL_GAP_MASK as usize,
+            "alpha column too large"
         );
+        column as u32
+    }
+
+    /// Create a strip starting at an aligned byte offset in the coverage buffer.
+    pub fn new(x: u16, y: u16, alpha_byte_offset: usize, fill_gap: bool) -> Self {
+        let alpha_column = Self::column_from_byte_offset(alpha_byte_offset);
         let fill_gap = u32::from(fill_gap) << 31;
         Self {
             x,
             y,
-            packed_alpha_idx_fill_gap: alpha_idx | fill_gap,
+            packed_alpha_column_fill_gap: alpha_column | fill_gap,
         }
     }
 
     /// Creates a sentinel strip.
-    pub fn sentinel(y: u16, alpha_idx: u32) -> Self {
-        Self::new(u16::MAX, y, alpha_idx, false)
+    pub fn sentinel(y: u16, alpha_byte_offset: usize) -> Self {
+        Self::new(u16::MAX, y, alpha_byte_offset, false)
     }
 
     /// Return whether the strip is a sentinel strip.
@@ -238,44 +245,44 @@ impl Strip {
     /// **IMPORTANT**: This assumes that the `next` is actually the next adjacent strip
     /// to `self`, otherwise this method will return a garbage value!
     pub fn width_to(&self, next: &Self) -> u32 {
-        let col = self.alpha_idx() / u32::from(Tile::HEIGHT);
-        let next_col = next.alpha_idx() / u32::from(Tile::HEIGHT);
-        next_col - col
+        next.alpha_column() - self.alpha_column()
     }
 
-    /// Returns the alpha index.
+    /// Index of the first coverage column in the alpha buffer.
     #[inline(always)]
-    pub fn alpha_idx(&self) -> u32 {
-        self.packed_alpha_idx_fill_gap & !Self::FILL_GAP_MASK
+    pub fn alpha_column(&self) -> u32 {
+        self.packed_alpha_column_fill_gap & !Self::FILL_GAP_MASK
     }
 
-    /// Sets the alpha index.
-    ///
-    /// Note that the largest value that can be stored in the alpha index is `u32::MAX << 1`, as the
-    /// highest bit is reserved for `fill_gap`.
+    /// Byte offset at which to slice the coverage buffer.
     #[inline(always)]
-    pub fn set_alpha_idx(&mut self, alpha_idx: u32) {
-        // Ensure `alpha_idx` does not collide with the fill flag bit.
-        assert!(
-            alpha_idx & Self::FILL_GAP_MASK == 0,
-            "`alpha_idx` too large"
-        );
-        let fill_gap = self.packed_alpha_idx_fill_gap & Self::FILL_GAP_MASK;
-        self.packed_alpha_idx_fill_gap = alpha_idx | fill_gap;
+    pub fn alpha_byte_offset(self) -> usize {
+        self.alpha_column() as usize * usize::from(Tile::HEIGHT)
+    }
+
+    /// Shift the strip by the given number of coverage columns.
+    pub(crate) fn rebase(&mut self, columns: u32) {
+        let column = self
+            .alpha_column()
+            .checked_add(columns)
+            .expect("alpha column overflow");
+        assert!(column < Self::FILL_GAP_MASK, "alpha column too large");
+        self.packed_alpha_column_fill_gap =
+            column | (self.packed_alpha_column_fill_gap & Self::FILL_GAP_MASK);
     }
 
     /// Returns whether the gap that lies between this strip and the previous in the same row should be filled.
     #[inline(always)]
     pub fn fill_gap(&self) -> bool {
-        (self.packed_alpha_idx_fill_gap & Self::FILL_GAP_MASK) != 0
+        (self.packed_alpha_column_fill_gap & Self::FILL_GAP_MASK) != 0
     }
 
     /// Sets whether the gap that lies between this strip and the previous in the same row should be filled.
     #[inline(always)]
     pub fn set_fill_gap(&mut self, fill: bool) {
         let fill = u32::from(fill) << 31;
-        self.packed_alpha_idx_fill_gap =
-            (self.packed_alpha_idx_fill_gap & !Self::FILL_GAP_MASK) | fill;
+        self.packed_alpha_column_fill_gap =
+            (self.packed_alpha_column_fill_gap & !Self::FILL_GAP_MASK) | fill;
     }
 
     /// When early culling is active, geometry fully to the left of the viewport creates no tiles.
@@ -302,7 +309,7 @@ impl Strip {
         windings.for_active_rows_in_range(start as usize, end as usize, |row| {
             if should_fill(windings.coarse[row]) {
                 let y_pos = row as u16 * Tile::HEIGHT;
-                strips.push(Self::new(0, y_pos, alphas.len() as u32, false));
+                strips.push(Self::new(0, y_pos, alphas.len(), false));
                 // TODO: Would be nice to get rid of this, but the current clipping code only
                 // allows zero-width strips as a row terminator, not in-between.
                 alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
@@ -320,16 +327,16 @@ impl Strip {
     ) {
         let end = u32::from(viewport_width).next_multiple_of(u32::from(Tile::WIDTH));
         if end <= u32::from(u16::MAX) {
-            strips.push(Self::new(end as u16, y, alphas.len() as u32, fill_gap));
+            strips.push(Self::new(end as u16, y, alphas.len(), fill_gap));
         } else if fill_gap {
             // An aligned endpoint of 65536 cannot be a strip start. Keep the
             // last tile explicit instead of aliasing the sentinel.
             let last = strips.last().unwrap();
             let alpha_end = u32::from(last.x)
-                + (alphas.len() as u32 - last.alpha_idx()) / u32::from(Tile::HEIGHT);
+                + (Self::column_from_byte_offset(alphas.len()) - last.alpha_column());
             if alpha_end < end {
                 let last_x = u16::MAX / Tile::WIDTH * Tile::WIDTH;
-                strips.push(Self::new(last_x, y, alphas.len() as u32, true));
+                strips.push(Self::new(last_x, y, alphas.len(), true));
                 alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
             }
         }
@@ -430,7 +437,7 @@ fn render_impl<S: Simd>(
     let maybe_emit_sentinel_strip = |strip_buf: &mut Vec<Strip>, alpha_buf: &Vec<u8>| {
         // Emit the final sentinel strip, if we produced at least one strip.
         if let Some(last_y) = strip_buf[strip_start..].last().map(|s| s.y) {
-            strip_buf.push(Strip::sentinel(last_y, alpha_buf.len() as u32));
+            strip_buf.push(Strip::sentinel(last_y, alpha_buf.len()));
         }
     };
 
@@ -454,7 +461,7 @@ fn render_impl<S: Simd>(
             let coarse_wd = tiles.windings.coarse[y as usize];
 
             if should_fill(coarse_wd) && !is_left_viewport {
-                strips.push(Strip::new(0, y * Tile::HEIGHT, alphas.len() as u32, false));
+                strips.push(Strip::new(0, y * Tile::HEIGHT, alphas.len(), false));
                 alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
             }
 
@@ -515,7 +522,7 @@ fn render_impl<S: Simd>(
     let mut strip = Strip::new(
         prev_tile.x * Tile::WIDTH,
         prev_tile.y * Tile::HEIGHT,
-        alpha_buf.len() as u32,
+        alpha_buf.len(),
         should_fill(winding_delta) && !left_viewport,
     );
 
@@ -591,7 +598,7 @@ fn render_impl<S: Simd>(
         if !prev_tile.same_loc(&tile) && !prev_tile.prev_loc(&tile) {
             debug_assert_eq!(
                 (prev_tile.x as u32 + 1) * Tile::WIDTH as u32 - strip.x as u32,
-                ((alpha_buf.len() - strip.alpha_idx() as usize) / usize::from(Tile::HEIGHT)) as u32,
+                Strip::column_from_byte_offset(alpha_buf.len()) - strip.alpha_column(),
                 "The number of columns written to the alpha buffer should equal the number of columns spanned by this strip."
             );
             strip_buf.push(strip);
@@ -648,7 +655,7 @@ fn render_impl<S: Simd>(
             strip = Strip::new(
                 tile.x * Tile::WIDTH,
                 tile.y * Tile::HEIGHT,
-                alpha_buf.len() as u32,
+                alpha_buf.len(),
                 should_fill(winding_delta) && !left_viewport,
             );
         }
@@ -873,8 +880,42 @@ mod tests {
                     && u32::from(8 - pair[0].x) < pair[0].width_to(&pair[1])
             })
             .unwrap()[0];
-        let i = strip.alpha_idx() as usize + usize::from(8 - strip.x) * 4;
+        let i = strip.alpha_byte_offset() + usize::from(8 - strip.x) * 4;
         assert_eq!([alphas[i], alphas[i + 1], alphas[i + 4]], [128, 0, 255]);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn high_alpha_columns_round_trip_and_clip_without_a_backing_buffer() {
+        assert_eq!(size_of::<Strip>(), 8);
+        for boundary in [1_usize << 31, 1_usize << 32] {
+            let mut strip = Strip::new(0, 0, boundary - 32, true);
+            strip.rebase(4);
+            let end = Strip::sentinel(0, boundary + 16);
+            assert!(strip.fill_gap());
+            assert!(!end.fill_gap());
+            assert_eq!(strip.alpha_byte_offset(), boundary - 16);
+            assert_eq!(end.alpha_byte_offset(), boundary + 16);
+            assert_eq!(strip.width_to(&end), 8);
+            let mut clipped = None;
+            visit_strip_fill_segments(
+                &[strip, end],
+                RectU16::new(1, 0, 2, 1),
+                &mut clipped,
+                |out, segment| *out = Some(segment),
+                |_, _| unreachable!(),
+            );
+            assert_eq!(clipped.unwrap().alpha_column as usize * 4, boundary);
+        }
+        let last = Strip::sentinel(0, (1_usize << 33) - 4);
+        assert_eq!(last.alpha_column(), (1 << 31) - 1);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "alpha column too large")]
+    fn eight_gibibyte_alpha_position_is_rejected() {
+        Strip::sentinel(0, 1_usize << 33);
     }
 
     #[test]
@@ -893,7 +934,7 @@ mod tests {
             assert_eq!(segments.len(), 1);
             assert_eq!(segments[0].tile_x0, 0);
             assert_eq!(segments[0].tile_x1, width.div_ceil(4));
-            assert_eq!(segments[0].alpha_idx, 0);
+            assert_eq!(segments[0].alpha_column, 0);
         }
     }
 

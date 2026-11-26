@@ -96,7 +96,7 @@ fn render_impl<S: Simd>(s: S, rect: Rect, strip_buf: &mut Vec<Strip>, alpha_buf:
         let is_bottom_edge = strip_y_f < rect_y1 && rect_y1 < strip_y_end_f;
 
         if is_top_edge || is_bottom_edge {
-            let alpha_start = alpha_buf.len() as u32;
+            let alpha_start = alpha_buf.len();
 
             let y_cov = coverage(strip_y, rect_y0, rect_y1);
             // Only the left-most and right-most tiles can have partial horizontal coverage,
@@ -119,14 +119,14 @@ fn render_impl<S: Simd>(s: S, rect: Rect, strip_buf: &mut Vec<Strip>, alpha_buf:
 
             strip_buf.push(Strip::new(left_tile_x, strip_y, alpha_start, false));
         } else {
-            let alpha_start = alpha_buf.len() as u32;
+            let alpha_start = alpha_buf.len();
             alpha_buf.extend_from_slice(left_x_mask.as_slice());
             strip_buf.push(Strip::new(left_tile_x, strip_y, alpha_start, false));
 
             if needs_right_strip {
                 // `fill_gap = true` tells the renderer to fill solid 0xFF
                 // between the previous strip's end and this strip's start.
-                let alpha_start = alpha_buf.len() as u32;
+                let alpha_start = alpha_buf.len();
                 alpha_buf.extend_from_slice(right_x_mask.as_slice());
                 strip_buf.push(Strip::new(right_tile_x, strip_y, alpha_start, true));
             }
@@ -135,7 +135,7 @@ fn render_impl<S: Simd>(s: S, rect: Rect, strip_buf: &mut Vec<Strip>, alpha_buf:
 
     // Sentinel strip: marks the end of the strip list for this shape.
     let last_strip_y = ((tile_end_y - 1) * u32::from(Tile::HEIGHT)) as u16;
-    strip_buf.push(Strip::sentinel(last_strip_y, alpha_buf.len() as u32));
+    strip_buf.push(Strip::sentinel(last_strip_y, alpha_buf.len()));
 }
 
 /// Compute fractional pixel coverage for `N` consecutive pixels starting at `start`.
@@ -198,7 +198,7 @@ mod tests {
 
         assert_eq!(strips.len(), 2);
         assert_eq!(strips[0].x, u16::MAX - 3);
-        assert_eq!(strips[0].alpha_idx(), 0);
+        assert_eq!(strips[0].alpha_column(), 0);
         assert_eq!(
             alphas.len(),
             usize::from(Tile::WIDTH) * usize::from(Tile::HEIGHT)
@@ -216,7 +216,7 @@ mod tests {
 
         assert_eq!(strips.len(), 2);
         assert_eq!(strips[0].y, u16::MAX - 3);
-        assert_eq!(strips[0].alpha_idx(), 0);
+        assert_eq!(strips[0].alpha_column(), 0);
         assert_eq!(
             alphas.len(),
             usize::from(Tile::WIDTH) * usize::from(Tile::HEIGHT)

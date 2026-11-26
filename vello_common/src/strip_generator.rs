@@ -376,10 +376,17 @@ fn append_rebased(target: &mut StripStorage, source: &StripStorage) {
         let full = target.strips.capacity() - target.strips.len();
         target.strips.reserve(full + 1);
     }
-    let alpha_offset = target.alphas.len() as u32;
+    Strip::column_from_byte_offset(
+        target
+            .alphas
+            .len()
+            .checked_add(source.alphas.len())
+            .expect("alpha byte length overflow"),
+    );
+    let columns = Strip::column_from_byte_offset(target.alphas.len());
     target.strips.extend(source.strips.iter().map(|strip| {
         let mut strip = *strip;
-        strip.set_alpha_idx(strip.alpha_idx() + alpha_offset);
+        strip.rebase(columns);
         strip
     }));
     target.alphas.extend_from_slice(&source.alphas);
