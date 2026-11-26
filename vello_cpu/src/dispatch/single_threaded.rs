@@ -54,7 +54,9 @@ impl SingleThreadedDispatcher {
         Self {
             bucketer: RefCell::new(CommandBucketer::from_wh(width, height)),
             viewport: ViewportState::new(width, height, level),
-            recorder: CommandRecorder::new(width, height),
+            recorder: CommandRecorder::with_scene_size(vello_common::geometry::SizeU16::from_wh(
+                width, height,
+            )),
             strip_storage: StripStorage::new(GenerationMode::Append),
             level,
         }
@@ -417,7 +419,8 @@ impl Dispatcher for SingleThreadedDispatcher {
 
     fn reset(&mut self, width: u16, height: u16) {
         // Bucketer will be reset on demand, so no need to reset it here.
-        self.recorder.reset(width, height);
+        self.recorder
+            .reset_with_scene_size(vello_common::geometry::SizeU16::from_wh(width, height));
         self.strip_storage.clear();
         self.viewport.reset(width, height);
     }

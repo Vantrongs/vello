@@ -432,7 +432,7 @@ pub trait FineKernel<S: Simd>: Send + Sync + 'static {
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        start_x: u16,
+        start_x: usize,
         start_y: u16,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
@@ -547,11 +547,19 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     ///
     /// Initializes all scratch buffers and sets up the initial blend buffer.
     #[doc(hidden)]
-    pub fn new(simd: S, buffer_width: u16) -> Self {
-        let scratch_len = usize::from(buffer_width) * TILE_HEIGHT_COMPONENTS;
+    pub fn new(simd: S, buffer_width: usize) -> Self {
+        assert!(
+            buffer_width.is_multiple_of(usize::from(Tile::WIDTH)),
+            "fine buffer width must be tile-aligned"
+        );
+        let buffer_span = TileAlignedSpan::from_tiles(
+            0,
+            u16::try_from(buffer_width / usize::from(Tile::WIDTH)).unwrap(),
+        );
+        let scratch_len = buffer_width * TILE_HEIGHT_COMPONENTS;
         Self {
             simd,
-            buffer_span: TileAlignedSpan::try_from(Span::new(0, buffer_width)).unwrap(),
+            buffer_span,
             blend_buffers: vec![vec![T::Numeric::ZERO; scratch_len]],
             buffer_pool: VecPool::new(false),
             paint_buf: Vec::new(),
@@ -570,8 +578,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     }
 
     fn scratch_range(span: TileAlignedSpan) -> core::ops::Range<usize> {
-        let start = usize::from(span.pixel_x()) * TILE_HEIGHT_COMPONENTS;
-        let len = usize::from(span.pixel_width()) * TILE_HEIGHT_COMPONENTS;
+        let start = span.pixel_x() * TILE_HEIGHT_COMPONENTS;
+        let len = span.pixel_width() * TILE_HEIGHT_COMPONENTS;
         start..start + len
     }
 
@@ -597,11 +605,10 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                     #[inline]
                     |span| {
                         if let Some(span) = span
-                            .as_span()
                             // The pixmap we load from does not necessarily have a width that is
                             // a multiple of the tile width! We therefore clamp and leave any
                             // tail in the blend buffer uninitialized.
-                            .intersect(region.span())
+                            .intersect_pixels(region.span())
                         {
                             let mut region = region.sub_span(
                                 // Spans are in scene coordinates, but `sub_span` takes an index into
@@ -721,8 +728,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                 let paint_fill = |fine: &mut Self, span: TileAlignedSpan| {
                     let alphas = cmd.alpha_idx().map(|alpha_idx| {
                         let alpha_offset = alpha_idx as usize
-                            + usize::from(span.pixel_x() - cmd.span.pixel_x())
-                                * Tile::HEIGHT as usize;
+                            + (span.pixel_x() - cmd.span.pixel_x()) * Tile::HEIGHT as usize;
                         &alpha_buffer[alpha_offset..]
                     });
 
@@ -753,8 +759,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                 let layer_fill = |fine: &mut Self, span: TileAlignedSpan| {
                     let alphas = cmd.alpha_idx().map(|alpha_idx| {
                         let alpha_offset = alpha_idx as usize
-                            + usize::from(span.pixel_x() - cmd.span.pixel_x())
-                                * Tile::HEIGHT as usize;
+                            + (span.pixel_x() - cmd.span.pixel_x()) * Tile::HEIGHT as usize;
                         &alpha_buffer[alpha_offset..]
                     });
 
@@ -800,13 +805,13 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         let target = self.blend_buffers.last_mut().unwrap();
         let target = &mut target[Self::scratch_range(span)];
         let y = u32::from(row_y) + u32x4::from_slice(self.simd, &[0, 1, 2, 3]);
-        let iter = (x..x.saturating_add(width)).map(|x| {
-            let x_in_range = x < mask.width();
+        let iter = (x..x + width).map(|x| {
+            let x_in_range = x < usize::from(mask.width());
 
             macro_rules! sample {
                 ($idx:expr) => {
                     if x_in_range && (y[$idx] as u16) < mask.height() {
-                        mask.sample(x, y[$idx] as u16)
+                        mask.sample(u16::try_from(x).unwrap(), y[$idx] as u16)
                     } else {
                         0
                     }
@@ -941,22 +946,21 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
     ) {
         let x = span.pixel_x();
         let y = self.row_y;
-        let sample_x = x.saturating_add(self.origin.0);
+        let sample_x = x + usize::from(self.origin.0);
         let sample_y = y.saturating_add(self.origin.1);
         let width = span.pixel_width();
-        let len = usize::from(width) * TILE_HEIGHT_COMPONENTS;
+        let len = width * TILE_HEIGHT_COMPONENTS;
         if self.paint_buf.len() < len {
             self.paint_buf.resize(len, T::Numeric::ZERO);
         }
 
-        let t_len = usize::from(width) * Tile::HEIGHT as usize;
+        let t_len = width * Tile::HEIGHT as usize;
         if self.f32_buf.len() < t_len {
             self.f32_buf.resize(t_len, 0.0);
         }
 
         let simd = self.simd;
-        let width = usize::from(width);
-        let start = usize::from(x) * TILE_HEIGHT_COMPONENTS;
+        let start = x * TILE_HEIGHT_COMPONENTS;
         let dest = &mut self.blend_buffers.last_mut().unwrap()[start..start + len];
         let color_buf = &mut self.paint_buf[..len];
         let encoded_paint = resources
@@ -966,7 +970,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                 &resources.filter_paints[paint_index - resources.encoded_paints.len()]
             });
 
-        let sampler_x = f64::from(sample_x) + PIXEL_CENTER_OFFSET;
+        let sampler_x = sample_x as f64 + PIXEL_CENTER_OFFSET;
         let sampler_y = f64::from(sample_y) + PIXEL_CENTER_OFFSET;
         let default_blend = attrs.blend_mode == BlendMode::default();
 

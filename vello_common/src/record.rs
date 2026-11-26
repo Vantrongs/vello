@@ -37,7 +37,7 @@ use crate::geometry::{RectU16, SizeU16};
 use crate::mask::Mask;
 use crate::peniko::BlendMode;
 use crate::strip::Strip;
-use crate::util::RectExt;
+use crate::tile::Tile;
 use alloc::vec::Vec;
 use core::ops::Range;
 use smallvec::SmallVec;
@@ -170,7 +170,7 @@ impl RecordedLayer {
 /// Recorder for a scene description.
 #[derive(Debug)]
 pub struct CommandRecorder<D> {
-    /// Tile-aligned dimensions of the root scene.
+    /// Dimensions of the root viewport.
     pub scene_size: SizeU16,
     /// The nodes of the root layer.
     pub nodes: Vec<Node>,
@@ -230,8 +230,13 @@ struct OpenLayer {
 impl<D> CommandRecorder<D> {
     /// Create a new command recorder.
     pub fn new(width: u16, height: u16) -> Self {
+        Self::with_scene_size(snapped_scene_size(width, height))
+    }
+
+    /// Create a recorder with an explicit root viewport.
+    pub fn with_scene_size(scene_size: SizeU16) -> Self {
         Self {
-            scene_size: snapped_scene_size(width, height),
+            scene_size,
             ..Self::default()
         }
     }
@@ -244,7 +249,12 @@ impl<D> CommandRecorder<D> {
     /// Reset the command recorder.
     #[inline]
     pub fn reset(&mut self, width: u16, height: u16) {
-        self.scene_size = snapped_scene_size(width, height);
+        self.reset_with_scene_size(snapped_scene_size(width, height));
+    }
+
+    /// Reset with an explicit root viewport.
+    pub fn reset_with_scene_size(&mut self, scene_size: SizeU16) {
+        self.scene_size = scene_size;
         self.nodes.clear();
         self.draws.clear();
 
@@ -428,9 +438,13 @@ impl<D> CommandRecorder<D> {
 }
 
 fn snapped_scene_size(width: u16, height: u16) -> SizeU16 {
-    RectU16::new(0, 0, width, height)
-        .snap_to_tile_coordinates()
-        .into()
+    if width == 0 || height == 0 {
+        return SizeU16::ZERO;
+    }
+    SizeU16::from_wh(
+        width.checked_next_multiple_of(Tile::WIDTH).unwrap(),
+        height.checked_next_multiple_of(Tile::HEIGHT).unwrap(),
+    )
 }
 
 impl<D: Drawable> CommandRecorder<D> {

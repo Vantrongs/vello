@@ -363,7 +363,8 @@ pub struct PathDataRef<'a> {
     pub strips: &'a [Strip],
     /// The alpha buffer.
     pub alphas: &'a [u8],
-    /// A tile-aligned coarse bounding box of the clip path in pixel coordinates.
+    /// A coarse physical bounding box of the clip path in pixel coordinates.
+    /// Its exclusive edge may cut the final tile at the coordinate-domain boundary.
     ///
     /// These bounds have already been intersected with the viewport.
     pub bbox: RectU16,
@@ -507,7 +508,7 @@ fn intersect_impl<S: Simd>(
                                 start_strip(&mut strip_state, &target.alphas, overlap.start, false);
                             }
 
-                            let num_blocks = overlap.width() / Tile::HEIGHT;
+                            let num_blocks = overlap.width() / u32::from(Tile::HEIGHT);
 
                             // Get the right alpha values for the specific position.
                             let s1_alphas = s_region_1.alphas
@@ -567,15 +568,15 @@ fn first_strip_at_or_after(strips: &[Strip], strip_y: u16) -> usize {
 /// An overlap between two regions.
 struct Overlap {
     /// The start x coordinate.
-    start: u16,
+    start: u32,
     /// The end x coordinate.
-    end: u16,
+    end: u32,
     /// Whether the left or right region iterator should be advanced next.
     advance: Advance,
 }
 
 impl Overlap {
-    fn width(&self) -> u16 {
+    fn width(&self) -> u32 {
         self.end - self.start
     }
 }
@@ -595,14 +596,14 @@ enum OverlapRelationship {
 
 #[derive(Debug, Clone, Copy)]
 struct FillRegion {
-    start: u16,
-    width: u16,
+    start: u32,
+    width: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct StripRegion<'a> {
-    start: u16,
-    width: u16,
+    start: u32,
+    width: u32,
     alphas: &'a [u8],
 }
 
@@ -614,7 +615,7 @@ enum Region<'a> {
 
 impl Region<'_> {
     #[inline(always)]
-    fn start(&self) -> u16 {
+    fn start(&self) -> u32 {
         match self {
             Region::Fill(fill) => fill.start,
             Region::Strip(strip) => strip.start,
@@ -622,7 +623,7 @@ impl Region<'_> {
     }
 
     #[inline(always)]
-    fn width(&self) -> u16 {
+    fn width(&self) -> u32 {
         match self {
             Region::Fill(fill) => fill.width,
             Region::Strip(strip) => strip.width,
@@ -630,7 +631,7 @@ impl Region<'_> {
     }
 
     #[inline(always)]
-    fn end(&self) -> u16 {
+    fn end(&self) -> u32 {
         self.start() + self.width()
     }
 
@@ -699,10 +700,10 @@ impl<'a> RowIterator<'a> {
     }
 
     #[inline(always)]
-    fn cur_strip_width(&self) -> u16 {
+    fn cur_strip_width(&self) -> u32 {
         let cur = self.cur_strip();
         let next = self.next_strip();
-        ((next.alpha_idx() - cur.alpha_idx()) / Tile::HEIGHT as u32) as u16
+        cur.width_to(next)
     }
 
     #[inline(always)]
@@ -719,10 +720,12 @@ impl<'a> RowIterator<'a> {
         // zero winding so we don't need to special case this.
         if next.fill_gap() {
             let cur = self.cur_strip();
-            let x = cur.x + self.cur_strip_width();
-            let width = next.x - x;
-
-            (width > 0).then_some(FillRegion { start: x, width })
+            let x = u32::from(cur.x) + self.cur_strip_width();
+            let end = u32::from(next.x);
+            (x < end).then(|| FillRegion {
+                start: x,
+                width: end - x,
+            })
         } else {
             None
         }
@@ -762,7 +765,7 @@ impl<'a> Iterator for RowIterator<'a> {
             }
 
             // Calculate the dimensions of the strip and yield it.
-            let x = self.cur_strip().x;
+            let x = u32::from(self.cur_strip().x);
             let width = self.cur_strip_width();
 
             // Zero-width strips only act as markers for cheaply delimiting the width
@@ -808,9 +811,9 @@ fn flush_strip(strip_state: &mut Option<StripState>, strips: &mut Vec<Strip>, cu
 }
 
 #[inline(always)]
-fn start_strip(strip_data: &mut Option<StripState>, alphas: &[u8], x: u16, fill_gap: bool) {
+fn start_strip(strip_data: &mut Option<StripState>, alphas: &[u8], x: u32, fill_gap: bool) {
     *strip_data = Some(StripState {
-        x,
+        x: u16::try_from(x).expect("strip starts must remain in the physical coordinate domain"),
         alpha_idx: alphas.len() as u32,
         fill_gap,
     });
@@ -819,14 +822,14 @@ fn start_strip(strip_data: &mut Option<StripState>, alphas: &[u8], x: u16, fill_
 fn should_create_new_strip(
     strip_state: &Option<StripState>,
     alphas: &[u8],
-    overlap_start: u16,
+    overlap_start: u32,
 ) -> bool {
     // Returns false in case we can append to the currently built strip.
     strip_state.as_ref().is_none_or(|state| {
-        let width = ((alphas.len() as u32 - state.alpha_idx) / Tile::HEIGHT as u32) as u16;
-        let strip_end = state.x + width;
+        let width = (alphas.len() as u32 - state.alpha_idx) / u32::from(Tile::HEIGHT);
+        let strip_end = u32::from(state.x) + width;
 
-        strip_end < overlap_start - 1
+        strip_end + 1 < overlap_start
     })
 }
 
@@ -844,6 +847,21 @@ mod tests {
     use crate::tile::Tile;
     use fearless_simd::Level;
     use std::vec;
+
+    #[test]
+    fn intersect_preserves_alpha_strip_with_exclusive_end_65536() {
+        let mut input = StripStorage::default();
+        input.strips = vec![Strip::new(0, 0, 0, false), Strip::sentinel(0, 65536 * 4)];
+        input.alphas = vec![255; 65536 * 4];
+        let mut target = StripStorage::default();
+        intersect(
+            Level::new(),
+            path_ref(&input),
+            path_ref(&input),
+            &mut target,
+        );
+        assert_eq!(target, input);
+    }
 
     #[test]
     fn rectangular_clip_metadata_tracks_intersections_and_pops() {
@@ -1164,8 +1182,8 @@ mod tests {
     fn assert_strip_region(region: Option<Region<'_>>, start: u16, width: u16) {
         match region {
             Some(Region::Strip(strip)) => {
-                assert_eq!(strip.start, start);
-                assert_eq!(strip.width, width);
+                assert_eq!(strip.start, u32::from(start));
+                assert_eq!(strip.width, u32::from(width));
                 assert_eq!(strip.alphas.len(), (width * Tile::HEIGHT) as usize);
             }
             other => panic!("expected strip region, got {other:?}"),
@@ -1175,8 +1193,8 @@ mod tests {
     fn assert_fill_region(region: Option<Region<'_>>, start: u16, width: u16) {
         match region {
             Some(Region::Fill(fill)) => {
-                assert_eq!(fill.start, start);
-                assert_eq!(fill.width, width);
+                assert_eq!(fill.start, u32::from(start));
+                assert_eq!(fill.width, u32::from(width));
             }
             other => panic!("expected fill region, got {other:?}"),
         }

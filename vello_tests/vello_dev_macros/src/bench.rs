@@ -37,12 +37,12 @@ pub(crate) fn vello_bench_inner(_: TokenStream, item: TokenStream) -> TokenStrea
             }
 
             fn run_integer<S: Simd>(b: &mut Bencher, simd: S) {
-                let mut fine = Fine::<S, U8Kernel>::new(simd, crate::fine::BENCH_WIDTH);
+                let mut fine = Fine::<S, U8Kernel>::new(simd, usize::from(crate::fine::BENCH_WIDTH));
                 #inner_fn_name(b, &mut fine);
             }
 
             fn run_float<S: Simd>(b: &mut Bencher, simd: S) {
-                let mut fine = Fine::<S, F32Kernel>::new(simd, crate::fine::BENCH_WIDTH);
+                let mut fine = Fine::<S, F32Kernel>::new(simd, usize::from(crate::fine::BENCH_WIDTH));
                 #inner_fn_name(b, &mut fine);
             }
 
