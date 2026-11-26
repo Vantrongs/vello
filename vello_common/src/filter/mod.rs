@@ -219,6 +219,8 @@ impl Default for FilterLayerPlacement {
 pub struct FilterData {
     /// Device-pixel offset already applied while rasterizing the source in output coordinates.
     pub rasterized_offset: Option<(i32, i32)>,
+    /// Total translation from scene pixels to this CPU filter viewport, including ancestors.
+    pub raster_translation_from_scene: (i32, i32),
     /// The underlying filter.
     pub filter: Filter,
     /// The transform that was in place when the filter layer was invoked.
@@ -264,6 +266,7 @@ impl FilterData {
 
         Self {
             rasterized_offset: None,
+            raster_translation_from_scene: (0, 0),
             filter,
             transform,
             filter_padding,

@@ -564,7 +564,7 @@ impl RenderContext {
         let layer_transform = self
             .root_transforms
             .effective_path_transform(self.transforms());
-        let filter_data = filter.map(|filter| FilterData::for_cpu(filter, layer_transform));
+        let mut filter_data = filter.map(|filter| FilterData::for_cpu(filter, layer_transform));
 
         // Padding brings offscreen filter inputs into the source viewport.
         // A standalone offset instead rasterizes into its final pixel positions.
@@ -573,6 +573,10 @@ impl RenderContext {
             Affine::translate((f64::from(shift_x), f64::from(shift_y)))
         });
         self.root_transforms.push_root(relative_transform);
+        if let Some(data) = &mut filter_data {
+            let shift = self.root_transforms.root_transform().translation();
+            data.raster_translation_from_scene = (shift.x as i32, shift.y as i32);
+        }
 
         self.dispatcher.push_layer(
             clip_path,

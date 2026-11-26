@@ -555,6 +555,7 @@ mod tests {
     fn filter_data(filter_padding: PaddingU16, source_padding: PaddingU16) -> FilterData {
         FilterData {
             rasterized_offset: None,
+            raster_translation_from_scene: (0, 0),
             filter: Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 }),
             transform: Affine::IDENTITY,
             filter_padding,

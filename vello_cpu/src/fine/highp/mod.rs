@@ -189,8 +189,8 @@ impl<S: Simd> FineKernel<S> for F32Kernel {
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        mut start_x: usize,
-        start_y: u16,
+        mut start_x: i64,
+        start_y: i64,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
         alphas: Option<&[u8]>,

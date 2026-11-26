@@ -406,3 +406,43 @@ fn shifted_offset_at_terminal_tile() {
         }
     }
 }
+
+#[test]
+fn shifted_offset_samples_source_masks() {
+    use vello_common::filter_effects::{Filter, FilterPrimitive};
+    for transpose in [false, true] {
+        let (w, h, dx, dy) = if transpose {
+            (4, u16::MAX, 0., -2.)
+        } else {
+            (u16::MAX, 4, -2., 0.)
+        };
+        for layer_mask in [false, true] {
+            let mut ctx = context(w, h, 0, Level::baseline());
+            let mut data = vec![0; usize::from(w) * usize::from(h)];
+            data[if transpose { 65534 * 4 } else { 65534 }] = 255;
+            let mask = Mask::from_parts(data, w, h);
+            ctx.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset { dx, dy }));
+            if layer_mask {
+                ctx.push_mask_layer(mask);
+            } else {
+                ctx.set_mask(mask);
+            }
+            ctx.set_paint(RED);
+            ctx.fill_rect(&rect(65531, 65535, 4, transpose));
+            if layer_mask {
+                ctx.pop_layer();
+            }
+            ctx.pop_layer();
+            ctx.flush();
+            let mut image = Pixmap::new(w, h);
+            ctx.render(&mut image, &mut Resources::new());
+            check_pixels(&image, "shifted source mask", |x, y| {
+                if (if transpose { (y, x) } else { (x, y) }) == (65532, 0) {
+                    RED_PIXEL
+                } else {
+                    CLEAR
+                }
+            });
+        }
+    }
+}

@@ -126,6 +126,7 @@ impl SingleThreadedDispatcher {
             &filters,
             target,
             params,
+            (0, 0),
             target_init,
             self.recorder.root_is_blend_target,
             encoded_paints,
@@ -141,6 +142,7 @@ impl SingleThreadedDispatcher {
         filter_ctx: &FilterContext,
         mut target: PixmapMut<'_>,
         params: FineRenderParams,
+        mask_origin: (i64, i64),
         target_init: TargetInit<PremulColor>,
         root_is_blend_target: bool,
         encoded_paints: &[EncodedPaint],
@@ -175,6 +177,7 @@ impl SingleThreadedDispatcher {
             &bucketer,
             resources,
             &mut regions,
+            mask_origin,
             target_init,
             root_is_blend_target,
         );
@@ -185,11 +188,13 @@ impl SingleThreadedDispatcher {
         bucketer: &CommandBucketer,
         resources: FineResources<'_>,
         regions: &mut Regions<'_>,
+        mask_origin: (i64, i64),
         target_init: TargetInit<PremulColor>,
         root_is_blend_target: bool,
     ) {
         // TODO: Reuse fine and depth buffer across targets?
         let mut fine = Fine::<S, F>::new(simd, bucketer.width());
+        fine.mask_origin = mask_origin;
         let mut depth = DepthBuffer::new(bucketer.width());
         regions.update(|region| {
             rasterize_region::<S, F>(
@@ -261,6 +266,12 @@ impl SingleThreadedDispatcher {
                 &filter_ctx,
                 (&mut pixmap).into(),
                 params,
+                (
+                    i64::from(pixmap_bbox.x0)
+                        - i64::from(filter_plan.raster_translation_from_scene.0),
+                    i64::from(pixmap_bbox.y0)
+                        - i64::from(filter_plan.raster_translation_from_scene.1),
+                ),
                 TargetInit::Clear(PremulColor::from_alpha_color(AlphaColor::TRANSPARENT)),
                 false,
                 encoded_paints,

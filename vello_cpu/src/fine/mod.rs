@@ -56,17 +56,17 @@ pub use crate::span::TileAlignedSpan;
 pub use highp::F32Kernel;
 pub use lowp::U8Kernel;
 
-/// Four rows at a tile-aligned y coordinate. Clipping and blending use
+/// Four consecutive source rows of a raster tile column. Clipping and blending use
 /// different mask values outside its physical extent.
 #[inline]
-fn mask_column(mask: &Mask, x: usize, y: u16, outside: u8) -> [u8; 4] {
-    if x >= usize::from(mask.width()) {
+fn mask_column(mask: &Mask, x: i64, y: i64, outside: u8) -> [u8; 4] {
+    if !(0..i64::from(mask.width())).contains(&x) {
         return [outside; 4];
     }
     let x = x as u16;
     [y, y + 1, y + 2, y + 3].map(|row| {
-        if row < mask.height() {
-            mask.sample(x, row)
+        if (0..i64::from(mask.height())).contains(&row) {
+            mask.sample(x, row as u16)
         } else {
             outside
         }
@@ -449,8 +449,8 @@ pub trait FineKernel<S: Simd>: Send + Sync + 'static {
     fn blend(
         simd: S,
         dest: &mut [Self::Numeric],
-        start_x: usize,
-        start_y: u16,
+        start_x: i64,
+        start_y: i64,
         src: impl Iterator<Item = Self::Composite>,
         blend_mode: BlendMode,
         alphas: Option<&[u8]>,
@@ -557,6 +557,8 @@ pub struct Fine<S: Simd, T: FineKernel<S>> {
     row_y: u16,
     /// The origin of the current target we are rendering into.
     origin: (u16, u16),
+    /// Scene mask coordinates corresponding to pixel (0, 0) of this target.
+    pub(crate) mask_origin: (i64, i64),
 }
 
 impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
@@ -583,6 +585,7 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             f32_buf: Vec::new(),
             row_y: 0,
             origin: (0, 0),
+            mask_origin: (0, 0),
         }
     }
 
@@ -823,8 +826,10 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         let width = span.pixel_width();
         let target = self.blend_buffers.last_mut().unwrap();
         let target = &mut target[Self::scratch_range(span)];
-        let iter = (x..x + width).map(|x| {
-            let [s1, s2, s3, s4] = mask_column(mask, x, row_y, 0);
+        let x = x as i64 + self.mask_origin.0;
+        let y = i64::from(row_y) + self.mask_origin.1;
+        let iter = (x..x + width as i64).map(|x| {
+            let [s1, s2, s3, s4] = mask_column(mask, x, y, 0);
             let samples = u8x16::from_slice(
                 self.simd,
                 &[
@@ -866,8 +871,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
             T::blend(
                 self.simd,
                 target,
-                x,
-                row_y,
+                x as i64,
+                i64::from(row_y),
                 source
                     .chunks_exact(T::Composite::LENGTH)
                     .map(|s| T::Composite::from_slice(self.simd, s)),
@@ -928,8 +933,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         T::blend(
             simd,
             &mut scratch[Self::scratch_range(span)],
-            x,
-            self.row_y,
+            x as i64 + self.mask_origin.0,
+            i64::from(self.row_y) + self.mask_origin.1,
             iter::repeat(color),
             attrs.blend_mode,
             alphas,
@@ -999,8 +1004,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                         T::blend(
                             simd,
                             dest,
-                            x,
-                            y,
+                            x as i64 + self.mask_origin.0,
+                            i64::from(y) + self.mask_origin.1,
                             color_buf
                                 .chunks_exact(T::Composite::LENGTH)
                                 .map(|s| T::Composite::from_slice(simd, s)),
