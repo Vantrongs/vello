@@ -184,7 +184,7 @@ impl Worker {
                             transform,
                             aliasing_threshold,
                             &mut self.strip_storage,
-                            path_clip.map(|clip| clip.path),
+                            None,
                         );
 
                         let end = self.strip_storage.strips.len() as u32;

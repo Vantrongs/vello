@@ -98,3 +98,55 @@ fn a_layer_leaves_the_pixels_it_does_not_draw_in_unchanged() {
         }
     }
 }
+
+#[test]
+fn isolated_layer_clip_is_independent_of_fractional_draw_clip() {
+    use vello_cpu::kurbo::Shape;
+    use vello_cpu::{
+        Level, RenderSettings,
+        color::palette::css::{BLUE, GREEN, RED},
+    };
+    let full = Rect::new(0., 0., 8., 8.);
+    let full_path = full.to_path(0.1);
+    for num_threads in [
+        0,
+        #[cfg(feature = "multithreading")]
+        2,
+    ] {
+        for count in 0..=2 {
+            let draw = |explicit: bool| {
+                let mut ctx = RenderContext::new_with(
+                    8,
+                    8,
+                    RenderSettings {
+                        level: Level::baseline(),
+                        num_threads,
+                    },
+                );
+                ctx.set_paint(BLUE);
+                ctx.fill_rect(&full);
+                ctx.push_clip_path(&Rect::new(2.5, 0., 6., 8.).to_path(0.1));
+                let blend = (count == 0).then(|| BlendMode::new(Mix::Normal, Compose::Clear));
+                ctx.push_layer(explicit.then_some(&full_path), blend, None, None, None);
+                ctx.set_paint(RED);
+                for _ in 0..count {
+                    ctx.fill_rect(&full);
+                }
+                ctx.pop_layer();
+                ctx.fill_rect(&Rect::new(0., 5., 8., 6.));
+                ctx.pop_clip();
+                ctx.set_paint(GREEN);
+                ctx.fill_rect(&Rect::new(0., 6., 8., 8.));
+                ctx.flush();
+                let mut image = Pixmap::new(8, 8);
+                ctx.render(&mut image, &mut Resources::new());
+                image
+            };
+            assert_eq!(
+                draw(true).data(),
+                draw(false).data(),
+                "threads {num_threads}, draws {count}"
+            );
+        }
+    }
+}

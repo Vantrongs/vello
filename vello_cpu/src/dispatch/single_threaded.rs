@@ -369,33 +369,32 @@ impl Dispatcher for SingleThreadedDispatcher {
         mask: Option<Mask>,
         filter_data: Option<FilterData>,
     ) {
-        if let Some(filter_data) = &filter_data {
-            self.viewport.push_root_viewport(filter_data);
-        }
-
         let clip_path = clip_path.map(|clip_path| {
             let strip_start = self.strip_storage.strips.len();
             let strip_storage = &mut self.strip_storage;
-            self.viewport
-                .with_generator_and_clip(|strip_generator, existing_clip| {
-                    strip_generator.generate_filled_path(
-                        clip_path,
-                        fill_rule,
-                        clip_transform,
-                        aliasing_threshold,
-                        strip_storage,
-                        existing_clip.map(|clip| clip.path),
-                    );
+            self.viewport.with_generator_and_clip(|strip_generator, _| {
+                strip_generator.generate_filled_path(
+                    clip_path,
+                    fill_rule,
+                    clip_transform,
+                    aliasing_threshold,
+                    strip_storage,
+                    None,
+                );
 
-                    let strip_range = strip_start..strip_storage.strips.len();
-                    LayerClip {
-                        bbox: strip_bbox(&strip_storage.strips[strip_range.clone()])
-                            .unwrap_or(RectU16::ZERO),
-                        strip_range,
-                        thread_idx: 0,
-                    }
-                })
+                let strip_range = strip_start..strip_storage.strips.len();
+                LayerClip {
+                    bbox: strip_bbox(&strip_storage.strips[strip_range.clone()])
+                        .unwrap_or(RectU16::ZERO),
+                    strip_range,
+                    thread_idx: 0,
+                }
+            })
         });
+
+        if let Some(filter_data) = &filter_data {
+            self.viewport.push_root_viewport(filter_data);
+        }
 
         self.recorder.push_layer(
             LayerProps {
