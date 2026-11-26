@@ -99,6 +99,11 @@ impl Mask {
         self.0.height
     }
 
+    /// Return the mutable mask samples in row-major order, copying shared data on write.
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut Arc::make_mut(&mut self.0).data
+    }
+
     /// Sample the value at a specific location.
     ///
     /// This function might panic or yield a wrong result if the location
@@ -112,5 +117,23 @@ impl Mask {
         );
 
         repr.data[y as usize * repr.width as usize + x as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutate_unique_and_shared_samples() {
+        let samples = alloc::vec![3, 7];
+        let ptr = samples.as_ptr();
+        let mut mask = Mask::from_parts(samples, 2, 1);
+        assert_eq!(mask.data_mut().as_ptr(), ptr);
+        mask.data_mut()[0] = 5;
+        let shared = mask.clone();
+        mask.data_mut()[0] = 9;
+        assert_eq!(shared.sample(0, 0), 5);
+        assert_eq!(mask.sample(0, 0), 9);
     }
 }
