@@ -7,7 +7,7 @@ use crate::pixmap::Pixmap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MaskRepr {
     data: Vec<u8>,
     width: u16,
@@ -85,6 +85,11 @@ impl Mask {
             width: pixmap.width(),
             height: pixmap.height(),
         }))
+    }
+
+    /// The row-major coverage values. Detaches the buffer if another mask shares it.
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut Arc::make_mut(&mut self.0).data
     }
 
     /// Return the width of the mask.

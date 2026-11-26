@@ -506,6 +506,10 @@ impl Dispatcher for SingleThreadedDispatcher {
         }
     }
 
+    fn clip_bounds(&self) -> RectU16 {
+        self.viewport.clip_bounds()
+    }
+
     fn push_clip_path(
         &mut self,
         path: &BezPath,

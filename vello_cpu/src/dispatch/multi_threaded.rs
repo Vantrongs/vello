@@ -270,6 +270,7 @@ impl MultiThreadedDispatcher {
             strips: c.path.strips.into(),
             alphas: c.path.alphas.into(),
             bbox: c.path.bbox,
+            opaque_bbox: c.path.opaque_bbox,
             shape: c.shape,
         });
         let task = RenderTask {
@@ -686,6 +687,11 @@ impl Dispatcher for MultiThreadedDispatcher {
         }
     }
 
+    fn clip_bounds(&self) -> RectU16 {
+        self.strip_generator
+            .clip_bounds(self.clip_context.get().map(|clip| clip.path))
+    }
+
     fn push_clip_path(
         &mut self,
         path: &BezPath,
@@ -739,6 +745,7 @@ pub(crate) struct OwnedClip {
     ///
     /// These bounds have already been intersected with the viewport.
     bbox: RectU16,
+    opaque_bbox: Option<RectU16>,
     /// The known geometric shape of this clip.
     shape: ClipShape,
 }

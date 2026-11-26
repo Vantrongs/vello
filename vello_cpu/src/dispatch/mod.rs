@@ -11,6 +11,7 @@ use crate::peniko::{BlendMode, Fill};
 use core::fmt::Debug;
 use vello_common::encode::EncodedPaint;
 use vello_common::filter::FilterData;
+use vello_common::geometry::RectU16;
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageResolver, Paint};
 use vello_common::pixmap::PixmapMut;
@@ -45,6 +46,7 @@ pub(crate) trait Dispatcher: Debug + Send {
         blend_mode: BlendMode,
         mask: Option<Mask>,
     );
+    fn clip_bounds(&self) -> RectU16;
     fn push_clip_path(
         &mut self,
         path: &BezPath,

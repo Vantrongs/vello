@@ -25,6 +25,7 @@ use vello_common::encode::{EncodeExt, EncodedPaint, invert_paint_transform};
 use vello_common::fearless_simd::Level;
 use vello_common::filter::FilterData;
 use vello_common::filter_effects::Filter;
+use vello_common::geometry::RectU16;
 use vello_common::kurbo::{Affine, BezPath, Rect, Stroke};
 use vello_common::mask::Mask;
 use vello_common::paint::{ImageId, ImageResolver, Paint, PaintType, Tint};
@@ -795,6 +796,12 @@ impl RenderContext {
         }
     }
 
+    /// Pixel bounds used to cull paths in the active viewport. An active clip
+    /// covers whole strip tiles here, including partial tiles at viewport edges.
+    pub fn clip_bounds(&self) -> RectU16 {
+        self.dispatcher.clip_bounds()
+    }
+
     /// Push a new clip path to the clip stack.
     ///
     /// See the explanation in the [clipping](https://github.com/linebender/vello/tree/main/vello_cpu/examples)
@@ -1163,6 +1170,50 @@ mod tests {
                 assert_eq!(pixmap.sample(x, y), expected, "pixel at ({x}, {y})");
             }
         }
+    }
+
+    #[test]
+    fn accumulated_clip_bounds_single_threaded() {
+        check_accumulated_clip_bounds(0);
+    }
+
+    #[cfg(feature = "multithreading")]
+    #[test]
+    fn accumulated_clip_bounds_multi_threaded() {
+        check_accumulated_clip_bounds(2);
+    }
+
+    fn check_accumulated_clip_bounds(num_threads: u16) {
+        use vello_common::geometry::RectU16;
+        let mut ctx = RenderContext::new_with(
+            4096,
+            1024,
+            crate::RenderSettings {
+                num_threads,
+                ..Default::default()
+            },
+        );
+        let canvas = RectU16::new(0, 0, 4096, 1024);
+        let shared = Rect::new(0., 0., 16., 256.);
+        let compound = |x| {
+            let mut path = shared.to_path(0.1);
+            path.extend(Rect::new(x, 1000., x + 16., 1016.).path_elements(0.1));
+            path
+        };
+        assert_eq!(ctx.clip_bounds(), canvas);
+        ctx.push_clip_path(&compound(4080.));
+        let single = RectU16::new(0, 0, 4096, 1016);
+        assert_eq!(ctx.clip_bounds(), single);
+        ctx.push_clip_path(&compound(4000.));
+        assert_eq!(ctx.clip_bounds(), RectU16::new(0, 0, 16 + Tile::WIDTH, 256));
+        ctx.push_clip_rect(&Rect::new(64., 64., 80., 80.));
+        assert_eq!(ctx.clip_bounds(), RectU16::ZERO);
+        ctx.pop_clip();
+        assert_eq!(ctx.clip_bounds(), RectU16::new(0, 0, 16 + Tile::WIDTH, 256));
+        ctx.pop_clip();
+        assert_eq!(ctx.clip_bounds(), single);
+        ctx.reset();
+        assert_eq!(ctx.clip_bounds(), canvas);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use crate::clip::{ClipRef, ClipState};
 use crate::filter::FilterData;
-use crate::geometry::SizeU16;
+use crate::geometry::{RectU16, SizeU16};
 use crate::kurbo::{Affine, BezPath, Rect};
 use crate::strip_generator::StripGenerator;
 use alloc::vec::Vec;
@@ -46,6 +46,12 @@ impl ViewportState {
     /// Return the current clip path and its known shape.
     pub fn clip(&self) -> Option<ClipRef<'_>> {
         self.clip_state.get()
+    }
+
+    /// Pixel bounds used for path culling in the active viewport.
+    pub fn clip_bounds(&self) -> RectU16 {
+        self.strip_generator
+            .clip_bounds(self.clip().map(|clip| clip.path))
     }
 
     /// Whether any root viewports are currently pushed.
