@@ -62,7 +62,11 @@ extern crate std;
 
 pub mod blurred_rounded_rect;
 pub mod clip;
+pub(crate) mod cull;
+pub(crate) mod dash;
+pub use dash::DENSE_ENTRIES_PER_PX;
 pub mod encode;
+pub(crate) mod fill_clip;
 pub mod filter;
 pub mod filter_effects;
 pub mod flatten;
@@ -73,6 +77,7 @@ pub mod mask;
 pub mod math;
 pub mod multi_atlas;
 pub mod paint;
+pub mod path_budget;
 #[doc(hidden)]
 #[cfg(feature = "pico_svg")]
 pub mod pico_svg;

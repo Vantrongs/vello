@@ -1,0 +1,536 @@
+// Copyright 2026 the Vello Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! Subpixel stroke outlines.
+
+use super::{FlattenCtx, Line, TOL, emit_edge};
+use crate::cull::{Cull, SplitHuge};
+use crate::geometry::RectU16;
+#[cfg(not(feature = "std"))]
+use crate::kurbo::common::FloatFuncs as _;
+use crate::kurbo::{self, Affine, PathEl, Stroke};
+use crate::path_budget::Meter;
+use alloc::vec::Vec;
+use log::warn;
+
+/// Outlines a thin stroke with straight lines, built in user space and transformed, so
+/// the geometry stays exact under any affine transform; it replaces stroke expansion,
+/// whose curved round caps and joins dominate the cost of hairlines.
+///
+/// Each subpath becomes one polygon: the left offsets forward, the right offsets back
+/// (a closed subpath gives two loops), with the same orientation whatever the
+/// direction, as kurbo's outline has. At a join the inner side goes through the
+/// intersection of the two offset lines, so the overlap is not counted twice, unless
+/// that point lies beyond one of the segments (then it goes through the join point, as
+/// kurbo does); the outer side takes the miter tip within the miter limit, else the
+/// bevel, and round joins add the arc's midpoint. Joins that turn by at most 90° and
+/// whose wedge is under `MIN_JOIN_AREA` take the miter tip whatever the style, so the
+/// outline reaches at most √2 half widths from the path there.
+///
+/// Open ends are extended by the cap: half the width for square caps, a quarter of it
+/// for round caps. A quarter matches the area the expanded round cap keeps once
+/// flattened at sub-pixel radius (two chords, `r²`), so both paths agree at the
+/// threshold; the exact half disc (`π/8`) made stipple patterns of short round-capped
+/// strokes visibly darker than other renderers. Degenerate subpaths draw nothing, as in
+/// kurbo's stroker. A subpath outside `cull_bbox` is closed, so it contributes no
+/// winding inside it and is dropped.
+pub(super) fn hairline(
+    path: impl IntoIterator<Item = PathEl>,
+    style: &Stroke,
+    affine: Affine,
+    scale: f64,
+    line_buf: &mut Vec<Line>,
+    flatten_ctx: &mut FlattenCtx,
+    cull_bbox: RectU16,
+    cull: Cull<'_>,
+    meter: Meter<'_>,
+) {
+    line_buf.clear();
+    let [left, right] = &mut flatten_ctx.hairline_sides;
+    left.clear();
+    right.clear();
+    let mut sink = HairlineSink {
+        meter,
+        line_buf,
+        left,
+        right,
+        affine,
+        half_width: 0.5 * style.width,
+        device_half_width2: (0.5 * style.width * scale).powi(2),
+        join: style.join,
+        miter_limit: style.miter_limit,
+        start_ext: cap_extension(style.start_cap, style.width),
+        end_ext: cap_extension(style.end_cap, style.width),
+        cull: (
+            f64::from(cull_bbox.x0),
+            f64::from(cull_bbox.y0),
+            f64::from(cull_bbox.x1),
+            f64::from(cull_bbox.y1),
+        ),
+        start: kurbo::Point::ZERO,
+        last: kurbo::Point::ZERO,
+        first: None,
+        prev: None,
+        is_nan: false,
+    };
+    let tolerance = TOL / scale;
+    if style.dash_pattern.is_empty() {
+        crate::cull::flatten(path, tolerance, cull, |el| sink.push(el));
+    } else {
+        let path = SplitHuge::new(path, cull, true);
+        let mut dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine);
+        dashed.meter = meter;
+        crate::cull::flatten(dashed, tolerance, cull, |el| sink.push(el));
+    }
+    sink.end_subpath(false);
+    if sink.is_nan {
+        warn!("A path contains NaN, ignoring it.");
+        sink.line_buf.clear();
+    }
+}
+
+/// Joins whose wedge is smaller than this many square device pixels (and that turn by
+/// at most 90°) take the miter tip whatever the join style (see `hairline`).
+const MIN_JOIN_AREA: f64 = 1.0 / 128.0;
+
+fn cap_extension(cap: kurbo::Cap, width: f64) -> f64 {
+    match cap {
+        kurbo::Cap::Butt => 0.0,
+        kurbo::Cap::Square => 0.5 * width,
+        kurbo::Cap::Round => 0.25 * width,
+    }
+}
+
+/// A segment's unit direction and length.
+#[derive(Clone, Copy)]
+struct Dir {
+    u: kurbo::Vec2,
+    len: f64,
+}
+
+struct HairlineSink<'a> {
+    meter: Meter<'a>,
+    line_buf: &'a mut Vec<Line>,
+    /// The outline's points left and right of the subpath, in user space.
+    left: &'a mut Vec<kurbo::Point>,
+    right: &'a mut Vec<kurbo::Point>,
+    affine: Affine,
+    half_width: f64,
+    /// The squared half width in device pixels.
+    device_half_width2: f64,
+    join: kurbo::Join,
+    miter_limit: f64,
+    start_ext: f64,
+    end_ext: f64,
+    /// Left, top, right, bottom in device pixels.
+    cull: (f64, f64, f64, f64),
+    start: kurbo::Point,
+    last: kurbo::Point,
+    /// The subpath's first and latest segment.
+    first: Option<Dir>,
+    prev: Option<Dir>,
+    is_nan: bool,
+}
+
+impl HairlineSink<'_> {
+    fn push(&mut self, el: PathEl) {
+        match el {
+            PathEl::MoveTo(p) => {
+                self.end_subpath(false);
+                self.start = p;
+                self.last = p;
+            }
+            PathEl::LineTo(p) => self.segment(p),
+            PathEl::ClosePath => {
+                if self.last != self.start {
+                    self.segment(self.start);
+                }
+                self.end_subpath(true);
+                self.last = self.start;
+            }
+            // `kurbo::flatten` emits only lines.
+            PathEl::QuadTo(..) | PathEl::CurveTo(..) => unreachable!(),
+        }
+    }
+
+    fn normal(&self, d: Dir) -> kurbo::Vec2 {
+        kurbo::Vec2::new(-d.u.y, d.u.x) * self.half_width
+    }
+
+    fn segment(&mut self, p: kurbo::Point) {
+        if p == self.last || !self.meter.room(self.left, 3) || !self.meter.room(self.right, 3) {
+            return;
+        }
+        let v = p - self.last;
+        let len = v.hypot();
+        let d = Dir { u: v / len, len };
+        match self.prev {
+            None => {
+                let n = self.normal(d);
+                self.left.push(self.last + n);
+                self.right.push(self.last - n);
+                self.first = Some(d);
+            }
+            Some(prev) => self.join(self.last, prev, d),
+        }
+        self.prev = Some(d);
+        self.last = p;
+    }
+
+    /// Adds the outline points of the join at `p` from `d0` into `d1` to both sides.
+    fn join(&mut self, p: kurbo::Point, d0: Dir, d1: Dir) {
+        let (n0, n1) = (self.normal(d0), self.normal(d1));
+        let cos = d0.u.dot(d1.u);
+        let turn = d0.u.cross(d1.u);
+        // Where a join nearly reverses, `1 + cos` is lost to rounding and disagrees with
+        // `turn`; the sum and difference of the directions keep both consistent.
+        let (one_plus_cos, tan_half) = if cos >= 0.0 {
+            (1.0 + cos, turn.abs() / (1.0 + cos))
+        } else {
+            let (sum, difference) = (d0.u + d1.u, d1.u - d0.u);
+            (0.5 * sum.hypot2(), difference.hypot() / sum.hypot())
+        };
+        // Where the two offset lines on either side meet, relative to `p`, on the left.
+        let miter = (n0 + n1) / one_plus_cos;
+        // Turning left (positive cross product, y up) puts the left side inside.
+        let (inner, outer) = if turn > 0.0 {
+            (&mut *self.left, &mut *self.right)
+        } else {
+            (&mut *self.right, &mut *self.left)
+        };
+        let side = if turn > 0.0 { 1.0 } else { -1.0 };
+        let (n0, n1, miter) = (n0 * side, n1 * side, miter * side);
+        // The inner side, which `miter`, `n0` and `n1` point to.
+        let reach = self.half_width * tan_half;
+        if reach.is_finite() && reach <= d0.len.min(d1.len) {
+            inner.push(p + miter);
+        } else {
+            inner.extend([p + n0, p, p + n1]);
+        }
+        // The outer side.
+        let negligible = tan_half.is_nan()
+            || (tan_half <= 1.0 && self.device_half_width2 * tan_half < MIN_JOIN_AREA);
+        let within_limit = (0.5 * one_plus_cos).sqrt() * self.miter_limit >= 1.0;
+        match self.join {
+            _ if negligible && reach.is_finite() => outer.push(p - miter),
+            kurbo::Join::Miter if within_limit => outer.push(p - miter),
+            kurbo::Join::Round => {
+                let mid = n0 + n1;
+                let mid_len = mid.hypot();
+                // A full reversal bulges forward along the incoming segment.
+                let tip = if mid_len > 0.0 {
+                    p - mid * (self.half_width / mid_len)
+                } else {
+                    p + d0.u * self.half_width
+                };
+                outer.extend([p - n0, tip, p - n1]);
+            }
+            _ => outer.extend([p - n0, p - n1]),
+        }
+    }
+
+    fn end_subpath(&mut self, closed: bool) {
+        let (Some(first), Some(last)) = (self.first.take(), self.prev.take()) else {
+            return;
+        };
+        if !self.meter.room(self.left, 3) || !self.meter.room(self.right, 3) {
+            return;
+        }
+        if closed {
+            // The join at the start replaces the first point of each side; the loops
+            // are cyclic, so its points can follow the last join's.
+            self.join(self.start, last, first);
+            self.emit_loop(false);
+            self.emit_loop(true);
+        } else {
+            let n = self.normal(last);
+            let e0 = first.u * self.start_ext;
+            let e1 = last.u * self.end_ext;
+            self.left.push(self.last + n + e1);
+            self.right.push(self.last - n + e1);
+            self.left[0] -= e0;
+            self.right[0] -= e0;
+            self.emit_open();
+        }
+        self.left.clear();
+        self.right.clear();
+    }
+
+    /// Emits the left side forward and the right side back as one polygon.
+    fn emit_open(&mut self) {
+        if !self.meter.room(self.left, self.right.len()) {
+            return;
+        }
+        let mut pts = core::mem::take(self.left);
+        pts.extend(self.right.iter().rev());
+        self.emit(&pts);
+        *self.left = pts;
+    }
+
+    /// Emits one side of a closed subpath, without its first point, as a loop: the
+    /// left side forward, the right side backward.
+    fn emit_loop(&mut self, right: bool) {
+        let side = if right {
+            &mut *self.right
+        } else {
+            &mut *self.left
+        };
+        let mut pts = core::mem::take(side);
+        if right {
+            pts[1..].reverse();
+        }
+        self.emit(&pts[1..]);
+        if right {
+            *self.right = pts;
+        } else {
+            *self.left = pts;
+        }
+    }
+
+    /// Emits a closed polygon given in user space, unless it lies outside the cull box.
+    fn emit(&mut self, pts: &[kurbo::Point]) {
+        let start = self.line_buf.len();
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        let mut prev = self.affine * pts[pts.len() - 1];
+        let (left, top, right, bottom) = self.cull;
+        for p in pts {
+            let d = self.affine * *p;
+            self.is_nan |= d.x.is_nan() || d.y.is_nan();
+            x0 = x0.min(d.x);
+            y0 = y0.min(d.y);
+            x1 = x1.max(d.x);
+            y1 = y1.max(d.y);
+            emit_edge(
+                self.line_buf,
+                self.meter,
+                [left, top, right, bottom],
+                prev,
+                d,
+            );
+            prev = d;
+        }
+        if x1 < left || y1 < top || x0 > right || y0 > bottom {
+            self.line_buf.truncate(start);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fearless_simd::Level;
+    use crate::flatten::{max_scale, stroke, stroke_cull_rect};
+    use crate::kurbo::StrokeCtx;
+    use core::f64::consts::SQRT_2;
+
+    fn lines(path: &kurbo::BezPath, style: &Stroke, affine: Affine, cull: RectU16) -> Vec<Line> {
+        let mut buf = Vec::new();
+        let scale = max_scale(affine);
+        hairline(
+            path.iter(),
+            style,
+            affine,
+            scale,
+            &mut buf,
+            &mut FlattenCtx::default(),
+            cull,
+            Cull::in_path_space(affine, stroke_cull_rect(cull, style, scale), scale),
+            Meter::default(),
+        );
+        buf
+    }
+
+    fn bounds(lines: &[Line]) -> (f32, f32, f32, f32) {
+        lines.iter().flat_map(|l| [l.p0, l.p1]).fold(
+            (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
+            |(x0, y0, x1, y1), p| (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)),
+        )
+    }
+
+    const VIEW: RectU16 = RectU16 {
+        x0: 0,
+        y0: 0,
+        x1: 100,
+        y1: 100,
+    };
+
+    #[test]
+    fn open_segment_gets_caps_at_both_ends() {
+        let mut p = kurbo::BezPath::new();
+        p.move_to((10.0, 10.0));
+        p.line_to((20.0, 10.0));
+        let style = Stroke::new(0.5).with_caps(kurbo::Cap::Square);
+        let l = lines(&p, &style, Affine::scale(2.0), VIEW);
+        assert_eq!(l.len(), 4);
+        // User width 0.5 at scale 2 is 1 px; square caps add half the width per end.
+        assert_eq!(bounds(&l), (19.5, 19.5, 40.5, 20.5));
+    }
+
+    /// Signed areas of the closed polygons in `lines`, in emission order.
+    fn polygon_areas(lines: &[Line]) -> Vec<f32> {
+        let mut out = Vec::new();
+        let (mut start, mut area) = (None, 0.0);
+        for l in lines {
+            let s = *start.get_or_insert(l.p0);
+            area += l.p0.x * l.p1.y - l.p1.x * l.p0.y;
+            if l.p1 == s {
+                out.push(area);
+                (start, area) = (None, 0.0);
+            }
+        }
+        assert!(start.is_none(), "every polygon is closed");
+        out
+    }
+
+    #[test]
+    fn closed_subpath_is_two_loops_without_caps() {
+        let mut p = kurbo::BezPath::new();
+        p.move_to((10.0, 10.0));
+        p.line_to((20.0, 10.0));
+        p.line_to((20.0, 20.0));
+        p.line_to((10.0, 20.0));
+        p.close_path();
+        let style = Stroke::new(1.0)
+            .with_caps(kurbo::Cap::Square)
+            .with_join(kurbo::Join::Miter);
+        let l = lines(&p, &style, Affine::IDENTITY, VIEW);
+        let areas = polygon_areas(&l);
+        assert_eq!(areas.len(), 2);
+        // An 11 x 11 outer and a 9 x 9 inner square of opposite orientation: the
+        // ring has the area of the stroke (shoelace sums are twice the area).
+        let total: f32 = areas.iter().sum();
+        assert!((total.abs() / 2.0 - 40.0).abs() < 1e-3, "{areas:?}");
+        assert_eq!(bounds(&l), (9.5, 9.5, 20.5, 20.5));
+    }
+
+    #[test]
+    fn miter_join_area_is_the_union() {
+        let mut p = kurbo::BezPath::new();
+        p.move_to((10.0, 10.0));
+        p.line_to((20.0, 10.0));
+        p.line_to((20.0, 20.0));
+        let style = Stroke::new(1.0)
+            .with_caps(kurbo::Cap::Butt)
+            .with_join(kurbo::Join::Miter);
+        let l = lines(&p, &style, Affine::IDENTITY, VIEW);
+        let areas = polygon_areas(&l);
+        // Two 10 x 1 rectangles, plus the 0.5 x 0.5 square at the outer corner, minus
+        // their 0.5 x 0.5 overlap at the inner one.
+        assert_eq!(areas.len(), 1);
+        assert!((areas[0].abs() / 2.0 - 20.0).abs() < 1e-3, "{areas:?}");
+    }
+
+    #[test]
+    fn orientation_is_independent_of_direction_and_offscreen_subpaths_are_dropped() {
+        let mut p = kurbo::BezPath::new();
+        p.move_to((10.0, 10.0));
+        p.line_to((50.0, 10.0));
+        p.line_to((10.0, 50.0));
+        p.line_to((60.0, 60.0));
+        p.move_to((90.0, 80.0));
+        p.line_to((70.0, 80.0));
+        p.line_to((80.0, 90.0));
+        p.move_to((500.0, 10.0));
+        p.line_to((600.0, 10.0));
+        let flip = Affine::scale_non_uniform(1.0, -1.0) * Affine::translate((0.0, -100.0));
+        for join in [kurbo::Join::Miter, kurbo::Join::Round, kurbo::Join::Bevel] {
+            let l = lines(&p, &Stroke::new(1.0).with_join(join), flip, VIEW);
+            let areas = polygon_areas(&l);
+            assert_eq!(areas.len(), 2, "the third subpath lies outside the view");
+            assert_eq!(areas[0].signum(), areas[1].signum(), "{join:?} {areas:?}");
+        }
+    }
+
+    #[test]
+    fn reversal_and_nan_are_handled() {
+        let mut p = kurbo::BezPath::new();
+        p.move_to((10.0, 10.0));
+        p.line_to((20.0, 10.0));
+        p.line_to((10.0, 10.0));
+        for join in [kurbo::Join::Miter, kurbo::Join::Round, kurbo::Join::Bevel] {
+            let l = lines(
+                &p,
+                &Stroke::new(1.0).with_join(join),
+                Affine::IDENTITY,
+                VIEW,
+            );
+            assert!(
+                l.iter().all(|l| !l.p0.x.is_nan() && !l.p0.y.is_nan()),
+                "{join:?}"
+            );
+            assert!(!l.is_empty());
+        }
+        p.line_to((f64::NAN, 10.0));
+        assert!(lines(&p, &Stroke::new(1.0), Affine::IDENTITY, VIEW).is_empty());
+    }
+
+    /// A very thin stroke that nearly reverses: its wedge is tiny, but the miter tip
+    /// would lie 100 px out; the outline stays within √2 half widths of the path.
+    #[test]
+    fn thin_sharp_joins_stay_near_the_path() {
+        let mut p = kurbo::BezPath::new();
+        p.move_to((0.0, 50.0));
+        p.line_to((50.0, 50.0));
+        p.line_to((0.0, 50.000_002));
+        let hw = 1e-6;
+        let style = Stroke::new(2.0 * hw).with_join(kurbo::Join::Bevel);
+        let (x0, y0, x1, y1) = bounds(&lines(&p, &style, Affine::IDENTITY, VIEW));
+        let reach = (SQRT_2 * hw) as f32 + 1e-4;
+        assert!(x1 <= 50.0 + reach && x0 >= -reach, "{x0} {x1}");
+        assert!(y0 >= 50.0 - reach && y1 <= 50.000_002 + reach, "{y0} {y1}");
+    }
+
+    /// Joins that nearly reverse, whose `1 + cos` is lost to rounding, stay within
+    /// √2 half widths of the path, whatever the join.
+    #[test]
+    fn nearly_reversing_joins_stay_near_the_path() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let hw = 0.5;
+        for _ in 0..10_000 {
+            let start = kurbo::Point::new(1000.0 + 500.0 * next(), 1000.0 + 500.0 * next());
+            let turn = kurbo::Point::new(1000.0 + 500.0 * next(), 1000.0 + 500.0 * next());
+            let mut p = kurbo::BezPath::new();
+            p.move_to(start);
+            p.line_to(turn);
+            // Back to the start, off by a rounding error.
+            p.line_to(kurbo::Point::new(start.x, start.y + (next() - 0.5) * 1e-12));
+            let reach = (SQRT_2 * hw) as f32 + 1e-2;
+            for join in [kurbo::Join::Miter, kurbo::Join::Round, kurbo::Join::Bevel] {
+                let style = Stroke::new(2.0 * hw).with_join(join).with_miter_limit(1.0);
+                let view = RectU16::new(0, 0, 4096, 4096);
+                let (x0, y0, x1, y1) = bounds(&lines(&p, &style, Affine::IDENTITY, view));
+                let near = x0 >= start.x.min(turn.x) as f32 - reach
+                    && y0 >= start.y.min(turn.y) as f32 - reach
+                    && x1 <= start.x.max(turn.x) as f32 + reach
+                    && y1 <= start.y.max(turn.y) as f32 + reach;
+                assert!(near, "{join:?} {p:?}: {x0} {y0} {x1} {y1}");
+            }
+        }
+    }
+
+    #[test]
+    fn wide_strokes_are_expanded() {
+        let mut p = kurbo::BezPath::new();
+        p.move_to((10.0, 10.0));
+        p.line_to((20.0, 10.0));
+        let mut buf = Vec::new();
+        stroke(
+            Level::new(),
+            p.iter(),
+            &Stroke::new(4.0),
+            Affine::IDENTITY,
+            &mut buf,
+            &mut FlattenCtx::default(),
+            &mut StrokeCtx::default(),
+            VIEW,
+        );
+        // Round caps produce more than the four sides of a rectangle.
+        assert!(buf.len() > 4);
+    }
+}

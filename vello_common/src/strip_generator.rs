@@ -8,6 +8,7 @@ use crate::fearless_simd::Level;
 use crate::flatten::{FlattenCtx, Line};
 use crate::geometry::RectU16;
 use crate::kurbo::{Affine, PathEl, Rect, Stroke};
+use crate::path_budget::{CapacityExceeded, Meter, PathBudget};
 use crate::peniko::Fill;
 use crate::strip::Strip;
 use crate::tile::Tiles;
@@ -90,6 +91,36 @@ pub struct StripGenerator {
     height: u16,
 }
 
+/// Geometry and winding rule for a prepared path.
+#[derive(Clone, Copy, Debug)]
+pub enum PathStyle<'a> {
+    /// Fill with the specified winding rule.
+    Fill(Fill),
+    /// Expand a stroke before rasterization.
+    Stroke(&'a Stroke),
+}
+
+/// Directed edges prepared for the clip and viewport used at preparation time.
+#[derive(Debug)]
+pub struct PreparedPath<'g, 'c> {
+    generator: &'g mut StripGenerator,
+    clip: Option<PathDataRef<'c>>,
+    fill: Fill,
+}
+
+impl PreparedPath<'_, '_> {
+    /// Device-space directed edges for shading or inspection.
+    pub fn edges(&self) -> &[Line] {
+        &self.generator.line_buf
+    }
+
+    /// Rasterize the inspected edges into strip storage.
+    pub fn submit(self, aliasing_threshold: Option<u8>, storage: &mut StripStorage) {
+        self.generator
+            .generate_with_clip(aliasing_threshold, storage, self.fill, self.clip);
+    }
+}
+
 impl StripGenerator {
     /// Create a new strip generator.
     pub fn new(width: u16, height: u16, level: Level) -> Self {
@@ -124,6 +155,66 @@ impl StripGenerator {
             .unwrap_or(RectU16::new(0, 0, self.width, self.height))
     }
 
+    /// Prepare directed edges once. The budget covers additional Vello-owned buffer
+    /// capacity. Kurbo's private stroke expansion buffers are outside this budget.
+    pub fn prepare_path<'g, 'c>(
+        &'g mut self,
+        path: impl IntoIterator<Item = PathEl>,
+        style: PathStyle<'_>,
+        transform: Affine,
+        clip: Option<PathDataRef<'c>>,
+        budget: &PathBudget,
+    ) -> Result<PreparedPath<'g, 'c>, CapacityExceeded> {
+        let meter = Meter(Some(budget));
+        if meter.failed() {
+            return Err(CapacityExceeded);
+        }
+        let prepared = self.prepare(path, style, transform, clip, meter);
+        if meter.failed() {
+            Err(CapacityExceeded)
+        } else {
+            Ok(prepared)
+        }
+    }
+
+    fn prepare<'g, 'c>(
+        &'g mut self,
+        path: impl IntoIterator<Item = PathEl>,
+        style: PathStyle<'_>,
+        transform: Affine,
+        clip: Option<PathDataRef<'c>>,
+        meter: Meter<'_>,
+    ) -> PreparedPath<'g, 'c> {
+        let bbox = self.clip_bounds(clip);
+        let fill = match style {
+            PathStyle::Fill(fill) => {
+                fearless_simd::dispatch!(self.level, simd => flatten::fill_path(
+                    simd, path, transform, &mut self.line_buf, &mut self.flatten_ctx, bbox, meter
+                ));
+                fill
+            }
+            PathStyle::Stroke(stroke) => {
+                flatten::stroke_metered(
+                    self.level,
+                    path,
+                    stroke,
+                    transform,
+                    &mut self.line_buf,
+                    &mut self.flatten_ctx,
+                    &mut self.stroke_ctx,
+                    bbox,
+                    meter,
+                );
+                Fill::NonZero
+            }
+        };
+        PreparedPath {
+            generator: self,
+            clip,
+            fill,
+        }
+    }
+
     /// Generate the strips for a filled path.
     pub fn generate_filled_path(
         &mut self,
@@ -134,17 +225,14 @@ impl StripGenerator {
         strip_storage: &mut StripStorage,
         clip_path: Option<PathDataRef<'_>>,
     ) {
-        let cull_bbox = self.clip_bounds(clip_path);
-        flatten::fill(
-            self.level,
+        self.prepare(
             path,
+            PathStyle::Fill(fill_rule),
             transform,
-            &mut self.line_buf,
-            &mut self.flatten_ctx,
-            cull_bbox,
-        );
-
-        self.generate_with_clip(aliasing_threshold, strip_storage, fill_rule, clip_path);
+            clip_path,
+            Meter::default(),
+        )
+        .submit(aliasing_threshold, strip_storage);
     }
 
     /// Generate the strips for a stroked path.
@@ -157,18 +245,14 @@ impl StripGenerator {
         strip_storage: &mut StripStorage,
         clip_path: Option<PathDataRef<'_>>,
     ) {
-        let cull_bbox = self.clip_bounds(clip_path);
-        flatten::stroke(
-            self.level,
+        self.prepare(
             path,
-            stroke,
+            PathStyle::Stroke(stroke),
             transform,
-            &mut self.line_buf,
-            &mut self.flatten_ctx,
-            &mut self.stroke_ctx,
-            cull_bbox,
-        );
-        self.generate_with_clip(aliasing_threshold, strip_storage, Fill::NonZero, clip_path);
+            clip_path,
+            Meter::default(),
+        )
+        .submit(aliasing_threshold, strip_storage);
     }
 
     fn generate_with_clip(
