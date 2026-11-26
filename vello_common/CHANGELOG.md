@@ -20,6 +20,7 @@ This release has an [MSRV][] of 1.89.
 
 ### Changed
 
+- Breaking change: `vello_common::encode::GradientRange` adds `x0`, the start offset. Its `bias` is the color at `x0` and its `scale` is the color delta over the range. ([#1998](https://github.com/linebender/vello/issues/1998) by [@Vantrongs](https://github.com/Vantrongs))
 - `FilterGraph::add` and `FilterGraph::set_output` panic unless the graph stays a linear chain. (by [@LaurenzV][])
 - Breaking change: `FilterGraph::primitives` and `FilterGraph::output` are private; use the accessor methods of the same name. (by [@LaurenzV][])
 - Breaking change: `ProbeFeature::Filter` is renamed to `ProbeFeature::GaussianBlur`. (by [@LaurenzV][])
@@ -31,6 +32,8 @@ This release has an [MSRV][] of 1.89.
 - `PreparedFilter::new`. (by [@LaurenzV][])
 
 ### Fixed
+
+- Gradient lookup tables sample the correct colors near hard stops and on steep ramps. ([#1998](https://github.com/linebender/vello/issues/1998) by [@Vantrongs](https://github.com/Vantrongs))
 
 - A `FilterGraph` with several primitives sums their expansions instead of taking their union, so a chain of primitives no longer underestimates how far its output and source extend. ([#2087][] by [@LaurenzV][])
 - A path with a cubic that is almost straight in places is no longer dropped (flattening could put a `NaN` point in the straight segment). (by [@taj-p][])
