@@ -336,6 +336,64 @@ impl Strip {
     }
 }
 
+// Clip to one pixel column before integrating. This bounds the horizontal
+// displacement by one even when the original slope exceeds the f32 range.
+#[cold]
+fn wide_coverage<S: Simd>(
+    s: S,
+    line: Line,
+    tile: Tile,
+    sign: f32,
+    locations: &mut [f32x4<S>; Tile::WIDTH as usize],
+) -> f32x4<S> {
+    let (a, b) = if line.p0.x <= line.p1.x {
+        (line.p0, line.p1)
+    } else {
+        (line.p1, line.p0)
+    };
+    let (ax, ay, bx, by) = (
+        f64::from(a.x),
+        f64::from(a.y),
+        f64::from(b.x),
+        f64::from(b.y),
+    );
+    let y_at = |x| {
+        if x == ax {
+            ay
+        } else if x == bx {
+            by
+        } else {
+            crate::tile::crossing(ay, ax, by, bx, x)
+        }
+    };
+    let mut acc = f32x4::splat(s, 0.);
+    for (col, location) in locations.iter_mut().enumerate() {
+        let left = f64::from(tile.x * Tile::WIDTH) + col as f64;
+        let right = left + 1.;
+        let x0 = ax.max(left);
+        let x1 = bx.min(right);
+        let mut area = [0.; 4];
+        let mut height = [0.; 4];
+        if x0 < x1 || (ax == bx && (left..right).contains(&ax)) {
+            let y0 = y_at(x0);
+            let y1 = if ax == bx { by } else { y_at(x1) };
+            for row in 0..4 {
+                let top = f64::from(tile.y * Tile::HEIGHT) + row as f64;
+                let lo = y0.min(y1).max(top);
+                let hi = y0.max(y1).min(top + 1.);
+                if hi > lo {
+                    let t = ((lo + hi) * 0.5 - y0) / (y1 - y0);
+                    height[row] = (hi - lo) as f32 * sign;
+                    area[row] = ((right - x0) - t * (x1 - x0)) as f32 * height[row];
+                }
+            }
+        }
+        *location += acc + f32x4::simd_from(s, area);
+        acc += f32x4::simd_from(s, height);
+    }
+    acc
+}
+
 /// Render the tiles stored in `tiles` into the strip and alpha buffer.
 pub fn render(
     level: Level,
@@ -598,13 +656,13 @@ fn render_impl<S: Simd>(
 
         // TODO: horizontal geometry has no impact on winding. This branch will be removed when
         // horizontal geometry is culled at the tile-generation stage.
-        if p0_y == p1_y {
+        if line.p0.y == line.p1.y {
             continue;
         }
 
         // Lines moving upwards (in a y-down coordinate system) add to winding; lines moving
         // downwards subtract from winding.
-        let sign = (p0_y - p1_y).signum();
+        let sign = if line.p0.y > line.p1.y { 1. } else { -1. };
 
         // Calculate winding / pixel area coverage.
         //
@@ -646,6 +704,17 @@ fn render_impl<S: Simd>(
         let x_slope = 1. / y_slope;
 
         winding_delta += sign as i32 * i32::from(tile.winding());
+
+        // Reserve eleven fractional bits for pixel intersections. A very
+        // shallow slope can also overflow the reciprocal or its y intercept.
+        const LOCAL_LIMIT: f32 = 4096.;
+        if !(p0_x.abs().max(p1_x.abs()).max(p0_y.abs()).max(p1_y.abs()) <= LOCAL_LIMIT
+            && x_slope.abs() <= f32::MAX / (4. * LOCAL_LIMIT)
+            && (y_slope.is_finite() || line.p0.x == line.p1.x))
+        {
+            accumulated_winding += wide_coverage(s, line, tile, sign, &mut location_winding);
+            continue;
+        }
 
         let line_top_y = f32x4::splat(s, line_top_y);
         let line_bottom_y = f32x4::splat(s, line_bottom_y);
@@ -767,6 +836,46 @@ mod tests {
     use super::{Strip, StripFillSegment, visit_strip_fill_segments};
     use crate::geometry::RectU16;
     use alloc::vec;
+
+    #[test]
+    fn extreme_diagonal_half_coverage() {
+        use super::*;
+        use crate::flatten::Point;
+        let far = f32::MAX;
+        let a = Point { x: -far, y: -far };
+        let b = Point { x: far, y: far };
+        let c = Point { x: far, y: -far };
+        let lines = [
+            Line { p0: a, p1: b },
+            Line { p0: b, p1: c },
+            Line { p0: c, p1: a },
+        ];
+        let level = Level::baseline();
+        let mut tiles = Tiles::new(level, 16, 16);
+        tiles.make_tiles_analytic_aa(level, &lines, 16, 16);
+        tiles.sort_tiles();
+        let mut strips = vec![];
+        let mut alphas = vec![];
+        render(
+            level,
+            &tiles,
+            &mut strips,
+            &mut alphas,
+            Fill::NonZero,
+            None,
+            &lines,
+        );
+        let strip = strips
+            .windows(2)
+            .find(|pair| {
+                pair[0].y == 8
+                    && pair[0].x <= 8
+                    && u32::from(8 - pair[0].x) < pair[0].width_to(&pair[1])
+            })
+            .unwrap()[0];
+        let i = strip.alpha_idx() as usize + usize::from(8 - strip.x) * 4;
+        assert_eq!([alphas[i], alphas[i + 1], alphas[i + 4]], [128, 0, 255]);
+    }
 
     #[test]
     fn full_domain_alpha_strip_is_clipped_before_narrowing() {

@@ -35,6 +35,125 @@ const INTERSECTION_MASK: u32 = W | R | L | B | T;
 /// Shift amount corresponding to the intersection bits.
 const INT_MASK_SHIFT: u32 = INTERSECTION_MASK.count_ones();
 
+// Widen before scaling so even subnormal endpoints retain their position
+// relative to zero. A wholly left, infinite x can result from narrowing a
+// finite off-screen path: its y interval still contributes winding.
+fn tile_coordinates(line: Line) -> Option<[f64; 4]> {
+    let [mut x0, y0, mut x1, y1] = [line.p0.x, line.p0.y, line.p1.x, line.p1.y];
+    if ![x0, y0, x1, y1].into_iter().all(f32::is_finite) {
+        if !(x0 < 0.0 && x1 < 0.0 && y0.is_finite() && y1.is_finite()) {
+            return None;
+        }
+        x0 = -1.0;
+        x1 = -1.0;
+    }
+    Some([
+        f64::from(x0) / f64::from(Tile::WIDTH),
+        f64::from(y0) / f64::from(Tile::HEIGHT),
+        f64::from(x1) / f64::from(Tile::WIDTH),
+        f64::from(y1) / f64::from(Tile::HEIGHT),
+    ])
+}
+
+const BOUNDARY_MARGIN: f64 = 1e-5;
+
+// Grow a nonoverlapping expansion with error-free TwoSum. The highest component
+// gives the sign of the exact sum, even after cancellation. Each input adds at
+// most one component; the crossing determinant has six products.
+#[derive(Default)]
+struct CrossingSum {
+    parts: [f64; 6],
+    len: usize,
+}
+
+impl CrossingSum {
+    fn add(&mut self, mut value: f64) {
+        let mut used = 0;
+        for i in 0..self.len {
+            let part = self.parts[i];
+            let sum = value + part;
+            let b = sum - value;
+            let error = (value - (sum - b)) + (part - b);
+            if error != 0.0 {
+                self.parts[used] = error;
+                used += 1;
+            }
+            value = sum;
+        }
+        if value != 0.0 || used == 0 {
+            self.parts[used] = value;
+            used += 1;
+        }
+        self.len = used;
+    }
+
+    fn estimate(&self) -> f64 {
+        self.parts[..self.len].iter().sum()
+    }
+}
+
+// Inputs are f32 coordinates scaled by a power of two, or viewport integers.
+// Their products have at most 48 significant bits and fit exactly in f64.
+fn crossing_numerator(x0: f64, y0: f64, x1: f64, y1: f64, y: f64) -> CrossingSum {
+    let mut sum = CrossingSum::default();
+    for term in [x0 * y1, -x1 * y0, x1 * y, -x0 * y] {
+        sum.add(term);
+    }
+    sum
+}
+
+// The boundary and endpoints are exactly representable as f32. Swapping the
+// axes gives the y intersection at a vertical pixel boundary.
+pub(crate) fn crossing(x0: f64, y0: f64, x1: f64, y1: f64, y: f64) -> f64 {
+    crossing_numerator(x0, y0, x1, y1, y).estimate() / (y1 - y0)
+}
+
+#[cold]
+fn exact_column(x0: f64, y0: f64, x1: f64, y1: f64, y: f64) -> f64 {
+    let mut numerator = crossing_numerator(x0, y0, x1, y1, y);
+    let estimate = numerator.estimate() / (y1 - y0);
+    let k = estimate.round();
+    // With cancellation already resolved, only relative rounding error remains
+    // (summing the components, subtraction and division). Within the u16 viewport
+    // this is below 1e-9 columns. Outside it only the side matters.
+    if !(0.0..=f64::from(u16::MAX)).contains(&k) || (estimate - k).abs() > BOUNDARY_MARGIN {
+        return estimate;
+    }
+    numerator.add(-k * y1);
+    numerator.add(k * y0);
+    let side = numerator.parts[numerator.len - 1];
+    if side < 0.0 {
+        k.next_down()
+    } else if side > 0.0 {
+        k.next_up()
+    } else {
+        k
+    }
+}
+
+fn line_x_at_y(x0: f64, y0: f64, x1: f64, y1: f64) -> impl Fn(f64) -> f64 {
+    let slope = (x1 - x0) / (y1 - y0);
+    let ordinary = x0.abs().max(x1.abs()).max(y0.abs()).max(y1.abs()) <= 1e6;
+    move |y| {
+        if y == y0 {
+            return x0;
+        }
+        if y == y1 {
+            return x1;
+        }
+        let x = x0 + (y - y0) * slope;
+        // Inside the segment the interpolated displacement is at most |dx|.
+        // For ordinary endpoints even six rounding errors of 2e6 * EPSILON
+        // each cannot reach the boundary across this margin.
+        let fraction = (x - f64::from(x as i32)).abs();
+        if ordinary && (BOUNDARY_MARGIN..1.0 - BOUNDARY_MARGIN).contains(&fraction) {
+            x
+        } else {
+            exact_column(x0, y0, x1, y1, y)
+        }
+    }
+}
+
 /// The max number of lines per path.
 ///
 /// Trying to render a path with more lines than this may result in visual artifacts.
@@ -553,16 +672,14 @@ impl Tiles {
         let px_top = f32x4::from_slice(s, &[0.0, 1.0, 2.0, 3.0]);
         let px_bottom = px_top + f32x4::splat(s, 1.0);
         let simd_zero = f32x4::splat(s, 0.0);
-        let tile_height_f32 = Tile::HEIGHT as f32;
+        let tile_height = f64::from(Tile::HEIGHT);
 
         for (line_idx, line) in lines.iter().take(MAX_LINES_PER_PATH as usize).enumerate() {
             let line_idx = line_idx as u32;
 
-            let p0_x = line.p0.x / f32::from(Tile::WIDTH);
-            let p0_y = line.p0.y / f32::from(Tile::HEIGHT);
-            let p1_x = line.p1.x / f32::from(Tile::WIDTH);
-            let p1_y = line.p1.y / f32::from(Tile::HEIGHT);
-
+            let Some([p0_x, p0_y, p1_x, p1_y]) = tile_coordinates(*line) else {
+                continue;
+            };
             let (line_left_x, line_right_x) = if p0_x < p1_x {
                 (p0_x, p1_x)
             } else {
@@ -570,7 +687,7 @@ impl Tiles {
             };
 
             // Lines whose left-most endpoint exceed the right edge of the viewport are culled
-            if line_left_x > tile_columns as f32 {
+            if line_left_x >= f64::from(tile_columns) {
                 continue;
             }
 
@@ -600,12 +717,12 @@ impl Tiles {
 
             macro_rules! calc_fractional_coverage {
                 ($y_idx:expr, $segment_top_y:expr, $segment_bottom_y:expr) => {{
-                    let y_idx_f32 = f32::from($y_idx);
-                    let local_y_start = ($segment_top_y - y_idx_f32) * tile_height_f32;
-                    let local_y_end = ($segment_bottom_y - y_idx_f32) * tile_height_f32;
+                    let row_y = f64::from($y_idx);
+                    let local_y_start = ($segment_top_y - row_y) * tile_height;
+                    let local_y_end = ($segment_bottom_y - row_y) * tile_height;
 
-                    let start_v = f32x4::splat(s, local_y_start);
-                    let end_v = f32x4::splat(s, local_y_end);
+                    let start_v = f32x4::splat(s, local_y_start as f32);
+                    let end_v = f32x4::splat(s, local_y_end as f32);
 
                     (px_bottom.min(end_v) - px_top.max(start_v)).max(simd_zero)
                 }};
@@ -625,7 +742,7 @@ impl Tiles {
                     // Note: In theory, == should be enough, but just as
                     // additional safety against numerical precision errors we
                     // use <=.
-                    let at_top_of_tile = line_top_y <= f32::from(y_top_tiles);
+                    let at_top_of_tile = line_top_y <= f64::from(y_top_tiles);
                     if at_top_of_tile {
                         self.windings.coarse[y_top_tiles as usize] += dir;
                     }
@@ -696,7 +813,7 @@ impl Tiles {
                     let is_start_culled = line_top_y < 0.0;
                     if !is_start_culled {
                         let winding =
-                            ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
+                            ((f64::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
                         let tile = Tile::new_clamped(x, y_top_tiles, line_idx, winding);
                         self.tile_buf.push(tile);
                     }
@@ -715,9 +832,7 @@ impl Tiles {
                     }
                 } else {
                     // General case, any line which crosses more than one tile and is not vertical.
-                    let dx = p1_x - p0_x;
-                    let dy = p1_y - p0_y;
-                    let x_slope = dx / dy;
+                    let x_at = line_x_at_y(line_top_x, line_top_y, line_bottom_x, line_bottom_y);
                     let dx_dir = (line_bottom_x >= line_top_x) as u32;
                     let not_dx_dir = dx_dir ^ 1;
 
@@ -728,8 +843,8 @@ impl Tiles {
                         #[inline(always)]
                         |tile_buf: &mut Vec<Tile>,
                          y_idx: u16,
-                         row_left_x: f32,
-                         row_right_x: f32,
+                         row_left_x: f64,
+                         row_right_x: f64,
                          w_start: u32,
                          w_end: u32,
                          w_single: u32| {
@@ -755,17 +870,21 @@ impl Tiles {
                     let mut push_row = {
                         #[inline(always)]
                         |y_idx: u16,
-                         row_top_y: f32,
-                         row_bottom_y: f32,
+                         row_top_y: f64,
+                         row_bottom_y: f64,
                          w_start: u32,
                          w_end: u32,
                          w_single: u32| {
-                            let row_top_x = p0_x + (row_top_y - p0_y) * x_slope;
-                            let row_bottom_x = p0_x + (row_bottom_y - p0_y) * x_slope;
+                            let row_top_x = x_at(row_top_y);
+                            let row_bottom_x = if row_bottom_y == line_bottom_y {
+                                line_bottom_x
+                            } else {
+                                x_at(row_bottom_y)
+                            };
 
                             // TODO: Evaluate whether we need the second max/min.
-                            let row_left_x = f32::min(row_top_x, row_bottom_x).max(line_left_x);
-                            let row_right_x = f32::max(row_top_x, row_bottom_x).min(line_right_x);
+                            let row_left_x = f64::min(row_top_x, row_bottom_x).max(line_left_x);
+                            let row_right_x = f64::max(row_top_x, row_bottom_x).min(line_right_x);
 
                             if row_left_x < 0.0 {
                                 self.windings.culled = true;
@@ -797,14 +916,14 @@ impl Tiles {
                                     // The line crosses into the viewport in this row. Record only the
                                     // fractional portion of the winding, as the coarse winding will
                                     // naturally get included by the clamped tile logic!
-                                    let y_slope = dy / dx;
-                                    let y_intersect = row_top_y - (row_top_x * y_slope);
+                                    // Both products are exact, including when their difference is tiny.
+                                    let y_intersect = (p0_y * p1_x - p1_y * p0_x) / (p1_x - p0_x);
 
                                     let (off_screen_top_y, off_screen_bottom_y) = if row_top_x < 0.0
                                     {
-                                        (row_top_y, f32::min(row_bottom_y, y_intersect))
+                                        (row_top_y, f64::min(row_bottom_y, y_intersect))
                                     } else {
-                                        (f32::max(row_top_y, y_intersect), row_bottom_y)
+                                        (f64::max(row_top_y, y_intersect), row_bottom_y)
                                     };
 
                                     if off_screen_top_y < off_screen_bottom_y {
@@ -838,21 +957,21 @@ impl Tiles {
                     // This branch is taken in case the line is completely inside
                     // the viewport, allowing us to save many calculations that
                     // otherwise would need to be made viewport culling work.
-                    if line_left_x >= 0.0 && line_right_x < tile_columns as f32 {
+                    if line_left_x >= 0.0 && line_right_x < f64::from(tile_columns) {
                         if !is_start_culled {
-                            let y = f32::from(y_top_tiles);
+                            let y = f64::from(y_top_tiles);
                             let row_bottom_y = (y + 1.0).min(line_bottom_y);
                             let row_bottom_x = if row_bottom_y == line_bottom_y {
                                 line_bottom_x
                             } else {
-                                p0_x + (row_bottom_y - p0_y) * x_slope
+                                x_at(row_bottom_y)
                             };
                             let mask = ((y >= line_top_y) as u32) << WINDING_SHIFT;
                             push_row_extents(
                                 &mut self.tile_buf,
                                 y_top_tiles,
-                                f32::min(line_top_x, row_bottom_x),
-                                f32::max(line_top_x, row_bottom_x),
+                                line_top_x.min(row_bottom_x),
+                                line_top_x.max(row_bottom_x),
                                 w_start_base & mask,
                                 w_end_base & mask,
                                 W & mask,
@@ -866,22 +985,22 @@ impl Tiles {
                         };
 
                         if y_start < y_bottom_tiles {
-                            let mut row_top_x = p0_x + (f32::from(y_start) - p0_y) * x_slope;
+                            let mut row_top_x = x_at(f64::from(y_start));
                             for y_idx in y_start..y_bottom_tiles {
-                                let y = f32::from(y_idx);
+                                let y = f64::from(y_idx);
                                 // Note: We purposefully don't precompute it once
-                                // and just increment by `x_slope` after every iteration
+                                // and just increment by the slope after every iteration
                                 // to avoid errors due to floating point inaccuracies.
                                 let row_bottom_x = if line_bottom_y < y + 1.0 {
                                     line_bottom_x
                                 } else {
-                                    p0_x + (y + 1.0 - p0_y) * x_slope
+                                    x_at(y + 1.0)
                                 };
                                 push_row_extents(
                                     &mut self.tile_buf,
                                     y_idx,
-                                    f32::min(row_top_x, row_bottom_x),
-                                    f32::max(row_top_x, row_bottom_x),
+                                    f64::min(row_top_x, row_bottom_x),
+                                    f64::max(row_top_x, row_bottom_x),
                                     w_start_base,
                                     w_end_base,
                                     W,
@@ -891,7 +1010,7 @@ impl Tiles {
                         }
                     } else {
                         if !is_start_culled {
-                            let y = f32::from(y_top_tiles);
+                            let y = f64::from(y_top_tiles);
                             let row_bottom_y = (y + 1.0).min(line_bottom_y);
                             let mask = ((y >= line_top_y) as u32) << WINDING_SHIFT;
                             push_row(
@@ -911,7 +1030,7 @@ impl Tiles {
                         };
 
                         for y_idx in y_start..y_bottom_tiles {
-                            let y = f32::from(y_idx);
+                            let y = f64::from(y_idx);
                             let row_bottom_y = (y + 1.0).min(line_bottom_y);
                             push_row(y_idx, y, row_bottom_y, w_start_base, w_end_base, W);
                         }
@@ -923,7 +1042,7 @@ impl Tiles {
                     (line_left_x as u16).min(tile_columns + 1),
                     y_top_tiles,
                     line_idx,
-                    ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT,
+                    ((f64::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT,
                 );
                 self.tile_buf.push(tile);
             }
@@ -975,11 +1094,9 @@ impl Tiles {
         for (line_idx, line) in lines.iter().take(MAX_LINES_PER_PATH as usize).enumerate() {
             let line_idx = line_idx as u32;
 
-            let p0_x = line.p0.x / f32::from(Tile::WIDTH);
-            let p0_y = line.p0.y / f32::from(Tile::HEIGHT);
-            let p1_x = line.p1.x / f32::from(Tile::WIDTH);
-            let p1_y = line.p1.y / f32::from(Tile::HEIGHT);
-
+            let Some([p0_x, p0_y, p1_x, p1_y]) = tile_coordinates(*line) else {
+                continue;
+            };
             let (line_left_x, line_right_x) = if p0_x < p1_x {
                 (p0_x, p1_x)
             } else {
@@ -987,7 +1104,7 @@ impl Tiles {
             };
 
             // Lines whose left-most endpoint exceed the right edge of the viewport are culled
-            if line_left_x > tile_columns as f32 {
+            if line_left_x >= f64::from(tile_columns) {
                 continue;
             }
 
@@ -1031,7 +1148,7 @@ impl Tiles {
                     let is_start_culled = line_top_y < 0.0;
                     if !is_start_culled {
                         let winding =
-                            ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
+                            ((f64::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
                         let intersection_mask = B | winding;
                         let tile = Tile::new_clamped(x, y_top_tiles, line_idx, intersection_mask);
                         self.tile_buf.push(tile);
@@ -1073,9 +1190,7 @@ impl Tiles {
                         self.tile_buf.push(tile);
                     }
                 } else {
-                    let dx = p1_x - p0_x;
-                    let dy = p1_y - p0_y;
-                    let x_slope = dx / dy;
+                    let x_at = line_x_at_y(line_top_x, line_top_y, line_bottom_x, line_bottom_y);
                     let dx_dir = (line_bottom_x >= line_top_x) as u32;
                     let not_dx_dir = dx_dir ^ 1;
 
@@ -1084,10 +1199,9 @@ impl Tiles {
 
                     // Check if the line is fully within the horizontal viewport bounds. If it is,
                     // we can skip the min/max clamping per row.
-                    let min_x = p0_x.min(p1_x);
-                    let max_x = p0_x.max(p1_x);
                     // Note: We use >= on the right edge to ensure strictly safe integer truncation
-                    let needs_clamping = min_x < line_left_x || max_x >= line_right_x;
+                    let needs_clamping =
+                        line_left_x < 0.0 || line_right_x >= f64::from(tile_columns);
 
                     // Handles the bitmask logic for start/end tiles. Invariant to clamping.
                     macro_rules! push_edge {
@@ -1125,8 +1239,8 @@ impl Tiles {
                             mask |= (1 ^ canonical_row_end) << dx_dir << LEFT_SHIFT;
 
                             // Corner
-                            let x_left_f = x_idx as f32;
-                            let x_right_f = (x_idx + 1) as f32;
+                            let x_left_f = f64::from(x_idx);
+                            let x_right_f = f64::from(x_idx + 1);
                             let trc = (($row_top_x == x_right_f) as u32) & (1 ^ start_tile);
                             let tlc = (($row_top_x == x_left_f) as u32) & (1 ^ start_tile);
                             let brc = (($row_bottom_x == x_right_f) as u32) & (1 ^ end_tile);
@@ -1147,17 +1261,21 @@ impl Tiles {
                     macro_rules! process_row {
                         ($y_idx:expr, $row_top_y:expr, $row_bottom_y:expr, $w_mask:expr,
                      $check_s:tt, $check_e:tt, $clamped:tt) => {{
-                            let row_top_x = p0_x + ($row_top_y - p0_y) * x_slope;
-                            let row_bottom_x = p0_x + ($row_bottom_y - p0_y) * x_slope;
+                            let row_top_x = x_at($row_top_y);
+                            let row_bottom_x = if $row_bottom_y == line_bottom_y {
+                                line_bottom_x
+                            } else {
+                                x_at($row_bottom_y)
+                            };
 
                             let (row_left_x, row_right_x, x_end) = if $clamped {
-                                let lx = f32::min(row_top_x, row_bottom_x).max(line_left_x);
-                                let rx = f32::max(row_top_x, row_bottom_x).min(line_right_x);
+                                let lx = f64::min(row_top_x, row_bottom_x).max(line_left_x);
+                                let rx = f64::max(row_top_x, row_bottom_x).min(line_right_x);
                                 let xe = (rx as u16).min(tile_columns.saturating_sub(1));
                                 (lx, rx, xe)
                             } else {
-                                let lx = f32::min(row_top_x, row_bottom_x);
-                                let rx = f32::max(row_top_x, row_bottom_x);
+                                let lx = f64::min(row_top_x, row_bottom_x);
+                                let rx = f64::max(row_top_x, row_bottom_x);
                                 let xe = rx as u16; // Safe because we checked bounds earlier
                                 (lx, rx, xe)
                             };
@@ -1211,7 +1329,7 @@ impl Tiles {
                             // Top Row
                             let is_start_culled = line_top_y < 0.0;
                             if !is_start_culled {
-                                let y = f32::from(y_top_tiles);
+                                let y = f64::from(y_top_tiles);
                                 let row_bottom_y = (y + 1.0).min(line_bottom_y);
                                 let mask = ((y >= line_top_y) as u32) << WINDING_SHIFT;
                                 process_row!(
@@ -1238,7 +1356,7 @@ impl Tiles {
 
                             if y_start_middle < y_end_middle {
                                 for y_idx in y_start_middle..y_end_middle {
-                                    let y = f32::from(y_idx);
+                                    let y = f64::from(y_idx);
                                     let row_bottom_y = (y + 1.0).min(line_bottom_y);
                                     let is_last_middle = y_idx == y_end_middle - 1;
                                     let check_end = is_last_middle && !has_separate_bottom_row;
@@ -1258,7 +1376,7 @@ impl Tiles {
                             // Bottom Row
                             if has_separate_bottom_row {
                                 let y_idx = y_end_middle;
-                                let y = f32::from(y_idx);
+                                let y = f64::from(y_idx);
                                 process_row!(
                                     y_idx,
                                     y,
@@ -1284,7 +1402,7 @@ impl Tiles {
                     (line_left_x as u16).min(tile_columns + 1),
                     y_top_tiles,
                     line_idx,
-                    ((f32::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT,
+                    ((f64::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT,
                 );
                 self.tile_buf.push(tile);
             }
@@ -1970,6 +2088,205 @@ mod tests {
     // Sloped Lines
     //==============================================================================================
     #[test]
+    fn crossing_matches_integer_rationals() {
+        // Sixteenths keep the oracle integral. The local endpoint bounds the
+        // products below 2^120 even when the far endpoint is 2^100 away.
+        for power in [4, 12, 23, 40, 60, 100] {
+            let far = 1_i128 << power;
+            for x0 in [0, 1, 31, 32, 33, 513] {
+                for x1 in [-far, 0, far] {
+                    for y0 in [-31, -16, -1] {
+                        let at = super::line_x_at_y(
+                            x0 as f64 / 16.,
+                            y0 as f64 / 16.,
+                            x1 as f64 / 16.,
+                            far as f64 / 16.,
+                        );
+                        for y in 0..=(far / 16).min(16) {
+                            let den = 16 * (far - y0);
+                            let num = x0 * (far - y0) + (16 * y - y0) * (x1 - x0);
+                            let x = at(y as f64);
+                            for k in 0..=48 {
+                                assert_eq!(
+                                    x.partial_cmp(&(k as f64)).unwrap(),
+                                    num.cmp(&(k * den)),
+                                    "power={power} x0={x0} x1={x1} y0={y0} y={y} k={k}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crossings_between_distant_endpoints() {
+        for top in [-2_f32.powi(30), -2_f32.powi(120), -f32::MAX] {
+            for bottom in [2_f32.powi(30), 2_f32.powi(120), f32::MAX] {
+                let x0 = top * 0.5;
+                for perturbed in [x0.next_down(), x0, x0.next_up()] {
+                    let at = super::line_x_at_y(
+                        f64::from(perturbed),
+                        f64::from(top),
+                        f64::from(bottom * 0.5),
+                        f64::from(bottom),
+                    );
+                    // x(y) - y/2 = (perturbed - x0) * (bottom - y) / (bottom - top).
+                    for y in [0., 2., 8., 32_766.] {
+                        assert_eq!(at(y).partial_cmp(&(y * 0.5)), perturbed.partial_cmp(&x0));
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_row_tiles(a: Point, b: Point, expected: &[Tile]) {
+        let rows = expected.first().unwrap().y..=expected.last().unwrap().y;
+        for (p0, p1) in [(a, b), (b, a)] {
+            let line = [Line { p0, p1 }];
+            let mut tiles = new_tiles();
+            tiles.make_tiles_msaa(&line, 640, 808);
+            tiles.tile_buf.retain(|t| rows.contains(&t.y));
+            assert_eq!(tiles.tile_buf, expected);
+            tiles.make_tiles_analytic_aa(Level::baseline(), &line, 640, 808);
+            tiles.tile_buf.retain(|t| rows.contains(&t.y));
+            check_analytic_aa_matches(&tiles.tile_buf, expected);
+        }
+    }
+
+    #[test]
+    fn winding_and_corner_flags_at_row_boundaries() {
+        assert_row_tiles(
+            Point {
+                x: f32::from_bits(1),
+                y: 0.,
+            },
+            Point { x: 8., y: 8. },
+            &[Tile::new(0, 0, 0, W | R), Tile::new(1, 0, 0, L | B)],
+        );
+        assert_row_tiles(
+            Point {
+                x: 108.408_05,
+                y: 503.681,
+            },
+            Point {
+                x: 38_007.54,
+                y: 30_317.664,
+            },
+            &[
+                Tile::new(118, 198, 0, W | T | R),
+                Tile::new(119, 198, 0, L | R),
+                Tile::new(120, 198, 0, L),
+                Tile::new(120, 199, 0, W | T | R),
+                Tile::new(121, 199, 0, L | B),
+            ],
+        );
+        assert_row_tiles(
+            Point {
+                x: 147.999_98,
+                y: 411.0,
+            },
+            Point {
+                x: 148.000_02,
+                y: 625.0,
+            },
+            &[
+                Tile::new(36, 128, 0, W | T | B),
+                Tile::new(36, 129, 0, W | T | R),
+                Tile::new(37, 129, 0, L | B),
+            ],
+        );
+    }
+
+    #[test]
+    fn left_edge_preserves_partial_pixel_winding() {
+        let a = Point {
+            x: -f32::MAX,
+            y: -f32::MAX,
+        };
+        let b = Point { x: 1., y: 2.5 };
+        for (p0, p1, dir) in [(a, b, -1.), (b, a, 1.)] {
+            let mut tiles = new_tiles();
+            tiles.make_tiles_analytic_aa(Level::baseline(), &[Line { p0, p1 }], 16, 16);
+            assert_eq!(tiles.windings.partial[0], [dir, 0.5 * dir, 0., 0.]);
+        }
+    }
+
+    #[test]
+    fn distant_diagonal_preserves_local_crossing() {
+        let far = 2_f32.powi(60);
+        let a = Point { x: -far, y: -far };
+        let b = Point { x: far, y: far };
+        let expected = [Tile::new(2, 2, 0, W | T | R), Tile::new(3, 2, 0, L)];
+        assert_row_tiles(a, b, &expected);
+    }
+
+    #[test]
+    fn distant_endpoint_spans_visible_rows() {
+        let near = Point { x: 20., y: 100. };
+        let far = Point {
+            x: 2_f32.powi(60),
+            y: -2_f32.powi(60),
+        };
+        let far_tiles = 1_i128 << 58;
+        let column = |row: u16| {
+            // x = 5 + (25 - row) * (far_tiles - 5) / (far_tiles + 25).
+            (5 + (25 - i128::from(row)) * (far_tiles - 5) / (far_tiles + 25)) as u16
+        };
+        let mut expected = Vec::new();
+        for row in 0..25 {
+            let top = column(row);
+            let bottom = column(row + 1);
+            if top == bottom {
+                expected.push(Tile::new(top, row, 0, W | T));
+            } else {
+                expected.push(Tile::new(bottom, row, 0, R | B));
+                expected.push(Tile::new(top, row, 0, W | T | L));
+            }
+        }
+        for (p0, p1) in [(near, far), (far, near)] {
+            new_tiles().assert_tiles_match(&[Line { p0, p1 }], 200, 120, &expected);
+        }
+    }
+
+    #[test]
+    fn non_integral_slope_crosses_exact_corner() {
+        let top = Point { x: 0., y: 1. };
+        let bottom = Point { x: 72., y: 67. };
+        let expected = [
+            Tile::new(13, 13, 0, W | T | R),
+            Tile::new(14, 13, 0, L | R),
+            Tile::new(15, 13, 0, L),
+            Tile::new(15, 14, 0, W | T | R),
+            Tile::new(16, 14, 0, L | B),
+        ];
+        assert_row_tiles(top, bottom, &expected);
+    }
+
+    #[test]
+    fn near_vertical_column_crossing() {
+        let boundary = 20.0_f32;
+        let top = Point {
+            x: boundary.next_down(),
+            y: 1.0,
+        };
+        let bottom = Point {
+            x: boundary.next_up(),
+            y: 11.0,
+        };
+        let expected = [
+            Tile::new(4, 0, 0, B),
+            Tile::new(4, 1, 0, W | T | R),
+            Tile::new(5, 1, 0, L | B),
+            Tile::new(5, 2, 0, W | T),
+        ];
+        for (p0, p1) in [(top, bottom), (bottom, top)] {
+            new_tiles().assert_tiles_match(&[Line { p0, p1 }], VIEW_DIM, VIEW_DIM, &expected);
+        }
+    }
+
+    #[test]
     fn top_left_to_bottom_right() {
         let lines = [Line {
             p0: Point { x: 1.0, y: 1.0 },
@@ -2221,10 +2538,11 @@ mod tests {
 
         let tile_width = f32::from(Tile::WIDTH);
         let tile_height = f32::from(Tile::HEIGHT);
+        // Exactly representable endpoints put the crossing at the corner (33, 2).
         let lines = [Line {
             p0: Point {
-                x: 32.89 * tile_width,
-                y: 0.9 * tile_height,
+                x: 32.875 * tile_width,
+                y: 0.75 * tile_height,
             },
             p1: Point {
                 x: 33.5 * tile_width,
@@ -2232,7 +2550,7 @@ mod tests {
             },
         }];
 
-        let mut tiles = Tiles::new(Level::baseline(), HEIGHT, HEIGHT);
+        let mut tiles = Tiles::new(Level::baseline(), WIDTH, HEIGHT);
         tiles.make_tiles_analytic_aa(Level::baseline(), &lines, WIDTH, HEIGHT);
 
         let row_tiles: Vec<Tile> = tiles
