@@ -37,7 +37,6 @@ use crate::simd::{Splat4thExt, element_wise_splat};
 use peniko::kurbo::common::FloatFuncs as _;
 
 const DEGENERATE_THRESHOLD: f32 = 1.0e-6;
-const NUDGE_VAL: f32 = 1.0e-7;
 #[cfg(feature = "std")]
 fn exp(val: f32) -> f32 {
     val.exp()
@@ -364,31 +363,12 @@ fn encode_stops(
             clamp(right_stop.color.premultiply().components)
         };
 
-        // We calculate a bias and scale factor, such that we can simply calculate
-        // bias + x * scale to get the interpolated color, where x is between x0 and x1,
-        // to calculate the resulting color.
-        // At a repeated endpoint the final LUT sample takes the right-hand color.
-        if x0 == x1 {
-            return GradientRange {
-                x1,
-                bias: c1,
-                scale: [0.0; 4],
-                interpolation_alpha_space,
-            };
-        }
-        let x1_minus_x0 = (x1 - x0).max(NUDGE_VAL);
-        let mut scale = [0.0; 4];
-        let mut bias = c0;
-
-        for i in 0..4 {
-            scale[i] = (c1[i] - c0[i]) / x1_minus_x0;
-            bias[i] = c0[i] - x0 * scale[i];
-        }
-
         GradientRange {
+            x0,
             x1,
-            bias,
-            scale,
+            // The last sample at a repeated endpoint takes its right-hand color.
+            bias: if x0 == x1 { c1 } else { c0 },
+            scale: core::array::from_fn(|i| c1[i] - c0[i]),
             interpolation_alpha_space,
         }
     };
@@ -881,13 +861,13 @@ impl BitEq for GradientCacheKey {
 /// An encoded range between two color stops.
 #[derive(Debug, Clone)]
 pub struct GradientRange {
+    /// The start value of the range.
+    pub x0: f32,
     /// The end value of the range.
     pub x1: f32,
-    /// A bias to apply when interpolating the color (in this case just the values of the start
-    /// color of the gradient).
+    /// Color at the start of the range.
     pub bias: [f32; 4],
-    /// The scale factors of the range. By calculating bias + x * factors (where x is
-    /// between 0.0 and 1.0), we can interpolate between start and end color of the gradient range.
+    /// Difference between the end and start colors.
     pub scale: [f32; 4],
     /// The alpha space in which the interpolation was performed.
     pub interpolation_alpha_space: InterpolationAlphaSpace,
@@ -1114,15 +1094,21 @@ impl<T: GradientLutExt> GradientLut<T> {
             ramps
         };
 
-        let inv_lut_scale = f32x4::splat(simd, 1.0 / scale);
-        let add_factor = f32x4::from_slice(simd, &[0.0, 1.0, 2.0, 3.0]) * inv_lut_scale;
-
         for (ramp_range, range) in ramps {
+            let start = f64::from(range.x0);
+            let width = f64::from(range.x1) - start;
             let biases = f32x16::block_splat(f32x4::from_slice(simd, &range.bias));
             let scales = f32x16::block_splat(f32x4::from_slice(simd, &range.scale));
 
             ramp_range.clone().step_by(4).for_each(|idx| {
-                let t_vals = f32x4::splat(simd, idx as f32).mul_add(inv_lut_scale, add_factor);
+                let samples: [f32; 4] = core::array::from_fn(|lane| {
+                    if width == 0.0 {
+                        0.0
+                    } else {
+                        (((idx + lane) as f64 / f64::from(scale) - start) / width) as f32
+                    }
+                });
+                let t_vals = f32x4::from_slice(simd, &samples);
 
                 let t_vals = element_wise_splat(simd, t_vals);
 
@@ -1337,6 +1323,38 @@ mod tests {
         assert_eq!(lut[1], [0, 0, 0, 255]);
         assert_eq!(lut[2], [255; 4]);
         assert_eq!(lut[4095], [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn steep_ramp_keeps_fractional_sample_position() {
+        use crate::fearless_simd::Level;
+        let boundary = 2048.5_f32 / 4096.;
+        let stops = [
+            (0., 0.),
+            (boundary, 0.),
+            (f32::from_bits(boundary.to_bits() + 2), 1.),
+            (1., 1.),
+        ];
+        let gradient = Gradient {
+            stops: ColorStops(
+                stops
+                    .map(|(offset, g)| ColorStop {
+                        offset,
+                        color: Color::new([g, g, g, 1.]).into(),
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Gradient::new_linear((0., 0.), (1., 0.))
+        };
+        let mut paints = vec![];
+        gradient.encode_into(&mut paints, Affine::IDENTITY, None);
+        let [EncodedPaint::Gradient(encoded)] = paints.as_slice() else {
+            panic!()
+        };
+        let lut = crate::fearless_simd::dispatch!(Level::new(), simd => encoded.u8_lut(simd).lut().to_vec());
+        assert_eq!(lut.len(), 4096);
+        assert_eq!(lut[2048], [64, 64, 64, 255]);
     }
 
     #[test]
