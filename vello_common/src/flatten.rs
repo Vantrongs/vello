@@ -248,6 +248,18 @@ pub(crate) fn fill_path<S: Simd, const CLIP: bool>(
     replay
 }
 
+/// Pieces presented to the dash iterator, with hidden pieces marked for phase skipping.
+pub fn dash_pieces(
+    path: impl IntoIterator<Item = PathEl>,
+    style: &Stroke,
+    affine: Affine,
+    view: RectU16,
+) -> impl Iterator<Item = (PathEl, bool)> {
+    let scale = max_scale(affine);
+    let cull = Cull::in_path_space(affine, stroke_cull_rect(view, style, scale), scale);
+    SplitHuge::new(path, cull, true)
+}
+
 /// Flatten a stroked Bézier path into line segments.
 ///
 /// See the note about open subpaths and culling on [`fill`].
@@ -497,6 +509,34 @@ impl Callback for FlattenerCallback<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dash_pieces_mark_offscreen_curves() {
+        let mut path = kurbo::BezPath::new();
+        path.move_to((10., 10.));
+        path.line_to((20., 10.));
+        path.line_to((1000., 10.));
+        path.curve_to((2000., 20.), (3000., 50.), (1e7, 30.));
+        let style = Stroke::new(2.).with_dashes(0., [2., 2.]);
+        let mut visible = false;
+        let mut curves = 0;
+        for (el, hidden) in dash_pieces(
+            &path,
+            &style,
+            Affine::IDENTITY,
+            RectU16::new(0, 0, 100, 100),
+        ) {
+            if el == PathEl::LineTo((20., 10.).into()) {
+                assert!(!hidden);
+                visible = true;
+            }
+            if matches!(el, PathEl::CurveTo(..)) {
+                assert!(hidden);
+                curves += 1;
+            }
+        }
+        assert!(visible && curves > 0);
+    }
 
     #[test]
     fn stroke_edges_match_one_pass_fill_of_the_outline() {
