@@ -61,57 +61,78 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
         dashes.len()
     };
 
-    let max_entry = dashes.iter().copied().fold(0., f64::max);
-    let scale = crate::flatten::max_scale(affine);
-    let mut pattern: Vec<Entry> = Vec::new();
-    let mut end = 0.;
-    let mut ix = 0;
-    while ix < entries {
-        let start = end;
-        let length = dashes[ix % dashes.len()];
-        let mut active = ix.is_multiple_of(2);
-        let mut count = 1;
-        let tiny = |length: f64| length * scale < 1. / DENSE_ENTRIES_PER_PX;
-        end += length;
-        if tiny(length) {
-            let mut paints = active && (length > 0. || paints_dots);
-            while ix + count < entries && tiny(dashes[(ix + count) % dashes.len()]) {
-                let next = dashes[(ix + count) % dashes.len()];
-                paints |= (ix + count).is_multiple_of(2) && (next > 0. || paints_dots);
-                end += next;
-                count += 1;
-            }
-            if count > 1 {
-                active = paints;
+    // Start at a painted dash so gaps meeting across the period boundary are
+    // adjacent in the iterator. Restore the original phase below.
+    let first = if paints_dots {
+        Some(0)
+    } else {
+        (0..entries)
+            .step_by(2)
+            .find(|i| dashes[i % dashes.len()] > 0.)
+    };
+    let first_ix = first.unwrap_or(0);
+    let phase_shift: f64 = dashes.iter().cycle().take(first_ix).sum();
+    let mut raw = (first_ix..entries)
+        .chain(0..first_ix)
+        .filter_map(|ix| {
+            let length = dashes[ix % dashes.len()];
+            let active = ix.is_multiple_of(2);
+            (!active || length > 0. || paints_dots).then_some((length, active))
+        })
+        .peekable();
+    let mut max_entry = 0.0_f64;
+    let mut runs = core::iter::from_fn(|| {
+        let (mut length, active) = raw.next()?;
+        if !active {
+            while let Some((gap, _)) = raw.next_if(|(_, active)| !active) {
+                length += gap;
             }
         }
+        max_entry = max_entry.max(length);
+        Some((length, active))
+    })
+    .peekable();
+
+    let scale = crate::flatten::max_scale(affine);
+    let tiny = |length: f64| length * scale < 1. / DENSE_ENTRIES_PER_PX;
+    let mut pattern: Vec<Entry> = Vec::new();
+    let mut end = 0.;
+    while let Some((mut length, mut active)) = runs.next() {
+        if tiny(length) {
+            while let Some((next, paints)) = runs.next_if(|(next, _)| tiny(*next)) {
+                length += next;
+                active |= paints;
+            }
+        }
+        end += length;
         if !meter.room(&mut pattern, 1) {
             break;
         }
         pattern.push(Entry {
-            length: if count == 1 { length } else { end - start },
+            length,
             end,
             active,
         });
-        ix += count;
     }
     let period = end;
-    let offset = if pattern.is_empty() {
-        0.
+    let (dash_ix, dash_remaining) = if pattern.is_empty() {
+        (0, 0.)
     } else {
-        dash_offset.rem_euclid(period)
+        let offset = dash_offset.rem_euclid(period) - phase_shift;
+        if offset < 0. {
+            // The phase lies in the gap wrapped to the end. Adding a long
+            // period here could round the remaining gap away.
+            (pattern.len() - 1, -offset)
+        } else {
+            let ix = pattern.partition_point(|e| e.end < offset);
+            (ix, pattern[ix].end - offset)
+        }
     };
-    let dash_ix = pattern.partition_point(|e| e.end < offset);
-    let dash_remaining = pattern.get(dash_ix).map_or(0., |e| e.end - offset);
     let is_active = pattern.get(dash_ix).is_some_and(|e| e.active);
     DashIterator {
         inner,
         meter,
-        input_done: valid
-            && !paints_dots
-            && (0..entries)
-                .step_by(2)
-                .all(|i| dashes[i % dashes.len()] == 0.),
+        input_done: valid && first.is_none(),
         closepath_pending: false,
         dashes: pattern,
         dash_ix,
@@ -698,7 +719,7 @@ mod tests {
             false,
             Meter::default(),
         );
-        assert_eq!(dashed.dashes.len(), 3);
+        assert_eq!(dashed.dashes.len(), 2);
         let mut start = 0.;
         let mut lines = 0;
         for el in dashed {

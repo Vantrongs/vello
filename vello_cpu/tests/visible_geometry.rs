@@ -856,3 +856,41 @@ fn dense_zero_length_dashes_respect_caps() {
         }
     }
 }
+
+#[test]
+fn zero_length_butt_dashes_join_subpixel_gaps() {
+    use vello_cpu::kurbo::{Cap, Stroke};
+    let mut pattern = vec![1. / 64., 1. / 64.];
+    for _ in 0..1024 {
+        pattern.extend([0., 1. / 64.]);
+    }
+    pattern.extend([2., 32.]);
+    let pixels = draw(|ctx| {
+        let mut path = BezPath::new();
+        path.move_to((2., 4.));
+        path.line_to((80., 4.));
+        ctx.set_stroke(
+            Stroke::new(3.)
+                .with_caps(Cap::Butt)
+                .with_dashes(0., pattern.as_slice()),
+        );
+        ctx.stroke_path(&path);
+    });
+    assert_eq!(pixels[4 * 100 + 10], 0);
+    assert_eq!(pixels[4 * 100 + 19], 255);
+}
+
+#[test]
+fn leading_butt_gap_survives_a_long_period() {
+    use vello_cpu::kurbo::{Cap, Stroke};
+    let pixels = draw(|ctx| {
+        ctx.set_stroke(
+            Stroke::new(3.)
+                .with_caps(Cap::Butt)
+                .with_dashes(0., [0., 4., 1e20, 8.]),
+        );
+        ctx.stroke_path(&vello_cpu::kurbo::Line::new((2., 4.), (80., 4.)).to_path(0.1));
+    });
+    assert_eq!(pixels[4 * 100 + 3], 0);
+    assert_eq!(pixels[4 * 100 + 6], 255);
+}
