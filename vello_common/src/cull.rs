@@ -30,10 +30,6 @@ use alloc::vec::Vec;
 /// thousand lines at most.
 pub(crate) const SPLIT_EXTENT: f64 = 131_072.0;
 
-/// Halvings after which a piece that still crosses the view is drawn as its chord:
-/// 2^128 pixels is beyond any `f32` coordinate under a sane transform.
-const MAX_DEPTH: u32 = 128;
-
 /// Splits of one segment after which its remaining pieces are drawn as chords.
 const MAX_SPLITS: u32 = 4096;
 
@@ -176,8 +172,8 @@ pub(crate) struct SplitHuge<'a, I> {
     pass_extent: f64,
     start: Point,
     last: Point,
-    /// Pieces still to emit with their depth, the next one on top.
-    stack: Vec<(PathSeg, u32)>,
+    /// Pieces still to emit, the next one on top.
+    stack: Vec<PathSeg>,
     line_pieces: smallvec::SmallVec<[(PathEl, bool); 5]>,
     splits: u32,
     /// A piece being emitted as a polyline: the lines out so far and their number.
@@ -255,9 +251,9 @@ impl<'a, I: Iterator<Item = PathEl>> SplitHuge<'a, I> {
 
     /// The element for `seg` (a segment at depth 0, else a piece of one), or `None`
     /// once its halves are on the stack or its polyline has begun.
-    fn piece(&mut self, seg: PathSeg, depth: u32) -> Option<(PathEl, bool)> {
+    fn piece(&mut self, seg: PathSeg, original: bool) -> Option<(PathEl, bool)> {
         let b = self.cull.device_box(&seg);
-        if depth == 0 && !exceeds(b, self.pass_extent) && !self.cull.too_large(&seg) {
+        if original && !exceeds(b, self.pass_extent) && !self.cull.too_large(&seg) {
             return Some((seg_to_el(&seg), false));
         }
         if let PathSeg::Line(line) = seg
@@ -288,7 +284,11 @@ impl<'a, I: Iterator<Item = PathEl>> SplitHuge<'a, I> {
             self.polyline = Some((seg, 0, n));
             return None;
         }
-        if depth >= MAX_DEPTH || self.splits >= MAX_SPLITS {
+        if self.splits >= MAX_SPLITS {
+            if self.keep_hidden {
+                self.split_dash_line(Line::new(seg.start(), seg.end()));
+                return self.line_pieces.pop();
+            }
             return Some((PathEl::LineTo(seg.end()), false));
         }
         self.splits += 1;
@@ -296,8 +296,8 @@ impl<'a, I: Iterator<Item = PathEl>> SplitHuge<'a, I> {
         if !self.cull.meter.room(&mut self.stack, 2) {
             return None;
         }
-        self.stack.push((b, depth + 1));
-        self.stack.push((a, depth + 1));
+        self.stack.push(b);
+        self.stack.push(a);
         None
     }
 }
@@ -324,8 +324,8 @@ impl<I: Iterator<Item = PathEl>> Iterator for SplitHuge<'_, I> {
                 };
                 return Some((PathEl::LineTo(p), false));
             }
-            if let Some((seg, depth)) = self.stack.pop() {
-                match self.piece(seg, depth) {
+            if let Some(seg) = self.stack.pop() {
+                match self.piece(seg, false) {
                     Some(el) => return Some(el),
                     None => continue,
                 }
@@ -373,7 +373,7 @@ impl<I: Iterator<Item = PathEl>> Iterator for SplitHuge<'_, I> {
             };
             self.splits = 0;
             self.polyline_left = MAX_POLYLINE;
-            if let Some(el) = self.piece(seg, 0) {
+            if let Some(el) = self.piece(seg, true) {
                 return Some(el);
             }
         }

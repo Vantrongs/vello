@@ -320,7 +320,11 @@ struct Clip<'a, S, C> {
 
 impl<S: Simd, C: Callback> Clip<'_, S, C> {
     fn eval(&self, t: f64) -> Point {
-        (self.seg.eval(t).to_vec2() * self.divisor).to_point()
+        let p = self.seg.eval(t).to_vec2() * self.divisor;
+        Point::new(
+            p.x.clamp(-f64::MAX, f64::MAX),
+            p.y.clamp(-f64::MAX, f64::MAX),
+        )
     }
 
     /// Draws the piece of the segment over `t0..t1`, monotone in x and y, from `p0`
@@ -528,6 +532,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn finite_quadratic_band_reaches_the_left_edge() {
+        let seg = PathSeg::Quad(crate::kurbo::QuadBez::new(
+            (-f64::MAX, -10.),
+            (-f64::MAX, 40.),
+            (-f64::MAX, 110.),
+        ));
+        let mut out = CheckedOutput {
+            at: seg.start(),
+            lines: 0,
+        };
+        let mut ctx = FlattenCtx::default();
+        let rect = [0., 0., 100., 100.];
+        dispatch!(Level::new(), simd => {
+            let clip = Clip {
+                simd, rect, out: Out {callback: &mut out, at: None}, ctx: &mut ctx,
+                seg: crate::kurbo::Affine::scale(1. / 16.) * seg, divisor: 16.,
+            };
+            assert_eq!(clip.eval(0.059).x, -f64::MAX);
+            flatten_seg(simd, seg, rect, &mut out, &mut ctx);
+        });
+        assert_eq!(out.lines, 1);
     }
 
     fn checked(c: CubicBez) -> usize {

@@ -311,7 +311,14 @@ pub(crate) fn stroke_metered(
         expand_stroke(path, style, tolerance, stroke_ctx);
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, meter);
+        let dashed = crate::dash::dash(
+            path,
+            style.dash_offset,
+            &style.dash_pattern,
+            affine,
+            style.start_cap != kurbo::Cap::Butt || style.end_cap != kurbo::Cap::Butt,
+            meter,
+        );
         let solid = Stroke {
             dash_pattern: kurbo::Dashes::new(),
             width: style.width,

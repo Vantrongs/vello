@@ -819,3 +819,40 @@ fn padded_gradient_uses_last_repeated_stop() {
         );
     }
 }
+
+#[test]
+fn subnormal_hairline_preserves_coverage() {
+    use vello_cpu::kurbo::{Cap, Stroke};
+    let render = |start, end, y, width, scale| {
+        draw(|ctx| {
+            let mut path = BezPath::new();
+            path.move_to((start, y));
+            path.line_to((end, y));
+            ctx.set_transform(Affine::scale(scale));
+            ctx.set_stroke(Stroke::new(width).with_caps(Cap::Butt));
+            ctx.stroke_path(&path);
+        })
+    };
+    let reference = render(0.1, 0.5, 2.5, 0.8, 1.);
+    assert!(reference[200] > 0);
+    assert!(render(1e-309, 5e-309, 2.5e-308, 8e-309, 1e308) == reference);
+}
+
+#[test]
+fn dense_zero_length_dashes_respect_caps() {
+    use vello_cpu::kurbo::{Cap, Stroke};
+    for cap in [Cap::Butt, Cap::Round, Cap::Square] {
+        let pixels = draw(|ctx| {
+            let mut path = BezPath::new();
+            path.move_to((2., 4.));
+            path.line_to((80., 4.));
+            ctx.set_stroke(Stroke::new(3.).with_caps(cap).with_dashes(0., [0., 0.01]));
+            ctx.stroke_path(&path);
+        });
+        if cap == Cap::Butt {
+            assert!(pixels.iter().all(|&alpha| alpha == 0));
+        } else {
+            assert_eq!(pixels[4 * 100 + 40], 255);
+        }
+    }
+}

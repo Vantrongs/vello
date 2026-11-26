@@ -37,6 +37,7 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
     dash_offset: f64,
     dashes: &[f64],
     affine: Affine,
+    paints_dots: bool,
     meter: Meter<'a>,
 ) -> DashIterator<'a, T> {
     // Ensure that offset is positive and minimal by normalization using period
@@ -70,14 +71,19 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
         let length = dashes[ix % dashes.len()];
         let mut active = ix.is_multiple_of(2);
         let mut count = 1;
-        let tiny = |length: f64| length > 0. && length * scale < 1. / DENSE_ENTRIES_PER_PX;
+        let tiny = |length: f64| length * scale < 1. / DENSE_ENTRIES_PER_PX;
         end += length;
         if tiny(length) {
+            let mut paints = active && (length > 0. || paints_dots);
             while ix + count < entries && tiny(dashes[(ix + count) % dashes.len()]) {
-                end += dashes[(ix + count) % dashes.len()];
+                let next = dashes[(ix + count) % dashes.len()];
+                paints |= (ix + count).is_multiple_of(2) && (next > 0. || paints_dots);
+                end += next;
                 count += 1;
             }
-            active |= count > 1;
+            if count > 1 {
+                active = paints;
+            }
         }
         if !meter.room(&mut pattern, 1) {
             break;
@@ -101,7 +107,11 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
     DashIterator {
         inner,
         meter,
-        input_done: false,
+        input_done: valid
+            && !paints_dots
+            && (0..entries)
+                .step_by(2)
+                .all(|i| dashes[i % dashes.len()] == 0.),
         closepath_pending: false,
         dashes: pattern,
         dash_ix,
@@ -300,7 +310,14 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
         if skip {
             // Relative accuracy: kurbo's absolute 1e-6 on a huge segment recurses to
             // its depth limit for nothing.
-            let len = arc_length(&seg, DASH_ACCURACY.max(1e-9 * control_length(&seg)));
+            let extent = control_length(&seg);
+            // Kurbo's curve arclength uses products of squared coordinates.
+            let len = if extent > 1e70 && extent.is_finite() && !matches!(seg, PathSeg::Line(_)) {
+                let normalized = Affine::scale(extent.recip()) * seg;
+                normalized.arclen(1e-9) * extent
+            } else {
+                arc_length(&seg, DASH_ACCURACY.max(1e-9 * extent))
+            };
             self.hidden_crossed = len > self.dash_remaining;
             self.seg_remaining = self.less_whole_periods(len);
             if let PathSeg::Line(line) = seg {
@@ -335,7 +352,9 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
                 self.max_entry * crate::flatten::max_scale(self.affine) < 1. / DENSE_ENTRIES_PER_PX
             }
         };
-        if all_tiny {
+        // If even the largest transition rounds away, a full period cannot
+        // advance the remaining length. Consume its phase in one step.
+        if all_tiny || len - self.max_entry == len {
             self.dense = Some(Solid::Start);
             self.seg_remaining = self.less_whole_periods(len);
         } else {
@@ -591,6 +610,7 @@ mod tests {
                     0.,
                     pattern,
                     Affine::IDENTITY,
+                    true,
                     Meter::default()
                 )
                 .eq(path)
@@ -606,7 +626,15 @@ mod tests {
     fn mine(path: &BezPath, offset: f64, dashes: &[f64], rect: [f64; 4]) -> Vec<PathEl> {
         let split = SplitHuge::new(path.iter(), Cull::new(Affine::IDENTITY, rect), true);
         starts_with_a_move(
-            dash(split, offset, dashes, Affine::IDENTITY, Meter::default()).collect(),
+            dash(
+                split,
+                offset,
+                dashes,
+                Affine::IDENTITY,
+                true,
+                Meter::default(),
+            )
+            .collect(),
         )
     }
 
@@ -621,6 +649,70 @@ mod tests {
 
     fn kurbo(path: &BezPath, offset: f64, dashes: &[f64]) -> Vec<PathEl> {
         crate::kurbo::dash(path.iter(), offset, dashes).collect()
+    }
+
+    #[test]
+    fn visible_quadratic_stays_curved_and_bounded_before_dashing() {
+        let mut path = BezPath::new();
+        path.move_to((0., 0.));
+        path.quad_to((1e80, 0.), (0., 1e160));
+        let pieces: Vec<_> =
+            SplitHuge::new(path.iter(), Cull::new(Affine::IDENTITY, VIEW), true).collect();
+        assert!(pieces.len() < 1024);
+        let mut curved = false;
+        for &(el, hidden) in &pieces {
+            if !hidden {
+                let end = el.end_point().unwrap();
+                assert!(end.x.abs() <= 200. && end.y.abs() <= 200.);
+                curved |= matches!(el, PathEl::QuadTo(..));
+            }
+        }
+        assert!(curved);
+        let count = dash(
+            pieces.into_iter(),
+            0.,
+            &[8., 8.],
+            Affine::IDENTITY,
+            false,
+            Meter::default(),
+        )
+        .take(4096)
+        .count();
+        assert!((2..4096).contains(&count));
+    }
+
+    #[test]
+    fn tiny_zero_dashes_share_one_gap_per_period() {
+        let mut pattern = [0., 2_f64.powi(-30)].repeat(65536);
+        pattern.extend([1., 1.]);
+        let gap = 2_f64.powi(-14);
+        let path = [
+            PathEl::MoveTo(Point::ZERO),
+            PathEl::LineTo(Point::new(65535., 0.)),
+        ];
+        let dashed = dash(
+            path.map(|el| (el, false)).into_iter(),
+            0.,
+            &pattern,
+            Affine::IDENTITY,
+            false,
+            Meter::default(),
+        );
+        assert_eq!(dashed.dashes.len(), 3);
+        let mut start = 0.;
+        let mut lines = 0;
+        for el in dashed {
+            match el {
+                PathEl::MoveTo(p) => start = p.x,
+                PathEl::LineTo(p) => {
+                    assert!((start - (gap + f64::from(lines) * (2. + gap))).abs() < 1e-6);
+                    assert!((p.x - (start + 1.).min(65535.)).abs() < 1e-6);
+                    lines += 1;
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(lines, ((65535. - gap) / (2. + gap)).ceil() as i32);
     }
 
     #[test]
@@ -646,7 +738,14 @@ mod tests {
             core::array::from_fn(|i| on_dash(&lines, Point::new(i as f64 + 0.5, 0.)));
         let mut rows = alloc::vec![[false;7]; subpaths as usize];
         let mut at = Point::ORIGIN;
-        for el in dash(input, 0.25, &pattern, Affine::IDENTITY, Meter::default()) {
+        for el in dash(
+            input,
+            0.25,
+            &pattern,
+            Affine::IDENTITY,
+            true,
+            Meter::default(),
+        ) {
             match el {
                 PathEl::LineTo(p) => {
                     for (i, pixel) in rows[p.y as usize].iter_mut().enumerate() {
@@ -677,7 +776,14 @@ mod tests {
         });
         let mut at = Point::ORIGIN;
         let mut seen = [false; 8192];
-        for el in dash(input, 0., &pattern, Affine::IDENTITY, Meter::default()) {
+        for el in dash(
+            input,
+            0.,
+            &pattern,
+            Affine::IDENTITY,
+            true,
+            Meter::default(),
+        ) {
             match el {
                 PathEl::MoveTo(p) => at = p,
                 PathEl::LineTo(p) => {
@@ -816,7 +922,16 @@ mod tests {
             let pieces = || SplitHuge::new(path.iter(), Cull::new(Affine::IDENTITY, VIEW), true);
             assert!(pieces().count() <= 4, "2^{exp}");
             assert!(
-                dash(pieces(), 0., &[7., 3.], Affine::IDENTITY, Meter::default()).count() <= 26,
+                dash(
+                    pieces(),
+                    0.,
+                    &[7., 3.],
+                    Affine::IDENTITY,
+                    true,
+                    Meter::default()
+                )
+                .count()
+                    <= 26,
                 "2^{exp}"
             );
         }
@@ -917,6 +1032,7 @@ mod tests {
                 0.0,
                 &dashes,
                 Affine::IDENTITY,
+                true,
                 Meter::default(),
             )
             .collect(),
@@ -958,7 +1074,8 @@ mod tests {
         p.line_to((0.0, 100.0));
         let wide = Cull::new(affine, [-1e6, -1e6, 1e6, 1e6]);
         let split = SplitHuge::new(p.iter(), wide, true);
-        let a = starts_with_a_move(dash(split, 1.5, &dashes, affine, Meter::default()).collect());
+        let a =
+            starts_with_a_move(dash(split, 1.5, &dashes, affine, true, Meter::default()).collect());
         // Starting inside a dash (offset 1.5 < 3), the first line is one stroke (out
         // last: kurbo holds a subpath's first dash back to join a closing one).
         let whole = [
@@ -972,7 +1089,8 @@ mod tests {
         same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
         // Starting in a gap (offset 4), the first line still is one stroke.
         let split = SplitHuge::new(p.iter(), wide, true);
-        let a = starts_with_a_move(dash(split, 4.0, &dashes, affine, Meter::default()).collect());
+        let a =
+            starts_with_a_move(dash(split, 4.0, &dashes, affine, true, Meter::default()).collect());
         assert!(a.windows(2).any(|w| w == whole), "{a:?}");
         let b = kurbo(&p, 4.0, &dashes);
         same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);

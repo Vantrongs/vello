@@ -78,7 +78,14 @@ pub(super) fn hairline(
         crate::cull::flatten(path, tolerance, cull, |el| sink.push(el));
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, meter);
+        let dashed = crate::dash::dash(
+            path,
+            style.dash_offset,
+            &style.dash_pattern,
+            affine,
+            style.start_cap != kurbo::Cap::Butt || style.end_cap != kurbo::Cap::Butt,
+            meter,
+        );
         crate::cull::flatten(dashed, tolerance, cull, |el| sink.push(el));
     }
     sink.end_subpath(false);
@@ -160,9 +167,19 @@ impl HairlineSink<'_> {
         if p == self.last || !self.meter.room(self.left, 3) || !self.meter.room(self.right, 3) {
             return;
         }
-        let v = p - self.last;
+        let mut v = p - self.last;
         let len = v.x.hypot(v.y);
-        let d = Dir { u: v / len, len };
+        let norm = if len.is_infinite() {
+            // A quarter also leaves room for the diagonal norm.
+            v = p.to_vec2() * 0.25 - self.last.to_vec2() * 0.25;
+            v.x.hypot(v.y)
+        } else {
+            len
+        };
+        let d = Dir {
+            u: kurbo::Vec2::new(v.x / norm, v.y / norm),
+            len,
+        };
         match self.prev {
             None => {
                 let n = self.normal(d);
