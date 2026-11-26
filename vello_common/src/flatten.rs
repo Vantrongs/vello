@@ -311,8 +311,7 @@ pub(crate) fn stroke_metered(
         expand_stroke(path, style, tolerance, stroke_ctx);
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let mut dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine);
-        dashed.meter = meter;
+        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, meter);
         let solid = Stroke {
             dash_pattern: kurbo::Dashes::new(),
             width: style.width,
@@ -335,9 +334,10 @@ const HAIRLINE_MAX_WIDTH: f64 = 1.0;
 /// `cull_bbox` widened by how far a stroke's outline reaches from its path, in device
 /// pixels: half the width times the miter limit for miter joins, else times √2 (square
 /// caps; the hairline joins that take the miter tip turn by at most 90°), plus a pixel
-/// for the flattening tolerance.
+/// for the flattening tolerance. Dashing retains endpoint joins on skipped
+/// pieces, so its margin only has to cover caps.
 fn stroke_cull_rect(cull_bbox: RectU16, style: &Stroke, scale: f64) -> [f64; 4] {
-    let miter = if style.join == kurbo::Join::Miter {
+    let miter = if style.join == kurbo::Join::Miter && style.dash_pattern.is_empty() {
         style.miter_limit
     } else {
         0.0
@@ -355,9 +355,12 @@ fn stroke_cull_rect(cull_bbox: RectU16, style: &Stroke, scale: f64) -> [f64; 4] 
 /// value).
 pub(crate) fn max_scale(affine: Affine) -> f64 {
     let [a, b, c, d, _, _] = affine.as_coeffs();
-    let t = a * a + b * b + c * c + d * d;
-    let det = a * d - b * c;
-    (0.5 * (t + (t * t - 4.0 * det * det).max(0.0).sqrt())).sqrt()
+    let m = a.abs().max(b.abs()).max(c.abs()).max(d.abs());
+    if m == 0. {
+        return 0.;
+    }
+    let (a, b, c, d) = (a / m, b / m, c / m, d / m);
+    m * (0.5 * ((a + d).hypot(b - c) + (a - d).hypot(b + c)))
 }
 
 /// Expand a stroked path to a filled path.
@@ -370,8 +373,7 @@ pub fn expand_stroke(
     kurbo::stroke_with(path, style, &StrokeOpts::default(), tolerance, stroke_ctx);
 }
 
-/// The metered API exposes bounded edges to its caller. Raw flattening also
-/// supports tile binning, which can consume ordinary offscreen endpoints directly.
+/// Clip a directed edge before narrowing its device coordinates.
 fn emit_edge(
     lines: &mut Vec<Line>,
     meter: Meter<'_>,
@@ -386,7 +388,7 @@ fn emit_edge(
             lines.push(Line::new(p.into(), q.into()));
         }
     };
-    if meter.0.is_some() && !(inside(a) && inside(b)) {
+    if !(inside(a) && inside(b)) {
         if a.is_finite() && b.is_finite() {
             crate::fill_clip::directed_line(a, b, rect, push);
         }
@@ -435,7 +437,11 @@ impl Callback for FlattenerCallback<'_> {
             LinePathEl::LineTo(p) => {
                 self.is_nan |= p.is_nan();
 
-                emit_edge(self.line_buf, self.meter, self.rect, self.p0, p);
+                if self.meter.0.is_some() {
+                    emit_edge(self.line_buf, self.meter, self.rect, self.p0, p);
+                } else {
+                    self.line_buf.push(Line::new(self.p0.into(), p.into()));
+                }
                 self.p0 = p;
             }
         }

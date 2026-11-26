@@ -4,18 +4,10 @@
 //! Dashing as in `kurbo::dash` (kurbo 0.13.1 `stroke.rs`, `DashIterator`), copied so
 //! its work stays bounded by the view:
 //!
-//! - A piece of a segment outside the view (flagged by `cull::SplitHuge`) is replaced
-//!   by its chord, drawn solid: its whole dash periods are skipped in one step, and
-//!   it paints nothing in view whatever its dashes. Kurbo walks every dash, so a
-//!   dashed segment with huge coordinates took time in proportion to its length.
-//! - A segment along which dashes and gaps (the pattern's entries walked) average
-//!   under `1 / DENSE_ENTRIES_PER_PX` device pixels, or beyond the `PATH_ENTRIES` a
-//!   path may walk, is drawn solid, its dash phase carried on as if dashed. Kurbo
-//!   emits every dash, so a pattern far finer than a pixel (a tiny scale, a transform
-//!   that compresses one direction, or many tiny entries) emitted dashes in
-//!   proportion to the inverse of their device size. `MuPDF` draws such patterns
-//!   solid too, below half a pixel per period at the transform's largest stretch
-//!   (1.28 `draw-path.c`, `do_flatten_stroke`).
+//! - Outside the cap margin, only the joins at a piece's endpoints can
+//!   reach the view. Skip its interior and preserve the phase and tangents.
+//! - Runs of subpixel entries are coalesced. A whole pattern can also become
+//!   subpixel along a compressed direction. Skipped lengths retain their phase.
 //!
 //! Every other segment is dashed exactly as kurbo does.
 
@@ -29,28 +21,23 @@ use alloc::vec::Vec;
 
 const DASH_ACCURACY: f64 = 1e-6;
 
-/// Pattern entries (dashes and gaps) per device pixel, on average along a segment,
-/// beyond which the segment is drawn solid: for a pattern of a dash and a gap, a
-/// period under a sixteenth of a pixel. Such dashes are a fine texture no output
-/// resolves, and drawing them all could take any amount of memory. Entries, not
-/// periods, are counted: each is an element out, and a period can hold any number.
-pub const DENSE_ENTRIES_PER_PX: f64 = 32.0;
+const DENSE_ENTRIES_PER_PX: f64 = 32.0;
 
-/// Pattern entries one path may walk; segments beyond are drawn solid. Segments
-/// larger than the view are split and their hidden pieces skipped (`cull::SplitHuge`),
-/// so drawings stay far below this; it bounds the dashes of a path whose geometry is
-/// numerically noisy (coordinates near the limits of `f64` under a nearly singular
-/// transform), whose split pieces can each look long on the device. A dash and its
-/// gap take about 64 bytes as a thin outline and 300 as an expanded one.
-const PATH_ENTRIES: f64 = (1 << 22) as f64;
+#[derive(Clone, Copy)]
+struct Entry {
+    length: f64,
+    end: f64,
+    active: bool,
+}
 
 /// Dashes `inner` like `kurbo::dash`, skipping the dash periods of the segments
 /// flagged `true`; `affine` maps the path to device space.
 pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
     inner: T,
     dash_offset: f64,
-    dashes: &'a [f64],
+    dashes: &[f64],
     affine: Affine,
+    meter: Meter<'a>,
 ) -> DashIterator<'a, T> {
     // Ensure that offset is positive and minimal by normalization using period
     let period: f64 = dashes.iter().sum();
@@ -67,36 +54,56 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
         && dash_offset.is_finite()
         && dashes.iter().all(|&d| d.is_finite() && d >= 0.0);
     let dashes = if valid { dashes } else { &[] };
-    let dash_offset = if valid {
-        dash_offset.rem_euclid(period)
-    } else {
-        0.0
-    };
     let entries = if dashes.len() % 2 == 1 {
         2 * dashes.len()
     } else {
         dashes.len()
     };
 
-    let mut dash_ix = 0;
-    let mut dash_remaining = dashes.first().copied().unwrap_or_default() - dash_offset;
-    let mut is_active = true;
-    // Find place in dashes array for initial offset.
-    for _ in 0..entries {
-        if dash_remaining >= 0.0 {
+    let max_entry = dashes.iter().copied().fold(0., f64::max);
+    let scale = crate::flatten::max_scale(affine);
+    let mut pattern: Vec<Entry> = Vec::new();
+    let mut end = 0.;
+    let mut ix = 0;
+    while ix < entries {
+        let start = end;
+        let length = dashes[ix % dashes.len()];
+        let mut active = ix.is_multiple_of(2);
+        let mut count = 1;
+        let tiny = |length: f64| length > 0. && length * scale < 1. / DENSE_ENTRIES_PER_PX;
+        end += length;
+        if tiny(length) {
+            while ix + count < entries && tiny(dashes[(ix + count) % dashes.len()]) {
+                end += dashes[(ix + count) % dashes.len()];
+                count += 1;
+            }
+            active |= count > 1;
+        }
+        if !meter.room(&mut pattern, 1) {
             break;
         }
-        dash_ix = (dash_ix + 1) % dashes.len();
-        dash_remaining += dashes[dash_ix];
-        is_active = !is_active;
+        pattern.push(Entry {
+            length: if count == 1 { length } else { end - start },
+            end,
+            active,
+        });
+        ix += count;
     }
-    let dash_remaining = dash_remaining.max(0.0);
+    let period = end;
+    let offset = if pattern.is_empty() {
+        0.
+    } else {
+        dash_offset.rem_euclid(period)
+    };
+    let dash_ix = pattern.partition_point(|e| e.end < offset);
+    let dash_remaining = pattern.get(dash_ix).map_or(0., |e| e.end - offset);
+    let is_active = pattern.get(dash_ix).is_some_and(|e| e.active);
     DashIterator {
         inner,
-        meter: Meter::default(),
+        meter,
         input_done: false,
         closepath_pending: false,
-        dashes,
+        dashes: pattern,
         dash_ix,
         init_dash_ix: dash_ix,
         init_dash_remaining: dash_remaining,
@@ -113,20 +120,23 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
         stash_ix: 0,
         needs_moveto: true,
         period,
-        entries_per_period: entries as f64,
+        max_entry,
         dense: None,
+        hidden: false,
+        hidden_crossed: false,
+        hidden_tail: None,
+        hidden_move: None,
         affine,
-        entries_left: PATH_ENTRIES,
     }
 }
 
 /// An implementation of dashing as an iterator-to-iterator transformation.
 pub(crate) struct DashIterator<'a, T> {
-    pub(crate) meter: Meter<'a>,
+    meter: Meter<'a>,
     inner: T,
     input_done: bool,
     closepath_pending: bool,
-    dashes: &'a [f64],
+    dashes: Vec<Entry>,
     dash_ix: usize,
     init_dash_ix: usize,
     init_dash_remaining: f64,
@@ -144,14 +154,15 @@ pub(crate) struct DashIterator<'a, T> {
     needs_moveto: bool,
     /// The length after which the dash state repeats.
     period: f64,
-    /// The pattern entries walked along `period`.
-    entries_per_period: f64,
+    max_entry: f64,
     /// Whether `current_seg` is drawn solid (`set_segment`), and if so how far it is
     /// out.
     dense: Option<Solid>,
+    hidden: bool,
+    hidden_crossed: bool,
+    hidden_tail: Option<Point>,
+    hidden_move: Option<Point>,
     affine: Affine,
-    /// Pattern entries the path may still walk (`PATH_ENTRIES`).
-    entries_left: f64,
 }
 
 /// How far a segment drawn solid is out.
@@ -177,6 +188,9 @@ impl<T: Iterator<Item = (PathEl, bool)>> Iterator for DashIterator<'_, T> {
     type Item = PathEl;
 
     fn next(&mut self) -> Option<PathEl> {
+        if self.meter.failed() {
+            return None;
+        }
         if self.dashes.is_empty() {
             return self.inner.next().map(|(el, _)| el);
         }
@@ -281,18 +295,13 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
         self.t = 0.0;
     }
 
-    /// Makes `seg` the current segment. One to `skip` (outside the view) is replaced
-    /// by its chord, drawn solid, with whole dash periods taken off its length: the
-    /// dash state after it is the same, and it paints nothing in view, as its control
-    /// box misses the view widened by the outline's reach. One whose dashes are too
-    /// dense (see the module) keeps its length less whole periods too, and is drawn
-    /// solid.
     fn set_segment(&mut self, seg: PathSeg, skip: bool) {
+        self.hidden = skip;
         if skip {
             // Relative accuracy: kurbo's absolute 1e-6 on a huge segment recurses to
             // its depth limit for nothing.
-            let len = seg.arclen(DASH_ACCURACY.max(1e-9 * control_length(&seg)));
-            self.dense = Some(Solid::Start);
+            let len = arc_length(&seg, DASH_ACCURACY.max(1e-9 * control_length(&seg)));
+            self.hidden_crossed = len > self.dash_remaining;
             self.seg_remaining = self.less_whole_periods(len);
             if let PathSeg::Line(line) = seg {
                 let axis = if line.p0.x == line.p1.x {
@@ -303,7 +312,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
                     None
                 };
                 if let Some((a, b)) = axis {
-                    let (main, tail) = crate::fill_clip::two_sum(b, -a);
+                    let (main, tail) = crate::expansion::two_sum(b, -a);
                     if tail != 0.0 && len > self.period + self.dash_remaining {
                         let phase = ((main.abs() % self.period)
                             + (main.signum() * tail % self.period)
@@ -313,21 +322,24 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
                     }
                 }
             }
-            self.current_seg = PathSeg::Line(Line::new(seg.start(), seg.end()));
+            self.current_seg = seg;
             return;
         }
-        let len = seg.arclen(DASH_ACCURACY);
+        let len = arc_length(&seg, DASH_ACCURACY);
         self.current_seg = seg;
-        let entries = len / self.period * self.entries_per_period;
-        if self.period > 0.0
-            && (entries > self.entries_left
-                || entries > DENSE_ENTRIES_PER_PX * self.device_length(&seg))
-        {
+        let all_tiny = match seg {
+            PathSeg::Line(_) => {
+                self.max_entry < len / self.device_length(&seg) / DENSE_ENTRIES_PER_PX
+            }
+            _ => {
+                self.max_entry * crate::flatten::max_scale(self.affine) < 1. / DENSE_ENTRIES_PER_PX
+            }
+        };
+        if all_tiny {
             self.dense = Some(Solid::Start);
             self.seg_remaining = self.less_whole_periods(len);
         } else {
             self.dense = None;
-            self.entries_left -= entries;
             self.seg_remaining = len;
         }
     }
@@ -336,7 +348,7 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
     /// walking it gives the dash state walking `len` would.
     fn less_whole_periods(&self, len: f64) -> f64 {
         let (dash, period) = (self.dash_remaining, self.period);
-        if !(period > 0.0 && len - dash > period) {
+        if len - dash <= period {
             return len;
         }
         // `len - dash` would round away the small remainder of a huge length: reduce
@@ -349,6 +361,99 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
         control_length(&(self.affine * *seg))
     }
 
+    fn advance_phase(&mut self) {
+        if self.seg_remaining > self.dash_remaining {
+            let end = self.dashes[self.dash_ix].end;
+            let advance = (self.seg_remaining - self.dash_remaining) % self.period;
+            let phase = if advance > self.period - end {
+                advance - (self.period - end)
+            } else {
+                end + advance
+            };
+            self.dash_ix = self.dashes.partition_point(|e| e.end < phase);
+            let entry = self.dashes[self.dash_ix];
+            self.dash_remaining = entry.end - phase;
+            self.is_active = entry.active;
+        } else {
+            self.dash_remaining -= self.seg_remaining;
+        }
+    }
+
+    // Only the joins at the ends of a hidden segment can reach past the cap
+    // margin. Keep their tangents and whether an on interval meets each end.
+    // Any caps on the disconnected tangent segments stay outside the view.
+    fn hidden_step(&mut self) -> Option<PathEl> {
+        if let Some(p) = self.hidden_move.take() {
+            if self.hidden_tail.is_none() {
+                self.get_input();
+            }
+            return Some(PathEl::MoveTo(p));
+        }
+        if let Some(p) = self.hidden_tail.take() {
+            self.get_input();
+            return Some(PathEl::LineTo(p));
+        }
+        let seg = self.current_seg;
+        let active = self.is_active;
+        let crossed = self.hidden_crossed;
+        let first_length = self.dash_remaining;
+        self.advance_phase();
+        if !crossed {
+            let result = active.then(|| crate::cull::seg_to_el(&seg));
+            self.get_input();
+            return result;
+        }
+        let points: &[Point] = match seg {
+            PathSeg::Line(l) => &[l.p0, l.p1],
+            PathSeg::Quad(q) => &[q.p0, q.p1, q.p2],
+            PathSeg::Cubic(c) => &[c.p0, c.p1, c.p2, c.p3],
+        };
+        let start = seg.start();
+        let end = seg.end();
+        // Long artificial tangents would also give the downstream stroke
+        // expander the length of the hidden segment rather than of the dash.
+        let tangent = |origin: Point, control: Point, length: f64| {
+            let v = control - origin;
+            let norm = v.x.hypot(v.y);
+            if norm <= length {
+                control
+            } else {
+                origin + crate::kurbo::Vec2::new(v.x / norm, v.y / norm) * length
+            }
+        };
+        let tail = if self.is_active {
+            self.hidden_tail = Some(end);
+            let control = points
+                .iter()
+                .rev()
+                .copied()
+                .find(|p| *p != end)
+                .unwrap_or(end);
+            tangent(
+                end,
+                control,
+                self.dashes[self.dash_ix].length - self.dash_remaining,
+            )
+        } else {
+            end
+        };
+        self.state = DashState::Working;
+        if active {
+            self.hidden_move = Some(tail);
+            let control = points
+                .iter()
+                .copied()
+                .find(|p| *p != start)
+                .unwrap_or(start);
+            Some(PathEl::LineTo(tangent(start, control, first_length)))
+        } else {
+            if self.hidden_tail.is_none() {
+                self.get_input();
+            }
+            Some(PathEl::MoveTo(tail))
+        }
+    }
+
     /// Move arc length forward to next event.
     fn step(&mut self) -> Option<PathEl> {
         let mut result = None;
@@ -359,6 +464,8 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             } else {
                 self.state = DashState::Working;
             }
+        } else if self.hidden {
+            return self.hidden_step();
         } else if let Some(solid) = self.dense {
             if solid == Solid::Stashed {
                 let end = self.current_seg.end();
@@ -373,19 +480,10 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
             result = Some(crate::cull::seg_to_el(&self.current_seg));
             let stashing = self.state == DashState::ToStash;
             // The dash state at its end, as walking it would leave it.
-            while self.dash_remaining < self.seg_remaining {
-                if self.is_active {
-                    self.state = DashState::Working;
-                }
-                self.is_active = !self.is_active;
-                self.seg_remaining -= self.dash_remaining;
-                self.dash_ix += 1;
-                if self.dash_ix == self.dashes.len() {
-                    self.dash_ix = 0;
-                }
-                self.dash_remaining = self.dashes[self.dash_ix];
+            if self.seg_remaining > self.dash_remaining {
+                self.state = DashState::Working;
             }
-            self.dash_remaining -= self.seg_remaining;
+            self.advance_phase();
             if stashing && self.state == DashState::Working && self.is_active {
                 self.dense = Some(Solid::Stashed);
             } else {
@@ -394,23 +492,29 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
         } else if self.dash_remaining < self.seg_remaining {
             // next transition is a dash transition
             let seg = self.current_seg.subsegment(self.t..1.0);
-            let t1 = seg.inv_arclen(self.dash_remaining, DASH_ACCURACY);
+            let t1 = if matches!(seg, PathSeg::Line(_)) {
+                self.dash_remaining / control_length(&seg)
+            } else {
+                seg.inv_arclen(self.dash_remaining, DASH_ACCURACY)
+            };
             if self.is_active {
                 let subseg = seg.subsegment(0.0..t1);
                 result = Some(crate::cull::seg_to_el(&subseg));
-                self.state = DashState::Working;
+                if !self.dashes[(self.dash_ix + 1) % self.dashes.len()].active {
+                    self.state = DashState::Working;
+                }
             } else {
                 let p = seg.eval(t1);
                 result = Some(PathEl::MoveTo(p));
             }
-            self.is_active = !self.is_active;
             self.t += t1 * (1.0 - self.t);
             self.seg_remaining -= self.dash_remaining;
             self.dash_ix += 1;
             if self.dash_ix == self.dashes.len() {
                 self.dash_ix = 0;
             }
-            self.dash_remaining = self.dashes[self.dash_ix];
+            self.dash_remaining = self.dashes[self.dash_ix].length;
+            self.is_active = self.dashes[self.dash_ix].active;
         } else {
             if self.is_active {
                 let seg = self.current_seg.subsegment(self.t..1.0);
@@ -447,10 +551,28 @@ impl<T: Iterator<Item = (PathEl, bool)>> DashIterator<'_, T> {
 
 /// The length of the control polygon of `seg`, at least its arc length.
 fn control_length(seg: &PathSeg) -> f64 {
+    let dist = |a: Point, b: Point| {
+        let v = a - b;
+        // Preserve Kurbo's rounding for ordinary dash boundaries.
+        let max = v.x.abs().max(v.y.abs());
+        if (1e-150..1e150).contains(&max) {
+            v.hypot()
+        } else {
+            v.x.hypot(v.y)
+        }
+    };
     match *seg {
-        PathSeg::Line(l) => l.p0.distance(l.p1),
-        PathSeg::Quad(q) => q.p0.distance(q.p1) + q.p1.distance(q.p2),
-        PathSeg::Cubic(c) => c.p0.distance(c.p1) + c.p1.distance(c.p2) + c.p2.distance(c.p3),
+        PathSeg::Line(l) => dist(l.p0, l.p1),
+        PathSeg::Quad(q) => dist(q.p0, q.p1) + dist(q.p1, q.p2),
+        PathSeg::Cubic(c) => dist(c.p0, c.p1) + dist(c.p1, c.p2) + dist(c.p2, c.p3),
+    }
+}
+
+fn arc_length(seg: &PathSeg, accuracy: f64) -> f64 {
+    if matches!(seg, PathSeg::Line(_)) {
+        control_length(seg)
+    } else {
+        seg.arclen(accuracy)
     }
 }
 
@@ -468,7 +590,8 @@ mod tests {
                     path.map(|el| (el, false)).into_iter(),
                     0.,
                     pattern,
-                    Affine::IDENTITY
+                    Affine::IDENTITY,
+                    Meter::default()
                 )
                 .eq(path)
             );
@@ -482,7 +605,9 @@ mod tests {
 
     fn mine(path: &BezPath, offset: f64, dashes: &[f64], rect: [f64; 4]) -> Vec<PathEl> {
         let split = SplitHuge::new(path.iter(), Cull::new(Affine::IDENTITY, rect), true);
-        starts_with_a_move(dash(split, offset, dashes, Affine::IDENTITY).collect())
+        starts_with_a_move(
+            dash(split, offset, dashes, Affine::IDENTITY, Meter::default()).collect(),
+        )
     }
 
     /// A stroker starts a line out first from the origin.
@@ -496,6 +621,74 @@ mod tests {
 
     fn kurbo(path: &BezPath, offset: f64, dashes: &[f64]) -> Vec<PathEl> {
         crate::kurbo::dash(path.iter(), offset, dashes).collect()
+    }
+
+    #[test]
+    fn many_subpaths_retain_resolvable_dashes_after_long_hidden_prefixes() {
+        // This pattern repeats [1, 2]. Its uncompressed period is large, but
+        // every visible suffix has the same small explicit reference.
+        let pattern = [1., 2.].repeat(131072);
+        let subpaths = 16384;
+        let input = (0..subpaths).flat_map(|row| {
+            let y = f64::from(row);
+            [
+                (PathEl::MoveTo(Point::new(-300001., y)), false),
+                (PathEl::LineTo(Point::new(0., y)), true),
+                (PathEl::LineTo(Point::new(7., y)), false),
+            ]
+        });
+        let mut expected = BezPath::new();
+        expected.move_to((0., 0.));
+        expected.line_to((7., 0.));
+        let reference = kurbo(&expected, 1.25, &[1., 2.]);
+        let (lines, _) = dashes_near_view(&reference);
+        let expected: [bool; 7] =
+            core::array::from_fn(|i| on_dash(&lines, Point::new(i as f64 + 0.5, 0.)));
+        let mut rows = alloc::vec![[false;7]; subpaths as usize];
+        let mut at = Point::ORIGIN;
+        for el in dash(input, 0.25, &pattern, Affine::IDENTITY, Meter::default()) {
+            match el {
+                PathEl::LineTo(p) => {
+                    for (i, pixel) in rows[p.y as usize].iter_mut().enumerate() {
+                        let x = i as f64 + 0.5;
+                        *pixel |= at.x <= x && x < p.x;
+                    }
+                    at = p;
+                }
+                PathEl::MoveTo(p) => at = p,
+                _ => unreachable!(),
+            }
+        }
+        assert!(rows.into_iter().all(|row| row == expected));
+    }
+
+    #[test]
+    fn resolvable_gaps_survive_high_cumulative_pattern_work() {
+        let mut pattern = [1. / 1024.; 1024].to_vec();
+        pattern.extend([64., 64.]);
+        // At 129 pixels per subpath, walking the raw pattern would exceed
+        // four million transitions. The following visible gap stays empty.
+        let input = (0..8192).flat_map(|y| {
+            let y = f64::from(y);
+            [
+                (PathEl::MoveTo(Point::new(0., y)), false),
+                (PathEl::LineTo(Point::new(129., y)), false),
+            ]
+        });
+        let mut at = Point::ORIGIN;
+        let mut seen = [false; 8192];
+        for el in dash(input, 0., &pattern, Affine::IDENTITY, Meter::default()) {
+            match el {
+                PathEl::MoveTo(p) => at = p,
+                PathEl::LineTo(p) => {
+                    assert!(!(at.x <= 100. && p.x > 100.));
+                    seen[p.y as usize] |= at.x <= 32. && p.x > 32.;
+                    at = p;
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(seen.into_iter().all(|covered| covered));
     }
 
     #[test]
@@ -623,7 +816,7 @@ mod tests {
             let pieces = || SplitHuge::new(path.iter(), Cull::new(Affine::IDENTITY, VIEW), true);
             assert!(pieces().count() <= 4, "2^{exp}");
             assert!(
-                dash(pieces(), 0., &[7., 3.], Affine::IDENTITY).count() <= 26,
+                dash(pieces(), 0., &[7., 3.], Affine::IDENTITY, Meter::default()).count() <= 26,
                 "2^{exp}"
             );
         }
@@ -718,8 +911,16 @@ mod tests {
             (PathEl::LineTo(Point::new(-200.0, 50.0)), true),
             (PathEl::LineTo(Point::new(100.0, 50.0)), false),
         ];
-        let a =
-            starts_with_a_move(dash(input.into_iter(), 0.0, &dashes, Affine::IDENTITY).collect());
+        let a = starts_with_a_move(
+            dash(
+                input.into_iter(),
+                0.0,
+                &dashes,
+                Affine::IDENTITY,
+                Meter::default(),
+            )
+            .collect(),
+        );
         let mut short = BezPath::new();
         short.move_to((-200.0, 50.0));
         short.line_to((100.0, 50.0));
@@ -757,7 +958,7 @@ mod tests {
         p.line_to((0.0, 100.0));
         let wide = Cull::new(affine, [-1e6, -1e6, 1e6, 1e6]);
         let split = SplitHuge::new(p.iter(), wide, true);
-        let a = starts_with_a_move(dash(split, 1.5, &dashes, affine).collect());
+        let a = starts_with_a_move(dash(split, 1.5, &dashes, affine, Meter::default()).collect());
         // Starting inside a dash (offset 1.5 < 3), the first line is one stroke (out
         // last: kurbo holds a subpath's first dash back to join a closing one).
         let whole = [
@@ -771,7 +972,7 @@ mod tests {
         same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
         // Starting in a gap (offset 4), the first line still is one stroke.
         let split = SplitHuge::new(p.iter(), wide, true);
-        let a = starts_with_a_move(dash(split, 4.0, &dashes, affine).collect());
+        let a = starts_with_a_move(dash(split, 4.0, &dashes, affine, Meter::default()).collect());
         assert!(a.windows(2).any(|w| w == whole), "{a:?}");
         let b = kurbo(&p, 4.0, &dashes);
         same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);

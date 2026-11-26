@@ -239,25 +239,10 @@ impl<S: Simd> FineKernel<S> for U8Kernel {
 
         let mask_iter = mask.map(|m| {
             iter::from_fn(|| {
-                let sample = |x: usize, y: u16| {
-                    if x < usize::from(m.width()) && y < m.height() {
-                        m.sample(u16::try_from(x).unwrap(), y)
-                    } else {
-                        255
-                    }
-                };
-
-                let samples = [
-                    sample(start_x, start_y),
-                    sample(start_x, start_y + 1),
-                    sample(start_x, start_y + 2),
-                    sample(start_x, start_y + 3),
-                    sample(start_x + 1, start_y),
-                    sample(start_x + 1, start_y + 1),
-                    sample(start_x + 1, start_y + 2),
-                    sample(start_x + 1, start_y + 3),
-                ];
-
+                let samples: [u8; 8] = bytemuck::cast([
+                    super::mask_column(m, start_x, start_y, 255),
+                    super::mask_column(m, start_x + 1, start_y, 255),
+                ]);
                 start_x += 2;
 
                 Some(samples)

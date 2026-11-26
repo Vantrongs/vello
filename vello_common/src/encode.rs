@@ -367,8 +367,15 @@ fn encode_stops(
         // We calculate a bias and scale factor, such that we can simply calculate
         // bias + x * scale to get the interpolated color, where x is between x0 and x1,
         // to calculate the resulting color.
-        // Apply a nudge value because we sometimes call `create_range` with the same offset
-        // to create the padded stops.
+        // At a repeated endpoint the final LUT sample takes the right-hand color.
+        if x0 == x1 {
+            return GradientRange {
+                x1,
+                bias: c1,
+                scale: [0.0; 4],
+                interpolation_alpha_space,
+            };
+        }
         let x1_minus_x0 = (x1 - x0).max(NUDGE_VAL);
         let mut scale = [0.0; 4];
         let mut bias = c0;
@@ -1096,7 +1103,8 @@ impl<T: GradientLutExt> GradientLut<T> {
                 let max_idx = if i + 1 == ranges.len() {
                     lut_size
                 } else {
-                    ((range.x1 * scale).ceil() as usize).clamp(prev_idx, lut_size)
+                    ((f64::from(range.x1) * f64::from(scale)).ceil() as usize)
+                        .clamp(prev_idx, lut_size)
                 };
 
                 ramps.push((prev_idx..max_idx, range));
@@ -1300,6 +1308,35 @@ mod tests {
                 entry[0]
             );
         }
+    }
+
+    #[test]
+    fn repeated_stops_have_right_continuous_lut_samples() {
+        use crate::fearless_simd::Level;
+        let boundary = f32::from_bits(0x39800801);
+        let stops = [(0., 0.), (boundary, 0.), (boundary, 1.), (1., 1.), (1., 0.)];
+        let gradient = Gradient {
+            stops: ColorStops(
+                stops
+                    .map(|(offset, g)| ColorStop {
+                        offset,
+                        color: Color::new([g, g, g, 1.]).into(),
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Gradient::new_linear((0., 0.), (1., 0.))
+        };
+        let mut paints = vec![];
+        gradient.encode_into(&mut paints, Affine::IDENTITY, None);
+        let [EncodedPaint::Gradient(encoded)] = paints.as_slice() else {
+            panic!()
+        };
+        let lut = crate::fearless_simd::dispatch!(Level::new(), simd => encoded.u8_lut(simd).lut().to_vec());
+        assert_eq!(lut.len(), 4096);
+        assert_eq!(lut[1], [0, 0, 0, 255]);
+        assert_eq!(lut[2], [255; 4]);
+        assert_eq!(lut[4095], [0, 0, 0, 255]);
     }
 
     #[test]

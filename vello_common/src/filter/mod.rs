@@ -151,14 +151,8 @@ impl FilterLayerPlacement {
             return Self::EMPTY;
         }
 
-        // Some more detailed explanations of what's going on here since this
-        // part is a bit confusing.
-
-        // `bbox` is the tight bounding box across all strips in the filter
-        // layer. We now need to expand it by the filter padding to know how
-        // large of a pixmap we actually need to allocate. Also, as mentioned
-        // in [`FilterLayerPlan::new`], we need to ensure the pixmap itself is
-        // also a multiple of the tile width / tile height.
+        // Round outward to covering tiles, keeping the physical endpoint
+        // when the last tile extends beyond the u16 coordinate range.
         let pixmap_bbox = bbox
             .expand(filter_plan.filter_padding)
             .intersect(RectU16::new(0, 0, viewport.width(), viewport.height()))
@@ -182,14 +176,6 @@ impl FilterLayerPlacement {
         let src_y = shift_y.saturating_sub(pixmap_bbox.y0);
         let dest_bbox = pixmap_bbox.relative_to_origin((shift_x, shift_y));
 
-        assert!(
-            dest_bbox.x0.is_multiple_of(Tile::WIDTH)
-                && dest_bbox.x1.is_multiple_of(Tile::WIDTH)
-                && dest_bbox.y0.is_multiple_of(Tile::HEIGHT)
-                && dest_bbox.y1.is_multiple_of(Tile::HEIGHT),
-            "filter destination bounds must be tile-aligned"
-        );
-
         Self {
             pixmap_bbox,
             dest_bbox,
@@ -200,14 +186,14 @@ impl FilterLayerPlacement {
 
     /// Return the bounds of the pixmap allocated for the filter layer.
     ///
-    /// The bbox is guaranteed to be aligned to tile coordinates.
+    /// The origin is tile-aligned. The terminal tile may be partial.
     pub fn pixmap_bbox(self) -> RectU16 {
         self.pixmap_bbox
     }
 
     /// Return the bounds where the filter layer is composited into its parent.
     ///
-    /// The bbox is guaranteed to be aligned to tile coordinates.
+    /// The origin is tile-aligned. The terminal tile may be partial.
     pub fn dest_bbox(self) -> RectU16 {
         self.dest_bbox
     }

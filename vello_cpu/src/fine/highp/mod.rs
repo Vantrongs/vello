@@ -199,44 +199,8 @@ impl<S: Simd> FineKernel<S> for F32Kernel {
         let alpha_iter = alphas.map(|a| bytemuck::cast_slice::<u8, [u8; 4]>(a).iter().copied());
 
         let mask_iter = mask.map(|m| {
-            let width = usize::from(m.width());
-            let height = m.height();
-
             core::iter::from_fn(move || {
-                let samples = if start_x < width && start_y + 3 < height {
-                    // All in bounds, sample directly
-                    [
-                        m.sample(u16::try_from(start_x).unwrap(), start_y),
-                        m.sample(u16::try_from(start_x).unwrap(), start_y + 1),
-                        m.sample(u16::try_from(start_x).unwrap(), start_y + 2),
-                        m.sample(u16::try_from(start_x).unwrap(), start_y + 3),
-                    ]
-                } else {
-                    // Fallback: check each individually
-                    [
-                        if start_x < width && start_y < height {
-                            m.sample(u16::try_from(start_x).unwrap(), start_y)
-                        } else {
-                            255
-                        },
-                        if start_x < width && start_y + 1 < height {
-                            m.sample(u16::try_from(start_x).unwrap(), start_y + 1)
-                        } else {
-                            255
-                        },
-                        if start_x < width && start_y + 2 < height {
-                            m.sample(u16::try_from(start_x).unwrap(), start_y + 2)
-                        } else {
-                            255
-                        },
-                        if start_x < width && start_y + 3 < height {
-                            m.sample(u16::try_from(start_x).unwrap(), start_y + 3)
-                        } else {
-                            255
-                        },
-                    ]
-                };
-
+                let samples = super::mask_column(m, start_x, start_y, 255);
                 start_x += 1;
 
                 Some(samples)

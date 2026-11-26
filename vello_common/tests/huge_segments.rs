@@ -9,7 +9,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::time::Instant;
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{FlattenCtx, Line, fill, stroke};
 use vello_common::geometry::RectU16;
@@ -68,7 +67,6 @@ fn run(name: &str, path: &BezPath, draw: &Draw, affine: Affine) -> Vec<Line> {
     let (mut flatten_ctx, mut stroke_ctx) = (FlattenCtx::default(), StrokeCtx::default());
     let base = IN_USE.load(Relaxed);
     PEAK.store(base, Relaxed);
-    let t = Instant::now();
     match draw {
         Draw::Fill => fill(
             level,
@@ -90,12 +88,6 @@ fn run(name: &str, path: &BezPath, draw: &Draw, affine: Affine) -> Vec<Line> {
         ),
     }
     let peak = PEAK.load(Relaxed).saturating_sub(base);
-    println!(
-        "{name}: {} lines, peak {} KiB, {:?}",
-        lines.len(),
-        peak / 1024,
-        t.elapsed()
-    );
     assert!(peak < 64 << 20, "{name}: peak {peak} bytes");
     lines
 }
@@ -758,4 +750,54 @@ fn coverage<const W: usize, const H: usize>(
         },
     );
     pixels
+}
+
+#[test]
+fn finite_curves_preserve_visible_coverage_and_allow_retry() {
+    use vello_common::path_budget::{CapacityExceeded, PathBudget};
+    use vello_common::strip_generator::{PathStyle, StripGenerator, StripStorage};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut right = BezPath::new();
+    right.move_to((10., 10.));
+    right.curve_to((5e307, 10.), (10., 30.), (20., 30.));
+    let mut swung = BezPath::new();
+    swung.move_to((4., -3.2e-306));
+    swung.curve_to((4e307, 32. / 3.), (-4e307, 64. / 3.), (4., 32.));
+    let mut quad = BezPath::new();
+    quad.move_to((-1e308, 0.));
+    quad.quad_to((1.5e308, 8.), (-1e308, 16.));
+    for (mut path, on, off) in [
+        (right, (24, 13), (5, 13)),
+        (swung, (24, 8), (24, 24)),
+        (quad, (24, 8), (24, 0)),
+    ] {
+        path.close_path();
+        let mut genr = StripGenerator::new(64, 64, Level::baseline());
+        let style = PathStyle::Fill(peniko::Fill::NonZero);
+        assert_eq!(
+            genr.prepare_path(
+                path.iter(),
+                style,
+                Affine::IDENTITY,
+                None,
+                &PathBudget::new(0)
+            )
+            .unwrap_err(),
+            CapacityExceeded
+        );
+        let prepared = genr
+            .prepare_path(
+                path.iter(),
+                style,
+                Affine::IDENTITY,
+                None,
+                &PathBudget::new(65536),
+            )
+            .unwrap();
+        let mut strips = StripStorage::default();
+        prepared.submit(None, &mut strips);
+        let pixels = coverage::<64, 64>(&strips);
+        assert_eq!(pixels[on.1][on.0], 255, "{on:?}");
+        assert_eq!(pixels[off.1][off.0], 0, "{off:?}");
+    }
 }

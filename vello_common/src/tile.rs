@@ -57,45 +57,16 @@ fn tile_coordinates(line: Line) -> Option<[f64; 4]> {
 
 const BOUNDARY_MARGIN: f64 = 1e-5;
 
-// Grow a nonoverlapping expansion with error-free TwoSum. The highest component
-// gives the sign of the exact sum, even after cancellation. Each input adds at
-// most one component; the crossing determinant has six products.
-#[derive(Default)]
-struct CrossingSum {
-    parts: [f64; 6],
-    len: usize,
-}
-
-impl CrossingSum {
-    fn add(&mut self, mut value: f64) {
-        let mut used = 0;
-        for i in 0..self.len {
-            let part = self.parts[i];
-            let sum = value + part;
-            let b = sum - value;
-            let error = (value - (sum - b)) + (part - b);
-            if error != 0.0 {
-                self.parts[used] = error;
-                used += 1;
-            }
-            value = sum;
-        }
-        if value != 0.0 || used == 0 {
-            self.parts[used] = value;
-            used += 1;
-        }
-        self.len = used;
-    }
-
-    fn estimate(&self) -> f64 {
-        self.parts[..self.len].iter().sum()
-    }
-}
-
 // Inputs are f32 coordinates scaled by a power of two, or viewport integers.
 // Their products have at most 48 significant bits and fit exactly in f64.
-fn crossing_numerator(x0: f64, y0: f64, x1: f64, y1: f64, y: f64) -> CrossingSum {
-    let mut sum = CrossingSum::default();
+fn crossing_numerator(
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    y: f64,
+) -> crate::expansion::Expansion<6> {
+    let mut sum = crate::expansion::Expansion::new();
     for term in [x0 * y1, -x1 * y0, x1 * y, -x0 * y] {
         sum.add(term);
     }
@@ -121,7 +92,7 @@ fn exact_column(x0: f64, y0: f64, x1: f64, y1: f64, y: f64) -> f64 {
     }
     numerator.add(-k * y1);
     numerator.add(k * y0);
-    let side = numerator.parts[numerator.len - 1];
+    let side = numerator.leading();
     if side < 0.0 {
         k.next_down()
     } else if side > 0.0 {

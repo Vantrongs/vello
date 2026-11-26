@@ -291,7 +291,6 @@ boundary_tests! {
 #[cfg(any(feature = "std", target_arch = "wasm32"))]
 fn native_simd_masks_and_indexed_paints_reach_last_frame_pixel() {
     let level = Level::new();
-    eprintln!("native SIMD level: {level:?}");
     boundary_with(
         u16::MAX,
         level,
@@ -303,6 +302,51 @@ fn native_simd_masks_and_indexed_paints_reach_last_frame_pixel() {
             Scene::Image,
         ],
     );
+}
+
+#[test]
+fn zero_offset_filter_at_terminal_tile() {
+    use vello_common::filter_effects::{Filter, FilterPrimitive};
+    for transpose in [false, true] {
+        let (w, h) = if transpose {
+            (4, u16::MAX)
+        } else {
+            (u16::MAX, 4)
+        };
+        let draw = |filtered| {
+            let mut ctx = context(w, h, 0, Level::baseline());
+            if filtered {
+                ctx.push_filter_layer(Filter::from_primitive(FilterPrimitive::Offset {
+                    dx: 0.,
+                    dy: 0.,
+                }));
+            }
+            ctx.set_paint(RED);
+            ctx.fill_rect(&rect(65532, 65535, 4, transpose));
+            if filtered {
+                ctx.pop_layer();
+            }
+            ctx.set_paint(BLUE);
+            ctx.fill_rect(&rect(0, 2, 4, transpose));
+            let mut image = Pixmap::new(w, h);
+            ctx.flush();
+            ctx.render_with(
+                &mut image,
+                &mut Resources::new(),
+                RasterizerSettings::default(),
+            );
+            image
+        };
+        let reference = draw(false);
+        check_pixels(&reference, "unfiltered", |x, y| {
+            match if transpose { y } else { x } {
+                0..2 => BLUE_PIXEL,
+                65532.. => RED_PIXEL,
+                _ => CLEAR,
+            }
+        });
+        assert!(draw(true).data() == reference.data());
+    }
 }
 
 #[test]

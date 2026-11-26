@@ -78,8 +78,7 @@ pub(super) fn hairline(
         crate::cull::flatten(path, tolerance, cull, |el| sink.push(el));
     } else {
         let path = SplitHuge::new(path, cull, true);
-        let mut dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine);
-        dashed.meter = meter;
+        let dashed = crate::dash::dash(path, style.dash_offset, &style.dash_pattern, affine, meter);
         crate::cull::flatten(dashed, tolerance, cull, |el| sink.push(el));
     }
     sink.end_subpath(false);
@@ -162,7 +161,7 @@ impl HairlineSink<'_> {
             return;
         }
         let v = p - self.last;
-        let len = v.hypot();
+        let len = v.x.hypot(v.y);
         let d = Dir { u: v / len, len };
         match self.prev {
             None => {

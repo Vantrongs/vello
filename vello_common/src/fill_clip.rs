@@ -53,18 +53,40 @@ pub(crate) fn flatten_seg<S: Simd>(
     callback: &mut impl Callback,
     ctx: &mut FlattenCtx,
 ) {
+    let points: &[Point] = match seg {
+        PathSeg::Quad(q) => &[q.p0, q.p1, q.p2],
+        PathSeg::Cubic(c) => &[c.p0, c.p1, c.p2, c.p3],
+        PathSeg::Line(_) => unreachable!(),
+    };
+    let max = |axis| {
+        points
+            .iter()
+            .map(|&p| coord(p, axis).abs())
+            .fold(1., f64::max)
+    };
+    // Independent powers of two preserve each axis's extrema even when the other
+    // coordinate is hundreds of orders of magnitude larger.
+    let (mx, my) = (max(0), max(1));
+    let norm = |m: f64| 2.0_f64.powi(1023 - (m.to_bits() >> 52) as i32);
+    let normalized = crate::kurbo::Affine::scale_non_uniform(norm(mx), norm(my)) * seg;
+    // Kurbo evaluates Bernstein polynomials with coefficients up to three.
+    let divisor = if mx.max(my) > f64::MAX / 16. { 16. } else { 1. };
     let mut clip = Clip {
         simd,
         rect,
         out: Out { callback, at: None },
         ctx,
-        seg,
+        seg: crate::kurbo::Affine::scale(1. / divisor) * seg,
+        divisor,
     };
-    let mut ts = seg.extrema();
+    let mut ts = normalized.extrema();
     ts.sort_by(f64::total_cmp);
     let (mut t0, mut p0) = (0.0, seg.start());
     for t in ts.into_iter().chain([1.0]) {
-        let p1 = if t == 1.0 { seg.end() } else { seg.eval(t) };
+        if clip.out.callback.meter().failed() {
+            return;
+        }
+        let p1 = if t == 1.0 { seg.end() } else { clip.eval(t) };
         clip.piece(t0, p0, t, p1);
         (t0, p0) = (t, p1);
     }
@@ -243,33 +265,21 @@ pub(crate) fn at_coord(a: Point, b: Point, axis: usize, v: f64) -> Point {
         f64::from_bits(1 << (shift + 1074))
     };
     let (ca, cb, v_scaled) = (ca * scale, cb * scale, v * scale);
-    let (da, da_tail) = two_sum(v_scaled, -ca);
-    let (db, db_tail) = two_sum(cb, -v_scaled);
+    let (da, da_tail) = crate::expansion::two_sum(v_scaled, -ca);
+    let (db, db_tail) = crate::expansion::two_sum(cb, -v_scaled);
     let (oa, ob) = (coord(a, 1 - axis), coord(b, 1 - axis));
     // Halving the other axis bounds products and partial sums even at f64::MAX.
     // The exact numerator is (v-ca)*ob + (cb-v)*oa. Its large terms must cancel
     // before rounding away the small contribution from the boundary coordinate.
-    let mut expansion = [0.0; 8];
-    let mut len = 0;
+    let mut expansion = crate::expansion::Expansion::<8>::new();
     for (distance, other) in [(da, ob), (da_tail, ob), (db, oa), (db_tail, oa)] {
         let other = other * 0.5;
         let product = distance * other;
         for term in [distance.mul_add(other, -product), product] {
-            let mut sum = term;
-            let mut next_len = 0;
-            for i in 0..len {
-                let (next, tail) = two_sum(sum, expansion[i]);
-                if tail != 0.0 {
-                    expansion[next_len] = tail;
-                    next_len += 1;
-                }
-                sum = next;
-            }
-            expansion[next_len] = sum;
-            len = next_len + 1;
+            expansion.add(term);
         }
     }
-    let other = (expansion[..len].iter().sum::<f64>() / (cb - ca)) * 2.0;
+    let other = (expansion.estimate() / (cb - ca)) * 2.0;
     // A boundary between the endpoints is a convex combination. Roundoff at
     // f64::MAX must not turn that finite intersection into infinity.
     with(
@@ -277,13 +287,6 @@ pub(crate) fn at_coord(a: Point, b: Point, axis: usize, v: f64) -> Point {
         axis,
         v,
     )
-}
-
-/// Error-free addition, apart from underflow of the roundoff term.
-pub(crate) fn two_sum(a: f64, b: f64) -> (f64, f64) {
-    let sum = a + b;
-    let b_virtual = sum - a;
-    (sum, (a - (sum - b_virtual)) + (b - b_virtual))
 }
 
 /// Draws a part of a line between cuts.
@@ -312,17 +315,18 @@ struct Clip<'a, S, C> {
     out: Out<'a, C>,
     ctx: &'a mut FlattenCtx,
     seg: PathSeg,
+    divisor: f64,
 }
 
 impl<S: Simd, C: Callback> Clip<'_, S, C> {
+    fn eval(&self, t: f64) -> Point {
+        (self.seg.eval(t).to_vec2() * self.divisor).to_point()
+    }
+
     /// Draws the piece of the segment over `t0..t1`, monotone in x and y, from `p0`
     /// to `p1`.
     fn piece(&mut self, t0: f64, p0: Point, t1: f64, p1: Point) {
         if misses(self.rect, p0, p1) || p0 == p1 {
-            return;
-        }
-        if let PathSeg::Line(_) = self.seg {
-            clip_line(&mut self.out, self.rect, p0, p1);
             return;
         }
         // The piece's ends and cuts, each with whether the curve up to the next one
@@ -346,6 +350,9 @@ impl<S: Simd, C: Callback> Clip<'_, S, C> {
         // An exact cut before a chord from the same parameter, so the chord is drawn.
         breaks.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
         for i in 0..n - 1 {
+            if self.out.callback.meter().failed() {
+                return;
+            }
             let ((ta, pa, chord), (tb, pb, _)) = (breaks[i], breaks[i + 1]);
             if chord {
                 clip_line(&mut self.out, self.rect, pa, pb);
@@ -370,12 +377,34 @@ impl<S: Simd, C: Callback> Clip<'_, S, C> {
             Region::Left => left_edge(&mut self.out, self.rect, p0, p1),
             Region::In => {
                 self.out.move_to(p0);
-                match self.seg.subsegment(t0..t1) {
-                    PathSeg::Line(_) => self.out.line_to(p1),
-                    PathSeg::Quad(q) => {
-                        flatten_quad(p0, q.p1, p1, self.rect, self.out.callback);
+                // Recover the restricted polynomial from points on the visible span.
+                // The monotone endpoint box bounds each sample, including when a
+                // parameter rounds onto an adjacent cut on a near-limit curve.
+                let sample = |u: f64| {
+                    let p = self.eval(t0 + u * (t1 - t0));
+                    Point::new(
+                        p.x.clamp(p0.x.min(p1.x), p0.x.max(p1.x)),
+                        p.y.clamp(p0.y.min(p1.y), p0.y.max(p1.y)),
+                    )
+                    .to_vec2()
+                };
+                match self.seg {
+                    PathSeg::Line(_) => unreachable!(),
+                    PathSeg::Quad(_) => {
+                        let control = 2. * sample(0.5) - 0.5 * (p0.to_vec2() + p1.to_vec2());
+                        flatten_quad(p0, control.to_point(), p1, self.rect, self.out.callback);
                     }
-                    PathSeg::Cubic(c) => self.cubic(CubicBez::new(p0, c.p1, c.p2, p1)),
+                    PathSeg::Cubic(_) => {
+                        // Invert the Bernstein basis at 1/3 and 2/3.
+                        let a = 27. * sample(1. / 3.) - 8. * p0.to_vec2() - p1.to_vec2();
+                        let b = 27. * sample(2. / 3.) - p0.to_vec2() - 8. * p1.to_vec2();
+                        self.cubic(CubicBez::new(
+                            p0,
+                            ((2. * a - b) / 18.).to_point(),
+                            ((2. * b - a) / 18.).to_point(),
+                            p1,
+                        ));
+                    }
                 }
                 self.out.at = Some(p1);
             }
@@ -414,7 +443,7 @@ impl<S: Simd, C: Callback> Clip<'_, S, C> {
                     p1: phi,
                 };
             }
-            let pm = self.seg.eval(mid);
+            let pm = self.eval(mid);
             let c = coord(pm, axis);
             if c == v {
                 return Cut {
@@ -441,27 +470,29 @@ impl<S: Simd, C: Callback> Clip<'_, S, C> {
         let third =
             (c.p1.to_vec2() * 3.0 - c.p0.to_vec2()) - (c.p2.to_vec2() * 3.0 - c.p3.to_vec2());
         let share = f64::from((TOL as f32) * 0.1);
-        let quads = (third.hypot() / (432_f64.sqrt() * share)).cbrt() / 16.0;
+        let quads = (third.x.hypot(third.y) / (432_f64.sqrt() * share)).cbrt() / 16.0;
         // A chord over 1/n of the parameter is within max |c''| / (8 n²) of a curve;
         // over 1/k of it, max |c''| is k² smaller.
-        let second =
-            |a: Point, b: Point, c: Point| (a.to_vec2() - 2.0 * b.to_vec2() + c.to_vec2()).hypot();
+        let second = |a: Point, b: Point, c: Point| {
+            let v = a.to_vec2() - 2.0 * b.to_vec2() + c.to_vec2();
+            v.x.hypot(v.y)
+        };
         let max_second = 6.0 * second(c.p0, c.p1, c.p2).max(second(c.p1, c.p2, c.p3));
         let lines = (max_second / (8.0 * TOL)).sqrt() / BLOCK_LINES;
-        // In the view the cubic is monotone, so its control points lie within twice
-        // its box's size of it and `k` is small; NaN gives one block.
-        let k = quads.max(lines).ceil().max(1.0);
+        // The reconstruction uses only samples in the visible monotone box.
+        let k = quads.max(lines).ceil().max(1.0) as usize;
         let mut p0 = c.p0;
-        let mut i = 1.0;
-        while i <= k {
-            let mut block = c.subsegment((i - 1.0) / k..i / k);
+        for i in 1..=k {
+            if self.out.callback.meter().failed() {
+                return;
+            }
+            let mut block = c.subsegment((i - 1) as f64 / k as f64..i as f64 / k as f64);
             block.p0 = p0;
             if i == k {
                 block.p3 = c.p3;
             }
             flatten_block(self.simd, block, self.out.callback, self.ctx);
             p0 = block.p3;
-            i += 1.0;
         }
     }
 }

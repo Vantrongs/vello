@@ -56,6 +56,23 @@ pub use crate::span::TileAlignedSpan;
 pub use highp::F32Kernel;
 pub use lowp::U8Kernel;
 
+/// Four rows at a tile-aligned y coordinate. Clipping and blending use
+/// different mask values outside its physical extent.
+#[inline]
+fn mask_column(mask: &Mask, x: usize, y: u16, outside: u8) -> [u8; 4] {
+    if x >= usize::from(mask.width()) {
+        return [outside; 4];
+    }
+    let x = x as u16;
+    [y, y + 1, y + 2, y + 3].map(|row| {
+        if row < mask.height() {
+            mask.sample(x, row)
+        } else {
+            outside
+        }
+    })
+}
+
 /// Offset to shift from pixel corner to pixel center for sampling.
 const PIXEL_CENTER_OFFSET: f64 = 0.5;
 
@@ -804,25 +821,8 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
         let width = span.pixel_width();
         let target = self.blend_buffers.last_mut().unwrap();
         let target = &mut target[Self::scratch_range(span)];
-        let y = u32::from(row_y) + u32x4::from_slice(self.simd, &[0, 1, 2, 3]);
         let iter = (x..x + width).map(|x| {
-            let x_in_range = x < usize::from(mask.width());
-
-            macro_rules! sample {
-                ($idx:expr) => {
-                    if x_in_range && (y[$idx] as u16) < mask.height() {
-                        mask.sample(u16::try_from(x).unwrap(), y[$idx] as u16)
-                    } else {
-                        0
-                    }
-                };
-            }
-
-            let s1 = sample!(0);
-            let s2 = sample!(1);
-            let s3 = sample!(2);
-            let s4 = sample!(3);
-
+            let [s1, s2, s3, s4] = mask_column(mask, x, row_y, 0);
             let samples = u8x16::from_slice(
                 self.simd,
                 &[

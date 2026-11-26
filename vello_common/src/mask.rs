@@ -87,11 +87,6 @@ impl Mask {
         }))
     }
 
-    /// The row-major coverage values. Detaches the buffer if another mask shares it.
-    pub fn data_mut(&mut self) -> &mut [u8] {
-        &mut Arc::make_mut(&mut self.0).data
-    }
-
     /// Return the width of the mask.
     #[inline(always)]
     pub fn width(&self) -> u16 {

@@ -201,7 +201,6 @@ fn matches_coverage(name: &str, path: &BezPath, rule: Fill, affine: Affine) {
     }
     let (x, y) = (worst.1 % usize::from(SIZE), worst.1 / usize::from(SIZE));
     let mean = sum / alphas.len() as f64;
-    println!("{name}: worst {:.1} at ({x}, {y}), mean {mean:.3}", worst.0);
     assert!(
         worst.0 <= 90.0,
         "{name}: pixel ({x}, {y}) has alpha {}, coverage {:.3}",
@@ -699,4 +698,124 @@ fn closed_dashed_curve_under_shear_matches_explicit_dashes() {
         })
     };
     assert_eq!(stroke(&pieces, solid), stroke(&path, dashed));
+}
+
+#[test]
+fn mixed_dash_patterns_keep_resolvable_gaps() {
+    use vello_cpu::kurbo::{Cap, Stroke};
+    let mut short = vec![1. / 1024.; 1024];
+    short.extend([8., 8.]);
+    let mut long = vec![1e-6; 4095];
+    long.push(64.);
+    for width in [1., 4.] {
+        for (pattern, offset, length) in [(&short, 0., 34.), (&long, 1., 50.)] {
+            let mut path = BezPath::new();
+            path.move_to((0., 4.5));
+            path.line_to((length, 4.5));
+            let pixels = draw(|ctx| {
+                ctx.set_stroke(
+                    Stroke::new(width)
+                        .with_caps(Cap::Butt)
+                        .with_dashes(offset, pattern),
+                );
+                ctx.stroke_path(&path);
+            });
+            if offset == 0. {
+                assert_eq!(pixels[4 * 100 + 12], 0);
+                assert_eq!(pixels[4 * 100 + 5], 255);
+                assert_eq!(pixels[4 * 100 + 22], 255);
+            } else {
+                assert!(pixels.iter().all(|&p| p == 0));
+            }
+        }
+    }
+}
+
+#[test]
+fn finite_transformed_hairlines_match_identity_pixels() {
+    use vello_cpu::kurbo::{Cap, Stroke};
+    let line = |sx: f64, sy: f64, dash: bool| {
+        draw(|ctx| {
+            let mut p = BezPath::new();
+            p.move_to((1. / sx, 2.5 / sy));
+            p.line_to((3. / sx, 2.5 / sy));
+            let mut stroke = Stroke::new(1. / sy).with_caps(Cap::Butt);
+            if dash {
+                stroke = stroke.with_dashes(0., [1. / sx, 1. / sx]);
+            }
+            ctx.set_stroke(stroke);
+            ctx.set_transform(Affine::scale_non_uniform(sx, sy));
+            ctx.stroke_path(&p);
+        })
+    };
+    for dashed in [false, true] {
+        let expected = line(1., 1., dashed);
+        assert_eq!(expected[201], 255);
+        for (sx, sy) in [(1e-160, 1.), (1e-180, 1e-180)] {
+            assert!(line(sx, sy, dashed) == expected, "{sx} {sy} {dashed}");
+        }
+    }
+}
+
+#[test]
+fn long_hairline_matches_prepared_coverage() {
+    use vello_common::{
+        path_budget::PathBudget,
+        strip_generator::{PathStyle, StripGenerator},
+    };
+    use vello_cpu::kurbo::{Cap, Stroke};
+    let style = Stroke::new(1.).with_caps(Cap::Butt);
+    let mut path = BezPath::new();
+    path.move_to((-1e40, 2.5));
+    path.line_to((1e40, 2.5));
+    let mut generator = StripGenerator::new(64, 4, vello_cpu::Level::baseline());
+    let prepared = generator
+        .prepare_path(
+            path.iter(),
+            PathStyle::Stroke(&style),
+            Affine::IDENTITY,
+            None,
+            &PathBudget::new(65536),
+        )
+        .unwrap();
+    let mut ctx = RenderContext::new(64, 4);
+    ctx.set_stroke(style);
+    ctx.stroke_path(&path);
+    ctx.flush();
+    let mut pixmap = Pixmap::new(64, 4);
+    ctx.render(&mut pixmap, &mut Resources::new());
+    for (i, p) in pixmap.data().iter().enumerate() {
+        let y = (i / 64) as f32 + 0.5;
+        let x = (i % 64) as f32 + 0.5;
+        let inside = prepared
+            .edges()
+            .iter()
+            .filter(|l| l.p0.x < x && ((l.p0.y <= y) != (l.p1.y <= y)))
+            .count()
+            % 2
+            == 1;
+        assert_eq!(inside, i / 64 == 2);
+        assert_eq!(p.a, if inside { 255 } else { 0 });
+    }
+}
+
+#[test]
+fn padded_gradient_uses_last_repeated_stop() {
+    use vello_cpu::color::palette::css::WHITE;
+    use vello_cpu::peniko::{Extend, Gradient};
+    let mut grad = Gradient::new_linear((0., 0.), (8., 0.))
+        .with_stops([(0., BLACK), (1., BLACK), (1., WHITE)].as_slice());
+    grad.extend = Extend::Pad;
+    let mut ctx = RenderContext::new(16, 1);
+    ctx.set_paint(grad);
+    ctx.fill_rect(&Rect::new(0., 0., 16., 1.));
+    ctx.flush();
+    let mut pixmap = Pixmap::new(16, 1);
+    ctx.render(&mut pixmap, &mut Resources::new());
+    for (i, p) in pixmap.data().iter().enumerate() {
+        assert_eq!(
+            *p,
+            if i < 8 { BLACK } else { WHITE }.premultiply().to_rgba8()
+        );
+    }
 }

@@ -117,9 +117,6 @@ impl<'a> Cull<'a> {
     /// Whether `seg` is a curve too large in path space for its consumer.
     #[inline(always)]
     pub(crate) fn too_large(&self, seg: &PathSeg) -> bool {
-        if self.path_limit == f64::INFINITY {
-            return false;
-        }
         let ext = |a: f64, b: f64, c: f64, d: f64| a.max(b).max(c).max(d) - a.min(b).min(c).min(d);
         let e = match *seg {
             PathSeg::Line(_) => return false,
@@ -145,7 +142,7 @@ impl<'a> Cull<'a> {
         // max |c''| is 2 |p0 - 2 p1 + p2| for a quadratic, and at most 6 times the
         // larger second difference for a cubic.
         let max_second = match *seg {
-            PathSeg::Line(_) => 0.0,
+            PathSeg::Line(_) => unreachable!(),
             PathSeg::Quad(q) => 2.0 * second(q.p0, q.p1, q.p2),
             PathSeg::Cubic(c) => 6.0 * second(c.p0, c.p1, c.p2).max(second(c.p1, c.p2, c.p3)),
         };
@@ -565,13 +562,7 @@ fn flatten_cubic(
 /// `seg` split at its middle; the halves share the midpoint and keep the end points.
 fn halves(seg: &PathSeg) -> (PathSeg, PathSeg) {
     match *seg {
-        PathSeg::Line(l) => {
-            let m = l.p0.midpoint(l.p1);
-            (
-                PathSeg::Line(Line::new(l.p0, m)),
-                PathSeg::Line(Line::new(m, l.p1)),
-            )
-        }
+        PathSeg::Line(_) => unreachable!(),
         PathSeg::Quad(q) => {
             let (a, b) = q.subdivide();
             (PathSeg::Quad(a), PathSeg::Quad(b))
