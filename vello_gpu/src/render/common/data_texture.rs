@@ -72,9 +72,10 @@ impl<T> DataTexture<T> {
     }
 
     pub(crate) fn rows_for_bytes(&self, len: usize) -> u32 {
-        u32::try_from(len)
-            .unwrap()
-            .div_ceil(self.width * self.format.bytes_per_texel())
+        let row_bytes = u64::from(self.width) * u64::from(self.format.bytes_per_texel());
+        let rows = (len as u64).div_ceil(row_bytes);
+        // Even a saturated row count exceeds the maximum GPU texture dimension.
+        u32::try_from(rows).unwrap_or(u32::MAX)
     }
 
     #[cfg(feature = "webgl")]
@@ -150,6 +151,28 @@ mod tests {
         });
         assert_eq!(grown, Ok(true));
         assert_eq!(*texture.texture(), 2);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn rejects_four_gibibytes_before_allocation() {
+        let mut texture = DataTexture::new(
+            (),
+            ResourceTexture::Alphas,
+            DataTextureFormat::Rgba8,
+            4096,
+            1,
+        );
+        let result =
+            texture.ensure_bytes::<crate::RenderError>(1_usize << 32, |_, _, _| unreachable!());
+        assert!(matches!(
+            result,
+            Err(crate::RenderError::ResourceTextureTooLarge {
+                texture: ResourceTexture::Alphas,
+                rows: 262144,
+                max_rows: 4096,
+            })
+        ));
     }
 
     #[test]
