@@ -13,6 +13,8 @@ use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
 use crate::filter::offset::Offset;
 use crate::filter_effects::{Filter, FilterPrimitive};
 use crate::geometry::{PaddingU16, RectU16, SizeU16};
+#[cfg(not(feature = "std"))]
+use crate::kurbo::common::FloatFuncs as _;
 use crate::kurbo::{Affine, Rect, Vec2};
 use crate::math::snap_up;
 use crate::tile::Tile;
@@ -215,6 +217,8 @@ impl Default for FilterLayerPlacement {
 /// Precomputed data for a filter layer.
 #[derive(Debug, Clone)]
 pub struct FilterData {
+    /// Device-pixel offset already applied while rasterizing the source in output coordinates.
+    pub rasterized_offset: Option<(i32, i32)>,
     /// The underlying filter.
     pub filter: Filter,
     /// The transform that was in place when the filter layer was invoked.
@@ -259,6 +263,7 @@ impl FilterData {
         let filter_padding = snapped_padding(filter.filter_expansion(&transform));
 
         Self {
+            rasterized_offset: None,
             filter,
             transform,
             filter_padding,
@@ -266,8 +271,28 @@ impl FilterData {
         }
     }
 
-    /// By how much to shift all rendered contents to ensure that all rendered contents
-    /// are visible in the viewport [0, 0, width, height].
+    /// Rasterize a standalone CPU offset directly in output coordinates. The
+    /// preimage of the output fits one viewport even at the maximum frame size.
+    pub fn for_cpu(filter: Filter, transform: Affine) -> Self {
+        let mut plan = Self::new(filter, transform);
+        if let [FilterPrimitive::Offset { dx, dy }] = plan.filter.graph.primitives() {
+            let (x, y) = transform_offset_params(*dx, *dy, &transform);
+            plan.rasterized_offset = Some((x.round() as i32, y.round() as i32));
+            plan.source_padding = PaddingU16::ZERO;
+            plan.filter_padding = PaddingU16::ZERO;
+        }
+        plan
+    }
+
+    /// Translation shared by the source geometry and its inherited clips.
+    pub fn raster_translation(&self) -> (i32, i32) {
+        self.rasterized_offset.unwrap_or_else(|| {
+            let (x, y) = self.source_shift();
+            (i32::from(x), i32::from(y))
+        })
+    }
+
+    /// Tile-aligned source padding removed when compositing into the parent.
     pub fn source_shift(&self) -> (u16, u16) {
         (self.source_padding.left, self.source_padding.top)
     }

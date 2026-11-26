@@ -371,3 +371,38 @@ fn clip_touching_right_edge_leaves_target_clear() {
         check_pixels(&image, "right edge", |_, _| CLEAR);
     }
 }
+
+#[test]
+fn shifted_offset_at_terminal_tile() {
+    use vello_common::filter_effects::{Filter, FilterPrimitive};
+    for transpose in [false, true] {
+        let (w, h, dx, dy) = if transpose {
+            (4, u16::MAX, 0., 2.)
+        } else {
+            (u16::MAX, 4, 2., 0.)
+        };
+        // The two-stage case exercises composition of a physical partial tile.
+        for (start, chained) in [(65528, false), (65532, false), (65528, true)] {
+            let mut ctx = context(w, h, 0, Level::baseline());
+            let mut filter = Filter::from_primitive(FilterPrimitive::Offset { dx, dy });
+            if chained {
+                Arc::make_mut(&mut filter.graph)
+                    .add(FilterPrimitive::Offset { dx: 0., dy: 0. }, None);
+            }
+            ctx.push_filter_layer(filter);
+            ctx.set_paint(RED);
+            ctx.fill_rect(&rect(start, start + 1, 4, transpose));
+            ctx.pop_layer();
+            let mut image = Pixmap::new(w, h);
+            ctx.flush();
+            ctx.render(&mut image, &mut Resources::new());
+            check_pixels(&image, "offset", |x, y| {
+                if (if transpose { y } else { x }) == usize::from(start + 2) {
+                    RED_PIXEL
+                } else {
+                    CLEAR
+                }
+            });
+        }
+    }
+}

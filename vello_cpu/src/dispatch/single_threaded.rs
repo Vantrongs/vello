@@ -267,12 +267,14 @@ impl SingleThreadedDispatcher {
                 image_resolver,
             );
 
-            F::filter_layer(
-                &mut pixmap,
-                &filter_plan.filter,
-                filter_ctx.scratch(),
-                filter_plan.transform,
-            );
+            if filter_plan.rasterized_offset.is_none() {
+                F::filter_layer(
+                    &mut pixmap,
+                    &filter_plan.filter,
+                    filter_ctx.scratch(),
+                    filter_plan.transform,
+                );
+            }
 
             // Save the filtered pixmap to disk for debugging.
             // #[cfg(all(debug_assertions, feature = "std", feature = "png"))]

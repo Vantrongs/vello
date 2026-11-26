@@ -109,7 +109,7 @@ impl ViewportState {
         self.strip_generator_stack.push(parent_generator);
 
         self.clip_state
-            .push_root_viewport(filter_data.source_shift(), &mut self.strip_generator);
+            .push_root_viewport(filter_data.raster_translation(), &mut self.strip_generator);
     }
 
     /// Pop the last root viewport.

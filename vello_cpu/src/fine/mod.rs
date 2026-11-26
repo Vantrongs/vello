@@ -1099,6 +1099,32 @@ impl<S: Simd, T: FineKernel<S>> Fine<S, T> {
                         unimplemented!("External textures are not supported by `vello_cpu`")
                     }
                 };
+                // Filter composition covers whole tiles, but only the physical
+                // source pixels belong to the destination rectangle.
+                if paint_index >= resources.encoded_paints.len() {
+                    let [_, _, _, _, tx, ty] = image.transform.as_coeffs();
+                    let columns = (i64::from(pixmap.width()) - sample_x as i64 - tx as i64)
+                        .clamp(0, width as i64) as usize;
+                    let rows = (i64::from(pixmap.height()) - i64::from(sample_y) - ty as i64)
+                        .clamp(0, i64::from(Tile::HEIGHT)) as usize;
+                    let valid_len = columns * TILE_HEIGHT_COMPONENTS;
+                    T::apply_painter(
+                        simd,
+                        color_buf,
+                        T::plain_nn_image_painter(simd, image, &pixmap, sampler_x, sampler_y),
+                    );
+                    color_buf[valid_len..].fill(T::Numeric::ZERO);
+                    if rows < usize::from(Tile::HEIGHT) {
+                        for column in color_buf[..valid_len]
+                            .as_chunks_mut::<TILE_HEIGHT_COMPONENTS>()
+                            .0
+                        {
+                            column[rows * COLOR_COMPONENTS..].fill(T::Numeric::ZERO);
+                        }
+                    }
+                    T::alpha_composite_buffer(simd, dest, color_buf, None);
+                    return;
+                }
                 let tint = image.tint.as_ref();
 
                 match (image.has_skew(), image.nearest_neighbor()) {

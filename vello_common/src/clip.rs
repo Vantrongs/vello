@@ -234,13 +234,14 @@ impl ClipState {
     /// Push a new root viewport.
     pub fn push_root_viewport(
         &mut self,
-        source_shift: (u16, u16),
+        source_shift: (impl Into<i32>, impl Into<i32>),
         strip_generator: &mut StripGenerator,
     ) {
         let parent_context = core::mem::replace(&mut self.context, self.context_pool.take());
-        let source_shift =
-            Affine::translate((f64::from(source_shift.0), f64::from(source_shift.1)))
-                * self.active_shift();
+        let source_shift = Affine::translate((
+            f64::from(source_shift.0.into()),
+            f64::from(source_shift.1.into()),
+        )) * self.active_shift();
         self.frames.push(ClipFrame {
             parent_context,
             source_shift,
