@@ -256,7 +256,7 @@ impl Strip {
 
     /// Byte offset at which to slice the coverage buffer.
     #[inline(always)]
-    pub fn alpha_byte_offset(self) -> usize {
+    pub fn alpha_byte_offset(&self) -> usize {
         self.alpha_column() as usize * usize::from(Tile::HEIGHT)
     }
 

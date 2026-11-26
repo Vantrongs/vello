@@ -102,7 +102,7 @@ struct AlphaColumn(NonZeroU32);
 
 impl AlphaColumn {
     fn new(alpha_column: u32) -> Self {
-        Self(NonZeroU32::new(alpha_column.checked_add(1).expect("alpha index overflow")).unwrap())
+        Self(NonZeroU32::new(alpha_column.checked_add(1).expect("alpha column overflow")).unwrap())
     }
 
     fn get(self) -> u32 {
