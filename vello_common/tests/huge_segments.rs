@@ -827,8 +827,6 @@ fn wide_dashed_stroke_budget_boundary() {
             None,
         );
         let previous = (storage.strips.clone(), storage.alphas.clone());
-        let base = IN_USE.load(Relaxed);
-        PEAK.store(base, Relaxed);
         let accepted = generator
             .try_generate_stroke(
                 &path,
@@ -840,31 +838,26 @@ fn wide_dashed_stroke_budget_boundary() {
                 &PathBudget::new(bytes),
             )
             .is_ok();
-        let peak = PEAK.load(Relaxed).saturating_sub(base);
         if accepted {
             assert!(storage.strips.len() > previous.0.len());
         } else {
             assert_eq!(storage.strips, previous.0);
             assert_eq!(storage.alphas, previous.1);
         }
-        (accepted, peak)
+        accepted
     };
     let (mut lo, mut hi) = (0usize, 1 << 20);
-    assert!(!run(lo).0 && run(hi).0);
+    assert!(!run(lo) && run(hi));
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if run(mid).0 {
+        if run(mid) {
             hi = mid;
         } else {
             lo = mid;
         }
     }
-    let (ok, peak) = run(hi);
-    let (refused, rejected_peak) = run(lo);
-    assert!(ok && !refused);
-    eprintln!(
-        "wide dashed stroke accepted {hi} B (peak +{peak} B), refused {lo} B (peak +{rejected_peak} B)"
-    );
+    assert!(run(hi));
+    assert!(!run(lo));
 }
 
 #[test]

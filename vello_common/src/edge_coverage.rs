@@ -139,7 +139,23 @@ impl EdgeCoverage {
                 let mut from = 0.0;
                 for &(t, i, change) in crossings.iter().chain([&(1.0, usize::MAX, 0)]) {
                     if inside == self.paths.len() && t - from > widest.map_or(0.0, |w| w.0) {
-                        widest = Some((t - from, start + step * ((from + t) / 2.0)));
+                        let p = start + step * ((from + t) / 2.0);
+                        if !meter.admit(lines * 2, 0) {
+                            return Err(CapacityExceeded);
+                        }
+                        if p.y < y as f64 + 1.0
+                            && p.x < x as f64 + 1.0
+                            && self.holds(p)
+                            && self.paths.iter().all(|(_, rows)| {
+                                rows[row].iter().all(|line| {
+                                    let a = line.p0 - p;
+                                    let b = line.p1 - p;
+                                    a.cross(b) != 0.0 || a.dot(b) > 0.0
+                                })
+                            })
+                        {
+                            widest = Some((t - from, p));
+                        }
                     }
                     if i == usize::MAX {
                         break;
@@ -341,9 +357,7 @@ pub fn subsample(x: f64, y: f64, k: usize) -> Point {
     Point::new(x + (k as f64 + 0.5) / n, y + (row as f64 + 0.5) / n)
 }
 
-/// The points a sampled shading's pixel at a step is averaged from
-/// (`sample_shading`), one to each row and column of a grid as many a side:
-/// its coverage by either side of an edge along an axis in steps of 1/16.
+/// Number of coverage samples per pixel, one in each row and column of a square grid.
 pub const SUBSAMPLES: usize = 16;
 
 /// The rows between the points of consecutive columns (`SUBSAMPLES`); prime
@@ -448,9 +462,7 @@ pub enum Painted<'a> {
     Stroke(&'a BezPath, Affine, &'a Stroke),
 }
 
-/// The pixels around the ones tested that a region's lines are made for: a point
-/// tested lies in a pixel tested, and is tested against lines no farther than
-/// `EDGE_TOLERANCE`.
+/// Device-space padding around the sampling window for nearby edges.
 const MARGIN: f64 = 1.0;
 
 /// The steps the canvas's code takes for an element of a path, besides the lines
@@ -538,7 +550,8 @@ impl CanvasLines {
         rows: &mut EdgeRows,
         meter: &mut dyn EdgeBudget,
     ) -> Result<(), CapacityExceeded> {
-        let capacity = PathBudget::new(meter.remaining_bytes());
+        let available = meter.remaining_bytes();
+        let capacity = PathBudget::new(available);
         let prepared = self.generator.prepare_path(
             elements.iter().copied(),
             style,
@@ -546,6 +559,9 @@ impl CanvasLines {
             None,
             &capacity,
         )?;
+        if !meter.admit(0, available - capacity.remaining()) {
+            return Err(CapacityExceeded);
+        }
         prepared.index_edges(self.origin, rows, meter)
     }
 }
@@ -564,7 +580,7 @@ fn stroke(
     }
     let window = canvas.window;
     let view = window.width().max(window.height());
-    let reach = crate::flatten::stroke_reach(style, crate::flatten::max_scale(to_device));
+    let reach = crate::flatten::stroke_reach(style, crate::flatten::max_scale(to_device), true);
     let reached = window.inflate(reach, reach);
     let mut start = 0;
     while start < elements.len() {
@@ -704,7 +720,8 @@ mod edge_tests {
             for to_device in transforms {
                 let mut canvas = CanvasLines::new(level, window);
                 let mut meter = Unlimited;
-                let capacity = PathBudget::new(meter.remaining_bytes());
+                let available = meter.remaining_bytes();
+                let capacity = PathBudget::new(available);
                 let prepared = canvas
                     .generator
                     .prepare_path(

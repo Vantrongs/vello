@@ -486,32 +486,56 @@ mod tests {
 
     #[test]
     fn outlines_match_kurbo() {
-        let p = path();
-        for cap in [Cap::Butt, Cap::Square, Cap::Round] {
-            for join in [Join::Bevel, Join::Miter, Join::Round] {
-                let solid = Stroke::new(5.25).with_caps(cap).with_join(join);
-                let mut expected = kurbo::StrokeCtx::default();
-                let mut actual = StrokeBuffers::default();
-                let allowance = PathBudget::new(usize::MAX);
-                for dashed in [false, true] {
-                    let style = if dashed {
-                        solid.clone().with_dashes(0.3, [2., 1.])
-                    } else {
-                        solid.clone()
-                    };
-                    kurbo::stroke_with(&p, &style, &StrokeOpts::default(), 0.25, &mut expected);
-                    let meter = Meter::Raster(&allowance);
-                    if dashed {
-                        actual.expand(
-                            kurbo::dash(p.iter(), style.dash_offset, &style.dash_pattern),
-                            &solid,
-                            0.25,
-                            meter,
-                        );
-                    } else {
-                        actual.expand(&p, &solid, 0.25, meter);
+        let mut p = path();
+        p.move_to((-50., 40.));
+        p.line_to((-10., 50.));
+        p.line_to((-50., 60.));
+        p.line_to((-50., 60.));
+        p.move_to((0., 0.));
+        p.curve_to((10., 20.), (-10., 20.), (0., 0.));
+        p.curve_to((20., 30.), (-20., -30.), (0., 0.));
+        p.move_to((0., 0.));
+        p.curve_to((10., 10.), (0., 10.), (10., 0.)); // Cusp at t = 1/2.
+        p.move_to((0., 0.));
+        p.curve_to((10., 0.), (0., 10.), (20., -20.)); // Two interior inflections.
+        for tolerance in [0.01, 0.25, 1.] {
+            for miter_limit in [2., 30.] {
+                for cap in [Cap::Butt, Cap::Square, Cap::Round] {
+                    for join in [Join::Bevel, Join::Miter, Join::Round] {
+                        let solid = Stroke::new(5.25)
+                            .with_caps(cap)
+                            .with_join(join)
+                            .with_miter_limit(miter_limit);
+                        let mut expected = kurbo::StrokeCtx::default();
+                        let mut actual = StrokeBuffers::default();
+                        let allowance = PathBudget::new(usize::MAX);
+                        for dashed in [false, true] {
+                            let style = if dashed {
+                                solid.clone().with_dashes(0.3, [2., 1.])
+                            } else {
+                                solid.clone()
+                            };
+                            kurbo::stroke_with(
+                                &p,
+                                &style,
+                                &StrokeOpts::default(),
+                                tolerance,
+                                &mut expected,
+                            );
+                            let meter = Meter::Raster(&allowance);
+                            if dashed {
+                                actual.expand(
+                                    kurbo::dash(p.iter(), style.dash_offset, &style.dash_pattern),
+                                    &solid,
+                                    tolerance,
+                                    meter,
+                                );
+                            } else {
+                                actual.expand(&p, &solid, tolerance, meter);
+                            }
+                            assert_eq!(actual.output(), expected.output().elements());
+                        }
                     }
-                    assert_eq!(actual.output(), expected.output().elements());
                 }
             }
         }

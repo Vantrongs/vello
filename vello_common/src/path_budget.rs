@@ -24,6 +24,19 @@ impl PathBudget {
         }
     }
 
+    /// Reserve additional vector elements against this allowance before submission.
+    pub fn reserve<T>(&self, vec: &mut Vec<T>, extra: usize) -> Result<(), CapacityExceeded> {
+        if size_of::<T>() == 0 || Meter::Raster(self).room(vec, extra) {
+            Ok(())
+        } else {
+            Err(CapacityExceeded)
+        }
+    }
+
+    pub(crate) fn debit(&self, bytes: usize) {
+        self.remaining.set(self.remaining.get() - bytes);
+    }
+
     /// Capacity allowance still available.
     pub fn remaining(&self) -> usize {
         self.remaining.get()

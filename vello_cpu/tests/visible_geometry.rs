@@ -17,6 +17,23 @@ use vello_cpu::{Pixmap, RenderContext, Resources, color::palette::css::BLACK};
 /// instead of exhausting the machine.
 struct Capped;
 
+#[derive(Clone, Copy, Default)]
+struct AllocationStats {
+    live: isize,
+    peak: isize,
+    largest: usize,
+}
+
+std::thread_local! {
+    static STATS: std::cell::Cell<Option<AllocationStats>> = const { std::cell::Cell::new(None) };
+}
+
+fn measure<T>(f: impl FnOnce() -> T) -> (T, AllocationStats) {
+    STATS.set(Some(AllocationStats::default()));
+    let result = f();
+    (result, STATS.take().unwrap())
+}
+
 const CAP: usize = 1 << 30;
 
 // SAFETY: forwards to `System`.
@@ -26,12 +43,29 @@ unsafe impl GlobalAlloc for Capped {
             return std::ptr::null_mut();
         }
         // SAFETY: the caller's contract is `System`'s.
-        unsafe { System.alloc(layout) }
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            STATS.with(|stats| {
+                stats.set(stats.get().map(|mut s| {
+                    s.live += layout.size() as isize;
+                    s.peak = s.peak.max(s.live);
+                    s.largest = s.largest.max(layout.size());
+                    s
+                }))
+            });
+        }
+        p
     }
 
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         // SAFETY: `p` came from `alloc` above.
         unsafe { System.dealloc(p, layout) };
+        STATS.with(|stats| {
+            stats.set(stats.get().map(|mut s| {
+                s.live -= layout.size() as isize;
+                s
+            }))
+        });
     }
 }
 
@@ -895,20 +929,20 @@ fn leading_butt_gap_survives_a_long_period() {
     assert_eq!(pixels[4 * 100 + 6], 255);
 }
 
+struct Allow;
+impl vello_cpu::edge_coverage::EdgeBudget for Allow {
+    fn admit(&mut self, _: u64, _: usize) -> bool {
+        true
+    }
+    fn remaining_bytes(&self) -> usize {
+        usize::MAX
+    }
+}
 #[test]
 fn prepared_samples_intersect_before_selecting_sliver_points() {
-    use vello_cpu::edge_coverage::{EdgeBudget, EdgeCoverage, EdgeSamples, Painted};
-    struct Allow;
-    impl EdgeBudget for Allow {
-        fn admit(&mut self, _: u64, _: usize) -> bool {
-            true
-        }
-        fn remaining_bytes(&self) -> usize {
-            usize::MAX
-        }
-    }
-    let window = Rect::new(0., 0., 2., 1.);
-    let mask = |rects: &[Rect]| {
+    use vello_cpu::edge_coverage::{EdgeCoverage, EdgeSamples, Painted};
+    let window = Rect::new(0., 0., 2., 2.);
+    let mask = |rects: &[Rect], y, tolerance| {
         let paths: Vec<_> = rects.iter().map(|r| r.to_path(0.1)).collect();
         let region = EdgeCoverage::prepare(
             paths
@@ -921,20 +955,34 @@ fn prepared_samples_intersect_before_selecting_sliver_points() {
         .unwrap();
         let mut visits = Vec::new();
         region
-            .sample_row(0, [0, 1], 0., &mut Allow, |x, result| {
+            .sample_row(y, [0, 1], tolerance, &mut Allow, |x, result| {
                 visits.push((x, result))
             })
             .unwrap();
         visits
     };
     assert_eq!(
-        mask(&[Rect::new(0., 0., 0.75, 1.)]),
+        mask(&[Rect::new(0., 0., 0.75, 1.)], 0, 0.),
         [(0, EdgeSamples::Mask(0x0fff))]
     );
-    assert!(mask(&[Rect::new(0., 0., 0.5, 1.), Rect::new(0.5, 0., 1., 1.)]).is_empty());
-    let sliver = Rect::new(0.49, 0., 0.52, 1.);
-    let found = mask(&[sliver]);
-    assert!(matches!(found.as_slice(),[(0,EdgeSamples::Interior(p))] if sliver.contains(*p)));
+    assert!(
+        mask(
+            &[Rect::new(0., 0., 0.5, 1.), Rect::new(0.5, 0., 1., 1.)],
+            0,
+            0.
+        )
+        .is_empty()
+    );
+    for (r, y, tolerance) in [
+        (Rect::new(0.49, 0., 0.52, 1.), 0, 0.),
+        (Rect::new(0., 33. / 32., 1., 17. / 16.), 1, 1. / 32.),
+        (Rect::new(0.49, 0., 0.53125, 1.), 0, 1. / 32.),
+    ] {
+        assert!(
+            matches!(mask(&[r], y, tolerance).as_slice(), [(0, EdgeSamples::Interior(p))]
+            if r.x0 < p.x && p.x < r.x1 && r.y0 < p.y && p.y < r.y1)
+        );
+    }
 }
 
 #[test]
@@ -1016,4 +1064,133 @@ fn failed_tile_or_strip_growth_preserves_every_storage_mode() {
             assert_eq!(storage.generation_mode(), mode);
         }
     }
+}
+
+#[test]
+fn dashed_miter_tip_has_the_same_edge_samples_as_solid() {
+    use vello_cpu::edge_coverage::{EdgeCoverage, Painted};
+    use vello_cpu::kurbo::{Join, Stroke};
+    let mut path = BezPath::new();
+    path.move_to((-50., 40.));
+    path.line_to((-10., 50.));
+    path.line_to((-50., 60.));
+    let solid = Stroke::new(10.)
+        .with_join(Join::Miter)
+        .with_miter_limit(30.);
+    let samples = |style| {
+        let region = EdgeCoverage::prepare(
+            [Painted::Stroke(&path, Affine::IDENTITY, style)],
+            Rect::new(0., 49., 12., 51.),
+            vello_cpu::Level::baseline(),
+            &mut Allow,
+        )
+        .unwrap();
+        let mut visits = Vec::new();
+        for y in 49..51 {
+            region
+                .sample_row(y, [10], 1. / 32., &mut Allow, |x, s| visits.push((x, y, s)))
+                .unwrap();
+        }
+        visits
+    };
+    let expected = samples(&solid);
+    assert!(!expected.is_empty());
+    assert_eq!(
+        samples(&solid.clone().with_dashes(0., [100., 100.])),
+        expected
+    );
+}
+
+#[test]
+fn edge_storage_and_generator_fit_admitted_bytes() {
+    use vello_cpu::edge_coverage::{EdgeBudget, EdgeCoverage, Painted};
+    struct Strict(usize);
+    impl EdgeBudget for Strict {
+        fn remaining_bytes(&self) -> usize {
+            self.0
+        }
+        fn admit(&mut self, _: u64, bytes: usize) -> bool {
+            if bytes > self.0 {
+                return false;
+            }
+            self.0 -= bytes;
+            true
+        }
+    }
+    let window = Rect::new(0., 0., 32., 32.);
+    let path = Rect::new(1., 1., 31., 31.).to_path(0.1);
+    let mut budget = Strict(16384);
+    let (region, stats) = measure(|| {
+        EdgeCoverage::prepare(
+            [Painted::Fill(&path, Affine::IDENTITY, Fill::NonZero)],
+            window,
+            vello_cpu::Level::baseline(),
+            &mut budget,
+        )
+        .unwrap()
+    });
+    assert!(!region.is_empty());
+    assert!(stats.peak as usize <= 16384 - budget.0);
+}
+
+#[test]
+fn recorder_growth_refuses_warmed_stroke() {
+    use vello_cpu::path_budget::PathBudget;
+    let path = Rect::new(5., 5., 12., 12.).to_path(0.1);
+    let image = |attempt| {
+        draw(|ctx| {
+            ctx.try_stroke_path(&path, &PathBudget::new(1 << 20))
+                .unwrap();
+            for _ in 1..4 {
+                ctx.fill_rect(&Rect::new(3., 3., 4., 4.));
+            }
+            ctx.flush();
+            if attempt {
+                ctx.set_transform(Affine::translate((10., 10.)));
+                assert!(ctx.try_stroke_path(&path, &PathBudget::new(0)).is_err());
+            }
+        })
+    };
+    assert_eq!(image(true), image(false));
+}
+
+#[cfg(feature = "multithreading")]
+#[test]
+fn prepared_batch_under_a_complex_clip_matches_single_thread() {
+    use vello_cpu::{RenderSettings, path_budget::PathBudget};
+    let mut clip = BezPath::new();
+    for x in (0..512).step_by(3) {
+        clip.extend(Rect::new(x as f64 + 0.25, 0., x as f64 + 1.75, 512.).to_path(0.1));
+    }
+    let image = |num_threads| {
+        let mut ctx = RenderContext::new_with(
+            512,
+            512,
+            RenderSettings {
+                num_threads,
+                ..Default::default()
+            },
+        );
+        let path = Rect::new(1., 1., 20., 20.).to_path(0.1);
+        ctx.fill_path(&path);
+        ctx.push_clip_path(&clip);
+        ctx.fill_rect(&Rect::new(0., 0., 15., 15.));
+        ctx.try_stroke_path(&path, &PathBudget::new(1 << 20))
+            .unwrap();
+        ctx.push_clip_rect(&Rect::new(0., 0., 512., 512.));
+        ctx.try_stroke_path(&path, &PathBudget::new(1 << 20))
+            .unwrap();
+        let (_, stats) = measure(|| ctx.pop_clip());
+        assert!(
+            stats.largest < 8192,
+            "flush allocated {} bytes",
+            stats.largest
+        );
+        ctx.pop_clip();
+        ctx.flush();
+        let mut pixmap = Pixmap::new(512, 512);
+        ctx.render(&mut pixmap, &mut Resources::new());
+        pixmap
+    };
+    assert_eq!(image(2).data(), image(0).data());
 }

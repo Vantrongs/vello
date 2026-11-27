@@ -63,6 +63,9 @@ pub(crate) struct MultiThreadedDispatcher {
     allocation_group: AllocationGroup,
     /// The cost of the current batch.
     batch_cost: f32,
+    pending_draws: usize,
+    pending_layer_changes: usize,
+    batch_needs_clip: bool,
     /// The sender used to dispatch new rendering tasks from the main thread.
     ///
     /// This field will be set once we call the `init` method.
@@ -143,6 +146,9 @@ impl MultiThreadedDispatcher {
             allocations: Allocations::default(),
             allocation_group: AllocationGroup::default(),
             batch_cost,
+            pending_draws: 0,
+            pending_layer_changes: 0,
+            batch_needs_clip: false,
             task_idx,
             flushed,
             workers,
@@ -236,6 +242,16 @@ impl MultiThreadedDispatcher {
             self.init();
         }
 
+        match &task {
+            RenderTaskType::PushLayer { .. } | RenderTaskType::PopLayer => {
+                self.pending_layer_changes += 1
+            }
+            RenderTaskType::Prepared(_) => self.pending_draws += 1,
+            _ => {
+                self.pending_draws += 1;
+                self.batch_needs_clip = true;
+            }
+        }
         let cost = estimate_render_task_cost(&task, &self.allocation_group.path);
         self.allocation_group.render_tasks.push(task);
         self.batch_cost += cost;
@@ -266,13 +282,18 @@ impl MultiThreadedDispatcher {
         let allocation_group =
             std::mem::replace(&mut self.allocation_group, self.allocations.get());
         let task_sender = self.task_sender.as_mut().unwrap();
-        let clip_path = self.clip_context.get().map(|c| OwnedClip {
-            strips: c.path.strips.into(),
-            alphas: c.path.alphas.into(),
-            bbox: c.path.bbox,
-            opaque_bbox: c.path.opaque_bbox,
-            shape: c.shape,
-        });
+        let needs_clip = core::mem::take(&mut self.batch_needs_clip);
+        let clip_path = self
+            .clip_context
+            .get()
+            .filter(|_| needs_clip)
+            .map(|c| OwnedClip {
+                strips: c.path.strips.into(),
+                alphas: c.path.alphas.into(),
+                bbox: c.path.bbox,
+                opaque_bbox: c.path.opaque_bbox,
+                shape: c.shape,
+            });
         let task = RenderTask {
             idx: task_idx,
             clip_path,
@@ -315,6 +336,12 @@ impl MultiThreadedDispatcher {
                 Some(mut task) => {
                     let num_tasks = task.allocation_group.recorded_commands.len();
                     for cmd in task.allocation_group.recorded_commands.drain(0..num_tasks) {
+                        match &cmd {
+                            RecordedCommand::PushLayer { .. } | RecordedCommand::PopLayer => {
+                                self.pending_layer_changes -= 1
+                            }
+                            _ => self.pending_draws -= 1,
+                        }
                         match cmd {
                             RecordedCommand::Prepared(draw) => {
                                 let range = draw.strip_range.clone();
@@ -510,6 +537,17 @@ impl Dispatcher for MultiThreadedDispatcher {
         mask: Option<Mask>,
         budget: &vello_common::path_budget::PathBudget,
     ) -> Result<(), vello_common::path_budget::CapacityExceeded> {
+        // Pending layer commands determine which node vector receives this draw.
+        if self.pending_layer_changes != 0 {
+            self.flush();
+        }
+        self.recorder
+            .reserve_draws(self.pending_draws + 1, budget)?;
+        if !self.flushed {
+            let batch = &mut self.allocation_group;
+            budget.reserve(&mut batch.render_tasks, 1)?;
+            budget.reserve(&mut batch.recorded_commands, batch.render_tasks.len() + 1)?;
+        }
         let start = self.strip_storage.strips.len();
         self.strip_generator.try_generate_stroke(
             path,

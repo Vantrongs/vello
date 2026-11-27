@@ -340,6 +340,7 @@ impl Dispatcher for SingleThreadedDispatcher {
         mask: Option<Mask>,
         budget: &vello_common::path_budget::PathBudget,
     ) -> Result<(), vello_common::path_budget::CapacityExceeded> {
+        self.recorder.reserve_draws(1, budget)?;
         let start = self.strip_storage.strips.len();
         self.viewport.with_generator_and_clip(|generator, clip| {
             generator.try_generate_stroke(

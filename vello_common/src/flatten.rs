@@ -421,7 +421,7 @@ const HAIRLINE_MAX_WIDTH: f64 = 1.0;
 /// for the flattening tolerance. Dashing retains endpoint joins on skipped
 /// pieces, so its margin only has to cover caps.
 fn stroke_cull_rect(cull_bbox: RectU16, style: &Stroke, scale: f64) -> [f64; 4] {
-    let reach = stroke_reach(style, scale);
+    let reach = stroke_reach(style, scale, style.dash_pattern.is_empty());
     [
         f64::from(cull_bbox.x0) - reach,
         f64::from(cull_bbox.y0) - reach,
@@ -430,8 +430,8 @@ fn stroke_cull_rect(cull_bbox: RectU16, style: &Stroke, scale: f64) -> [f64; 4] 
     ]
 }
 
-pub(crate) fn stroke_reach(style: &Stroke, scale: f64) -> f64 {
-    let miter = if style.join == kurbo::Join::Miter && style.dash_pattern.is_empty() {
+pub(crate) fn stroke_reach(style: &Stroke, scale: f64, include_joins: bool) -> f64 {
+    let miter = if include_joins && style.join == kurbo::Join::Miter {
         style.miter_limit
     } else {
         0.0

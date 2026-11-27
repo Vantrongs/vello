@@ -448,6 +448,39 @@ fn snapped_scene_size(width: u16, height: u16) -> SizeU16 {
 }
 
 impl<D: Drawable> CommandRecorder<D> {
+    /// Reserve storage for consecutive draws in the current layer, including pending draws.
+    pub fn reserve_draws(
+        &mut self,
+        count: usize,
+        budget: &crate::path_budget::PathBudget,
+    ) -> Result<(), crate::path_budget::CapacityExceeded> {
+        budget.reserve(&mut self.draws, count)?;
+        let draw_idx = self.draws.len() as u32;
+        if self
+            .active_node_mut()
+            .is_some_and(|node| node.layer.is_none() && node.draws.end == draw_idx)
+        {
+            return Ok(());
+        }
+        if let Some(id) = self.active_layer {
+            let nodes = &mut self.layers[id as usize].nodes;
+            if nodes.len() == nodes.capacity() {
+                let old = if nodes.spilled() { nodes.capacity() } else { 0 };
+                let cap = (nodes.capacity() * 2).min(budget.remaining() / size_of::<Node>());
+                if cap <= nodes.len() {
+                    return Err(crate::path_budget::CapacityExceeded);
+                }
+                nodes
+                    .try_reserve_exact(cap - nodes.len())
+                    .map_err(|_| crate::path_budget::CapacityExceeded)?;
+                budget.debit((cap - old) * size_of::<Node>());
+            }
+        } else {
+            budget.reserve(&mut self.nodes, 1)?;
+        }
+        Ok(())
+    }
+
     /// Push a draw command.
     #[inline]
     pub fn push_draw(&mut self, draw: D, strips: &[Strip]) {
