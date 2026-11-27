@@ -37,6 +37,53 @@ const MAX_SPLITS: u32 = 4096;
 /// no larger than a 65 535 px view needs about a thousand. Further pieces are chords.
 const MAX_POLYLINE: u32 = 4096;
 
+fn dash_pieces(extent: f64, view: f64, curved: bool) -> u64 {
+    if extent <= view {
+        1
+    } else if curved {
+        5 * (u64::from(MAX_SPLITS) + 1) + u64::from(MAX_POLYLINE)
+    } else {
+        // One cut for each side in SplitHuge::split_dash_line.
+        5
+    }
+}
+
+/// Vello preprocesses the pattern once per stroke and binary searches its
+/// cumulative lengths when carrying phase past hidden or dense pieces.
+pub fn dash_work(pattern: &[f64], elements: &[PathEl], to_device: Affine, view: f64) -> u64 {
+    let pattern_len = pattern.len();
+    if pattern.is_empty() {
+        return 0;
+    }
+    let entries = pattern_len as u64 * (1 + (pattern_len % 2) as u64);
+    let mut pieces = 0_u64;
+    let (mut start, mut current) = (Point::ZERO, Point::ZERO);
+    for el in elements {
+        let (end, curved) = match *el {
+            PathEl::MoveTo(p) => {
+                (start, current) = (p, p);
+                continue;
+            }
+            PathEl::ClosePath => (start, false),
+            PathEl::LineTo(p) => (p, false),
+            PathEl::QuadTo(_, p) | PathEl::CurveTo(_, _, p) => (p, true),
+        };
+        let mut bounds = crate::kurbo::Rect::from_points(to_device * current, to_device * end);
+        match *el {
+            PathEl::QuadTo(p, _) => bounds = bounds.union_pt(to_device * p),
+            PathEl::CurveTo(p, q, _) => {
+                bounds = bounds.union_pt(to_device * p).union_pt(to_device * q)
+            }
+            _ => {}
+        }
+        current = end;
+        let extent = bounds.width().max(bounds.height());
+        pieces = pieces.saturating_add(dash_pieces(extent, view, curved));
+    }
+    let walks = pieces.saturating_mul(u64::from(entries.ilog2()) + 2);
+    walks.saturating_add(2 * entries)
+}
+
 /// The view in device pixels, the transform from path to device space, and how large
 /// a curve may be in path space.
 #[derive(Clone, Copy, Debug)]

@@ -4,6 +4,7 @@
 //! Primitives for creating tiles.
 
 use crate::flatten::Line;
+use crate::path_budget::Meter;
 use alloc::vec;
 use alloc::vec::Vec;
 use fearless_simd::*;
@@ -613,12 +614,18 @@ impl Tiles {
         width: u16,
         height: u16,
     ) -> bool {
-        dispatch!(level, simd => self.make_tiles_analytic_aa_impl::<_>(
-            simd,
-            lines,
-            width,
-            height,
-        ))
+        self.make_tiles_metered(level, lines, width, height, Meter::default())
+    }
+
+    pub(crate) fn make_tiles_metered(
+        &mut self,
+        level: Level,
+        lines: &[Line],
+        width: u16,
+        height: u16,
+        meter: Meter<'_>,
+    ) -> bool {
+        dispatch!(level, simd => self.make_tiles_analytic_aa_impl(simd, lines, width, height, meter))
     }
 
     #[inline(always)]
@@ -628,7 +635,21 @@ impl Tiles {
         lines: &[Line],
         width: u16,
         height: u16,
+        meter: Meter<'_>,
     ) -> bool {
+        if height != self.windings.height {
+            let (rows, words) = CulledWindings::sizes(height);
+            let w = &mut self.windings;
+            let grow_partial = rows.saturating_sub(w.partial.len());
+            let grow_coarse = rows.saturating_sub(w.coarse.len());
+            let grow_active = words.saturating_sub(w.active.len());
+            if !meter.room(&mut w.partial, grow_partial)
+                || !meter.room(&mut w.coarse, grow_coarse)
+                || !meter.room(&mut w.active, grow_active)
+            {
+                return false;
+            }
+        }
         self.reset(width, height);
 
         if width == 0 || height == 0 {
@@ -651,6 +672,9 @@ impl Tiles {
         let tile_height = f64::from(Tile::HEIGHT);
 
         for (line_idx, line) in lines.iter().take(MAX_LINES_PER_PATH as usize).enumerate() {
+            if meter.failed() {
+                return false;
+            }
             let line_idx = line_idx as u32;
 
             let Some([p0_x, p0_y, p1_x, p1_y]) = tile_coordinates(*line) else {
@@ -791,6 +815,9 @@ impl Tiles {
                         let winding =
                             ((f64::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT;
                         let tile = Tile::new_clamped(x, y_top_tiles, line_idx, winding);
+                        if !meter.room(&mut self.tile_buf, 1) {
+                            return false;
+                        }
                         self.tile_buf.push(tile);
                     }
 
@@ -804,6 +831,9 @@ impl Tiles {
 
                     for y_idx in y_start..y_bottom_tiles {
                         let tile = Tile::new_clamped(x, y_idx, line_idx, W);
+                        if !meter.room(&mut self.tile_buf, 1) {
+                            return false;
+                        }
                         self.tile_buf.push(tile);
                     }
                 } else {
@@ -828,6 +858,9 @@ impl Tiles {
                             let x_end = (row_right_x as u16).min(tile_columns - 1);
 
                             if x_start <= x_end {
+                                if !meter.room(tile_buf, usize::from(x_end - x_start) + 1) {
+                                    return;
+                                }
                                 let winding = if x_start == x_end { w_single } else { w_start };
 
                                 tile_buf.push(Tile::new(x_start, y_idx, line_idx, winding));
@@ -1020,6 +1053,9 @@ impl Tiles {
                     line_idx,
                     ((f64::from(y_top_tiles) >= line_top_y) as u32) << WINDING_SHIFT,
                 );
+                if !meter.room(&mut self.tile_buf, 1) {
+                    return false;
+                }
                 self.tile_buf.push(tile);
             }
         }

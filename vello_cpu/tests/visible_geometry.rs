@@ -894,3 +894,126 @@ fn leading_butt_gap_survives_a_long_period() {
     assert_eq!(pixels[4 * 100 + 3], 0);
     assert_eq!(pixels[4 * 100 + 6], 255);
 }
+
+#[test]
+fn prepared_samples_intersect_before_selecting_sliver_points() {
+    use vello_cpu::edge_coverage::{EdgeBudget, EdgeCoverage, EdgeSamples, Painted};
+    struct Allow;
+    impl EdgeBudget for Allow {
+        fn admit(&mut self, _: u64, _: usize) -> bool {
+            true
+        }
+        fn remaining_bytes(&self) -> usize {
+            usize::MAX
+        }
+    }
+    let window = Rect::new(0., 0., 2., 1.);
+    let mask = |rects: &[Rect]| {
+        let paths: Vec<_> = rects.iter().map(|r| r.to_path(0.1)).collect();
+        let region = EdgeCoverage::prepare(
+            paths
+                .iter()
+                .map(|p| Painted::Fill(p, Affine::IDENTITY, Fill::NonZero)),
+            window,
+            vello_cpu::Level::baseline(),
+            &mut Allow,
+        )
+        .unwrap();
+        let mut visits = Vec::new();
+        region
+            .sample_row(0, [0, 1], 0., &mut Allow, |x, result| {
+                visits.push((x, result))
+            })
+            .unwrap();
+        visits
+    };
+    assert_eq!(
+        mask(&[Rect::new(0., 0., 0.75, 1.)]),
+        [(0, EdgeSamples::Mask(0x0fff))]
+    );
+    assert!(mask(&[Rect::new(0., 0., 0.5, 1.), Rect::new(0.5, 0., 1., 1.)]).is_empty());
+    let sliver = Rect::new(0.49, 0., 0.52, 1.);
+    let found = mask(&[sliver]);
+    assert!(matches!(found.as_slice(),[(0,EdgeSamples::Interior(p))] if sliver.contains(*p)));
+}
+
+#[test]
+fn refused_stroke_leaves_prior_paint_and_can_be_retried() {
+    use vello_cpu::{kurbo::Stroke, path_budget::PathBudget};
+    let path = Rect::new(12.25, 13.5, 84., 92.).to_path(0.1);
+    let style = Stroke::new(7.).with_dashes(1., [4., 3.]);
+    let paint = |ctx: &mut RenderContext| {
+        ctx.fill_rect(&Rect::new(0., 0., 8., 8.));
+        ctx.set_stroke(style.clone());
+    };
+    let expected = draw(paint);
+    let refused = draw(|ctx| {
+        paint(ctx);
+        assert!(ctx.try_stroke_path(&path, &PathBudget::new(0)).is_err());
+    });
+    assert_eq!(refused, expected);
+    let retried = draw(|ctx| {
+        paint(ctx);
+        assert!(ctx.try_stroke_path(&path, &PathBudget::new(4096)).is_err());
+        ctx.try_stroke_path(&path, &PathBudget::new(1 << 20))
+            .unwrap();
+    });
+    assert_eq!(
+        retried,
+        draw(|ctx| {
+            paint(ctx);
+            ctx.stroke_path(&path);
+        })
+    );
+}
+
+#[test]
+fn failed_tile_or_strip_growth_preserves_every_storage_mode() {
+    use vello_cpu::{
+        Level,
+        path_budget::PathBudget,
+        strip_generator::{GenerationMode, PathStyle, StripGenerator, StripStorage},
+    };
+    let path = Circle::new((41.5, 41.5), 30.).to_path(0.1);
+    for warm_tiles in [false, true] {
+        for mode in [
+            GenerationMode::Append,
+            GenerationMode::Replace,
+            GenerationMode::ReplaceAfter(1),
+        ] {
+            let mut generator = StripGenerator::new(100, 100, Level::baseline());
+            let mut storage = StripStorage::new(mode);
+            generator.generate_filled_rect_fast(&Rect::new(1., 1., 5., 5.), &mut storage, None);
+            storage.strips.shrink_to_fit();
+            storage.alphas.shrink_to_fit();
+            let before = (storage.strips.clone(), storage.alphas.clone());
+            if warm_tiles {
+                generator.generate_filled_path(
+                    &path,
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    None,
+                    &mut StripStorage::default(),
+                    None,
+                );
+            }
+            let prepared = generator
+                .prepare_path(
+                    &path,
+                    PathStyle::Fill(Fill::NonZero),
+                    Affine::IDENTITY,
+                    None,
+                    &PathBudget::new(1 << 20),
+                )
+                .unwrap();
+            assert!(
+                prepared
+                    .try_submit(None, &mut storage, &PathBudget::new(0))
+                    .is_err()
+            );
+            assert_eq!(storage.strips, before.0);
+            assert_eq!(storage.alphas, before.1);
+            assert_eq!(storage.generation_mode(), mode);
+        }
+    }
+}

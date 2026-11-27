@@ -280,10 +280,36 @@ pub fn stroke(
         affine,
         line_buf,
         flatten_ctx,
-        stroke_ctx,
+        StrokeExpansion::Kurbo(stroke_ctx),
         cull_bbox,
         Meter::default(),
     );
+}
+
+pub(crate) enum StrokeExpansion<'a> {
+    Kurbo(&'a mut StrokeCtx),
+    Vello(&'a mut crate::stroke::StrokeBuffers),
+}
+
+impl StrokeExpansion<'_> {
+    fn expand(
+        &mut self,
+        path: impl IntoIterator<Item = PathEl>,
+        style: &Stroke,
+        tolerance: f64,
+        meter: Meter<'_>,
+    ) {
+        match self {
+            Self::Kurbo(ctx) => expand_stroke(path, style, tolerance, ctx),
+            Self::Vello(ctx) => ctx.expand(path, style, tolerance, meter),
+        }
+    }
+    fn output(&self) -> &[PathEl] {
+        match self {
+            Self::Kurbo(ctx) => ctx.output().elements(),
+            Self::Vello(ctx) => ctx.output(),
+        }
+    }
 }
 
 pub(crate) fn stroke_metered(
@@ -293,7 +319,7 @@ pub(crate) fn stroke_metered(
     affine: Affine,
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
-    stroke_ctx: &mut StrokeCtx,
+    mut stroke_ctx: StrokeExpansion<'_>,
     cull_bbox: RectU16,
     meter: Meter<'_>,
 ) {
@@ -329,7 +355,7 @@ pub(crate) fn stroke_metered(
     // flattens its outline in device space, splitting huge curves itself: an undashed
     // stroke needs no splitting here.
     if style.dash_pattern.is_empty() {
-        expand_stroke(path, style, tolerance, stroke_ctx);
+        stroke_ctx.expand(path, style, tolerance, meter);
     } else {
         let path = SplitHuge::new(path, cull, true);
         let dashed = crate::dash::dash(
@@ -349,7 +375,7 @@ pub(crate) fn stroke_metered(
             end_cap: style.end_cap,
             dash_offset: 0.0,
         };
-        expand_stroke(dashed, &solid, tolerance, stroke_ctx);
+        stroke_ctx.expand(dashed, &solid, tolerance, meter);
     }
     fill_outline(
         level,
@@ -364,7 +390,7 @@ pub(crate) fn stroke_metered(
 
 fn fill_outline(
     level: Level,
-    outline: &kurbo::BezPath,
+    outline: &[PathEl],
     affine: Affine,
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
@@ -372,15 +398,15 @@ fn fill_outline(
     meter: Meter<'_>,
 ) {
     // Only the full flattener uses SIMD. Metered outlines must charge once.
-    if meter.0.is_none()
+    if !matches!(meter, Meter::Indexed(_))
         && !dispatch!(Level::baseline(), simd => fill_path::<_, false>(
-            simd, outline.iter(), affine, line_buf, flatten_ctx, cull_bbox, Meter::default(),
+            simd, outline.iter().copied(), affine, line_buf, flatten_ctx, cull_bbox, meter,
         ))
     {
         return;
     }
     dispatch!(level, simd => fill_path::<_, true>(
-        simd, outline.iter(), affine, line_buf, flatten_ctx, cull_bbox, meter,
+        simd, outline.iter().copied(), affine, line_buf, flatten_ctx, cull_bbox, meter,
     ));
 }
 
@@ -395,18 +421,22 @@ const HAIRLINE_MAX_WIDTH: f64 = 1.0;
 /// for the flattening tolerance. Dashing retains endpoint joins on skipped
 /// pieces, so its margin only has to cover caps.
 fn stroke_cull_rect(cull_bbox: RectU16, style: &Stroke, scale: f64) -> [f64; 4] {
-    let miter = if style.join == kurbo::Join::Miter && style.dash_pattern.is_empty() {
-        style.miter_limit
-    } else {
-        0.0
-    };
-    let reach = 0.5 * style.width * scale * miter.max(SQRT_2) + 1.0;
+    let reach = stroke_reach(style, scale);
     [
         f64::from(cull_bbox.x0) - reach,
         f64::from(cull_bbox.y0) - reach,
         f64::from(cull_bbox.x1) + reach,
         f64::from(cull_bbox.y1) + reach,
     ]
+}
+
+pub(crate) fn stroke_reach(style: &Stroke, scale: f64) -> f64 {
+    let miter = if style.join == kurbo::Join::Miter && style.dash_pattern.is_empty() {
+        style.miter_limit
+    } else {
+        0.0
+    };
+    0.5 * style.width * scale * miter.max(SQRT_2) + 1.0
 }
 
 /// The largest factor by which `affine` stretches any direction (its largest singular
@@ -495,9 +525,9 @@ impl Callback for FlattenerCallback<'_> {
             LinePathEl::LineTo(p) => {
                 self.is_nan |= p.is_nan();
 
-                if self.meter.0.is_some() {
+                if matches!(self.meter, Meter::Indexed(_)) {
                     emit_edge(self.line_buf, self.meter, self.rect, self.p0, p);
-                } else {
+                } else if self.meter.room(self.line_buf, 1) {
                     self.line_buf.push(Line::new(self.p0.into(), p.into()));
                 }
                 self.p0 = p;

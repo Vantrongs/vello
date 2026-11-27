@@ -28,6 +28,17 @@ pub(crate) trait Dispatcher: Debug + Send {
         aliasing_threshold: Option<u8>,
         mask: Option<Mask>,
     );
+    fn try_stroke_path(
+        &mut self,
+        path: &BezPath,
+        stroke: &Stroke,
+        transform: Affine,
+        paint: Paint,
+        blend_mode: BlendMode,
+        aliasing_threshold: Option<u8>,
+        mask: Option<Mask>,
+        budget: &vello_common::path_budget::PathBudget,
+    ) -> Result<(), vello_common::path_budget::CapacityExceeded>;
     fn stroke_path(
         &mut self,
         path: &BezPath,

@@ -5,6 +5,7 @@
 
 use crate::geometry::RectU16;
 use crate::kurbo::{Affine, BezPath, PathEl, Rect};
+use crate::path_budget::Meter;
 use crate::strip::Strip;
 use crate::strip_generator::{GenerationMode, StripGenerator, StripStorage};
 use crate::tile::Tile;
@@ -440,7 +441,17 @@ pub fn intersect(
     path_2: PathDataRef<'_>,
     target: &mut StripStorage,
 ) {
-    dispatch!(level, simd => intersect_impl(simd, path_1, path_2, target));
+    intersect_metered(level, path_1, path_2, target, Meter::default());
+}
+
+pub(crate) fn intersect_metered(
+    level: Level,
+    path_1: PathDataRef<'_>,
+    path_2: PathDataRef<'_>,
+    target: &mut StripStorage,
+    meter: Meter<'_>,
+) {
+    dispatch!(level, simd => intersect_impl(simd, path_1, path_2, target, meter));
 }
 
 /// The implementation of the clipping algorithm using sparse strips. Conceptually, it is relatively
@@ -460,6 +471,7 @@ fn intersect_impl<S: Simd>(
     path_1: PathDataRef<'_>,
     path_2: PathDataRef<'_>,
     target: &mut StripStorage,
+    meter: Meter<'_>,
 ) {
     // In case either path is empty, the clip path should be empty.
     if path_1.strips.is_empty() || path_2.strips.is_empty() {
@@ -488,6 +500,7 @@ fn intersect_impl<S: Simd>(
         path_2_idx = first_strip_at_or_after(path_2.strips, cur_y);
     }
 
+    let strip_start = target.strips.len();
     let mut strip_state = None;
 
     // Iterate over each strip row and handle them.
@@ -525,7 +538,7 @@ fn intersect_impl<S: Simd>(
                         // so that the whole area before that will be filled with a sparse
                         // fill.
                         (Region::Fill(_), Region::Fill(_)) => {
-                            flush_strip(&mut strip_state, &mut target.strips, cur_y);
+                            flush_strip(meter, &mut strip_state, &mut target.strips, cur_y);
                             start_strip(&mut strip_state, &target.alphas, overlap.end, true);
                         }
                         // One fill one strip, so we simply use the alpha mask from the strip region.
@@ -534,12 +547,15 @@ fn intersect_impl<S: Simd>(
                             // If possible, don't create a new strip but just extend the current one.
                             if should_create_new_strip(&strip_state, &target.alphas, overlap.start)
                             {
-                                flush_strip(&mut strip_state, &mut target.strips, cur_y);
+                                flush_strip(meter, &mut strip_state, &mut target.strips, cur_y);
                                 start_strip(&mut strip_state, &target.alphas, overlap.start, false);
                             }
 
                             let s_alphas = &s.alphas[(overlap.start - s.start) as usize * 4..]
                                 [..overlap.width() as usize * 4];
+                            if !meter.room(&mut target.alphas, s_alphas.len()) {
+                                return;
+                            }
                             target.alphas.extend_from_slice(s_alphas);
                         }
                         // Two strips, we need to multiply the opacity masks from both paths.
@@ -547,7 +563,7 @@ fn intersect_impl<S: Simd>(
                             // Once again, only create a new strip if we can't extend the current one.
                             if should_create_new_strip(&strip_state, &target.alphas, overlap.start)
                             {
-                                flush_strip(&mut strip_state, &mut target.strips, cur_y);
+                                flush_strip(meter, &mut strip_state, &mut target.strips, cur_y);
                                 start_strip(&mut strip_state, &target.alphas, overlap.start, false);
                             }
 
@@ -567,6 +583,9 @@ fn intersect_impl<S: Simd>(
                                 .iter()
                                 .take(num_blocks as usize);
 
+                            if !meter.room(&mut target.alphas, num_blocks as usize * 16) {
+                                return;
+                            }
                             for (s1_alpha, s2_alpha) in s1_alphas.zip(s2_alphas) {
                                 let s1 = u8x16::from_slice(simd, s1_alpha);
                                 let s2 = u8x16::from_slice(simd, s2_alpha);
@@ -588,12 +607,15 @@ fn intersect_impl<S: Simd>(
         }
 
         // Flush the strip before advancing to the next strip row.
-        flush_strip(&mut strip_state, &mut target.strips, cur_y);
+        flush_strip(meter, &mut strip_state, &mut target.strips, cur_y);
         cur_y += 1;
     }
 
     // Push the sentinel strip if the intersection is not empty.
-    if !target.strips.is_empty() {
+    if target.strips.len() != strip_start {
+        if !meter.room(&mut target.strips, 1) {
+            return;
+        }
         target
             .strips
             .push(Strip::sentinel(end_y * Tile::HEIGHT, target.alphas.len()));
@@ -841,8 +863,16 @@ struct StripState {
     fill_gap: bool,
 }
 
-fn flush_strip(strip_state: &mut Option<StripState>, strips: &mut Vec<Strip>, cur_y: u16) {
+fn flush_strip(
+    meter: Meter<'_>,
+    strip_state: &mut Option<StripState>,
+    strips: &mut Vec<Strip>,
+    cur_y: u16,
+) {
     if let Some(state) = core::mem::take(strip_state) {
+        if !meter.room(strips, 1) {
+            return;
+        }
         strips.push(Strip::new(
             state.x,
             cur_y * Tile::HEIGHT,

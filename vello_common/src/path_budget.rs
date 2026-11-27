@@ -3,12 +3,12 @@
 
 //! Allocation metering during directed-edge preparation.
 
+pub use crate::cull::dash_work;
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-/// Cumulative allowance for additional Vello-owned vector capacity during path preparation.
-/// Reused capacity is free. Kurbo's private stroke outline buffers and rasterization after
-/// submission are outside this allowance.
+/// Allowance for Vello vector growth while preparing edges and submitting strips.
+/// Reused storage is free. A growth must also fit while its old allocation is live.
 #[derive(Debug)]
 pub struct PathBudget {
     remaining: Cell<usize>,
@@ -43,16 +43,26 @@ impl core::fmt::Display for CapacityExceeded {
 impl core::error::Error for CapacityExceeded {}
 
 #[derive(Clone, Copy, Default, Debug)]
-pub(crate) struct Meter<'a>(pub(crate) Option<&'a PathBudget>);
+pub(crate) enum Meter<'a> {
+    #[default]
+    Unlimited,
+    Raster(&'a PathBudget),
+    Indexed(&'a PathBudget),
+}
 
 impl Meter<'_> {
     pub(crate) fn failed(self) -> bool {
-        self.0.is_some_and(|b| b.exhausted.get())
+        match self {
+            Self::Unlimited => false,
+            Self::Raster(b) | Self::Indexed(b) => b.exhausted.get(),
+        }
     }
 
     #[inline]
     pub(crate) fn room<T>(self, buf: &mut Vec<T>, extra: usize) -> bool {
-        let Some(b) = self.0 else { return true };
+        let (Self::Raster(b) | Self::Indexed(b)) = self else {
+            return true;
+        };
         if b.exhausted.get() {
             return false;
         }
@@ -63,17 +73,17 @@ impl Meter<'_> {
         let available = b.remaining.get() / size_of::<T>();
         let cap = required
             .max(buf.capacity().saturating_mul(2).max(4))
-            .min(buf.capacity().saturating_add(available));
+            .min(available);
         if cap < required {
             b.exhausted.set(true);
             return false;
         }
         let bytes = (cap - buf.capacity()) * size_of::<T>();
-        b.remaining.set(b.remaining.get() - bytes);
         if buf.try_reserve_exact(cap - buf.len()).is_err() {
             b.exhausted.set(true);
             return false;
         }
+        b.remaining.set(b.remaining.get() - bytes);
         true
     }
 }

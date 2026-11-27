@@ -14,6 +14,7 @@ pub(crate) fn estimate_render_task_cost(task: &RenderTaskType, paths: &[PathEl])
     const LAYER_COST: f32 = 10.0;
 
     match task {
+        RenderTaskType::Prepared(_) => 1.0,
         RenderTaskType::FillRect { rect, .. } => {
             // According to our benchmarks, the fast rect path is roughly
             // 5 times faster than the normal path. While it depends on the exact

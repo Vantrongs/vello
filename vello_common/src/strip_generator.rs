@@ -11,11 +11,11 @@ use crate::kurbo::{Affine, PathEl, Rect, Stroke};
 use crate::path_budget::{CapacityExceeded, Meter, PathBudget};
 use crate::peniko::Fill;
 use crate::strip::Strip;
+use crate::stroke::StrokeBuffers;
 use crate::tile::Tiles;
 use crate::util::strip_bbox;
 use crate::{flatten, rect, strip};
 use alloc::vec::Vec;
-use peniko::kurbo::StrokeCtx;
 
 /// A storage for storing strip-related data.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -84,7 +84,7 @@ pub struct StripGenerator {
     pub(crate) level: Level,
     line_buf: Vec<Line>,
     flatten_ctx: FlattenCtx,
-    stroke_ctx: StrokeCtx,
+    stroke_ctx: StrokeBuffers,
     temp_storage: StripStorage,
     tiles: Tiles,
     width: u16,
@@ -109,9 +109,86 @@ pub struct PreparedPath<'g, 'c> {
 }
 
 impl PreparedPath<'_, '_> {
+    pub(crate) fn fill_rule(&self) -> Fill {
+        self.fill
+    }
+
     /// Device-space directed edges for shading or inspection.
     pub fn edges(&self) -> &[Line] {
         &self.generator.line_buf
+    }
+
+    /// Rasterize within the additional capacity allowance. Refusal preserves all
+    /// previous strips and alpha bytes; scratch capacity remains reusable.
+    pub fn try_submit(
+        self,
+        threshold: Option<u8>,
+        storage: &mut StripStorage,
+        budget: &PathBudget,
+    ) -> Result<(), CapacityExceeded> {
+        let meter = Meter::Raster(budget);
+        let g = self.generator;
+        if meter.failed() {
+            return Err(CapacityExceeded);
+        }
+        g.tiles
+            .make_tiles_metered(g.level, &g.line_buf, g.width, g.height, meter);
+        if meter.failed() {
+            return Err(CapacityExceeded);
+        }
+        g.tiles.sort_tiles();
+        let render = |target: &mut StripStorage| {
+            strip::render_metered(
+                g.level,
+                &g.tiles,
+                &mut target.strips,
+                &mut target.alphas,
+                self.fill,
+                threshold,
+                &g.line_buf,
+                meter,
+            );
+        };
+        let start = storage.strips.len();
+        let alpha_start = storage.alphas.len();
+        if let Some(clip) = self.clip {
+            g.temp_storage.clear();
+            render(&mut g.temp_storage);
+            if !meter.failed() && within_opaque_clip(&clip, &g.temp_storage.strips) {
+                if meter.room(&mut storage.strips, g.temp_storage.strips.len())
+                    && meter.room(&mut storage.alphas, g.temp_storage.alphas.len())
+                {
+                    append_rebased(storage, &g.temp_storage);
+                }
+            } else if !meter.failed() {
+                crate::clip::intersect_metered(
+                    g.level,
+                    clip,
+                    PathDataRef {
+                        strips: &g.temp_storage.strips,
+                        alphas: &g.temp_storage.alphas,
+                        bbox: RectU16::new(0, 0, g.width, g.height),
+                        opaque_bbox: None,
+                    },
+                    storage,
+                    meter,
+                );
+            }
+        } else {
+            render(storage);
+        }
+        if meter.failed() {
+            storage.strips.truncate(start);
+            storage.alphas.truncate(alpha_start);
+            return Err(CapacityExceeded);
+        }
+        let retain = match storage.generation_mode {
+            GenerationMode::Append => start,
+            GenerationMode::Replace => 0,
+            GenerationMode::ReplaceAfter(n) => n.min(start),
+        };
+        storage.strips.drain(retain..start);
+        Ok(())
     }
 
     /// Rasterize the inspected edges into strip storage.
@@ -127,9 +204,9 @@ impl StripGenerator {
         Self {
             level,
             line_buf: Vec::new(),
-            tiles: Tiles::new(level, width, height),
+            tiles: Tiles::new(level, width, 0),
             flatten_ctx: FlattenCtx::default(),
-            stroke_ctx: StrokeCtx::default(),
+            stroke_ctx: StrokeBuffers::default(),
             temp_storage: StripStorage::default(),
             width,
             height,
@@ -156,7 +233,7 @@ impl StripGenerator {
     }
 
     /// Prepare directed edges once. The budget covers additional Vello-owned buffer
-    /// capacity. Kurbo's private stroke expansion buffers are outside this budget.
+    /// capacity, including stroke expansion.
     pub fn prepare_path<'g, 'c>(
         &'g mut self,
         path: impl IntoIterator<Item = PathEl>,
@@ -165,7 +242,7 @@ impl StripGenerator {
         clip: Option<PathDataRef<'c>>,
         budget: &PathBudget,
     ) -> Result<PreparedPath<'g, 'c>, CapacityExceeded> {
-        let meter = Meter(Some(budget));
+        let meter = Meter::Indexed(budget);
         if meter.failed() {
             return Err(CapacityExceeded);
         }
@@ -201,7 +278,7 @@ impl StripGenerator {
                     transform,
                     &mut self.line_buf,
                     &mut self.flatten_ctx,
-                    &mut self.stroke_ctx,
+                    flatten::StrokeExpansion::Vello(&mut self.stroke_ctx),
                     bbox,
                     meter,
                 );
@@ -235,6 +312,27 @@ impl StripGenerator {
         .submit(aliasing_threshold, strip_storage);
     }
 
+    /// Prepare and submit a stroke using the same edge coordinates as ordinary rasterization.
+    /// Indexed edges for sample queries are clipped to the view before rounding to f32.
+    pub fn try_generate_stroke(
+        &mut self,
+        path: impl IntoIterator<Item = PathEl>,
+        stroke: &Stroke,
+        transform: Affine,
+        threshold: Option<u8>,
+        storage: &mut StripStorage,
+        clip: Option<PathDataRef<'_>>,
+        budget: &PathBudget,
+    ) -> Result<(), CapacityExceeded> {
+        self.prepare(
+            path,
+            PathStyle::Stroke(stroke),
+            transform,
+            clip,
+            Meter::Raster(budget),
+        )
+        .try_submit(threshold, storage, budget)
+    }
     /// Generate the strips for a stroked path.
     pub fn generate_stroked_path(
         &mut self,
@@ -349,7 +447,7 @@ impl StripGenerator {
         self.width = width;
         self.height = height;
         self.line_buf.clear();
-        self.tiles.reset(width, height);
+        self.tiles.reset(width, 0);
         self.temp_storage.clear();
     }
 }

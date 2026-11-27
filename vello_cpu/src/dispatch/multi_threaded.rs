@@ -316,6 +316,11 @@ impl MultiThreadedDispatcher {
                     let num_tasks = task.allocation_group.recorded_commands.len();
                     for cmd in task.allocation_group.recorded_commands.drain(0..num_tasks) {
                         match cmd {
+                            RecordedCommand::Prepared(draw) => {
+                                let range = draw.strip_range.clone();
+                                self.recorder
+                                    .push_draw(draw, &self.strip_storage.strips[range]);
+                            }
                             RecordedCommand::RenderPath {
                                 strips: strip_range,
                                 paint,
@@ -330,7 +335,7 @@ impl MultiThreadedDispatcher {
                                 let strips =
                                     &self.strip_storage.strips[strip_range.start..strip_range.end];
                                 let draw = RecordedFill::new(
-                                    thread_id,
+                                    u16::from(thread_id),
                                     strip_range,
                                     paint.clone(),
                                     blend_mode,
@@ -413,7 +418,11 @@ impl MultiThreadedDispatcher {
 
         let alpha_slots = self.alpha_storage.take();
         {
-            let alpha_buffers = alpha_slots.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let alpha_buffers = alpha_slots
+                .iter()
+                .map(Vec::as_slice)
+                .chain([self.strip_storage.alphas.as_slice()])
+                .collect::<Vec<_>>();
             let resources = FineResources {
                 alpha_buffers: &alpha_buffers,
                 encoded_paints,
@@ -490,6 +499,37 @@ impl Dispatcher for MultiThreadedDispatcher {
         });
     }
 
+    fn try_stroke_path(
+        &mut self,
+        path: &BezPath,
+        stroke: &Stroke,
+        transform: Affine,
+        paint: Paint,
+        blend_mode: BlendMode,
+        aliasing_threshold: Option<u8>,
+        mask: Option<Mask>,
+        budget: &vello_common::path_budget::PathBudget,
+    ) -> Result<(), vello_common::path_budget::CapacityExceeded> {
+        let start = self.strip_storage.strips.len();
+        self.strip_generator.try_generate_stroke(
+            path,
+            stroke,
+            transform,
+            aliasing_threshold,
+            &mut self.strip_storage,
+            self.clip_context.get().map(|c| c.path),
+            budget,
+        )?;
+        let range = start..self.strip_storage.strips.len();
+        let draw = RecordedFill::new(self.num_threads, range.clone(), paint, blend_mode, mask);
+        if self.flushed {
+            self.recorder
+                .push_draw(draw, &self.strip_storage.strips[range]);
+        } else {
+            self.register_task(RenderTaskType::Prepared(draw));
+        }
+        Ok(())
+    }
     fn stroke_path(
         &mut self,
         path: &BezPath,
@@ -845,6 +885,7 @@ pub(crate) struct RenderTask {
 
 #[derive(Debug, Clone)]
 pub(crate) enum RenderTaskType {
+    Prepared(RecordedFill),
     FillRect {
         rect: Rect,
         paint: Paint,
@@ -886,6 +927,7 @@ pub(crate) struct RecordedCommandTask {
 
 #[derive(Debug)]
 pub(crate) enum RecordedCommand {
+    Prepared(RecordedFill),
     RenderPath {
         thread_id: u8,
         strips: Range<u32>,

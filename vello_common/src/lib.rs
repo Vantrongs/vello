@@ -64,6 +64,7 @@ pub mod blurred_rounded_rect;
 pub mod clip;
 pub(crate) mod cull;
 pub(crate) mod dash;
+pub mod edge_coverage;
 pub mod encode;
 mod expansion;
 pub(crate) mod fill_clip;
@@ -92,6 +93,7 @@ pub mod reset;
 pub mod simd;
 pub mod strip;
 pub mod strip_generator;
+mod stroke;
 pub mod target;
 pub mod tile;
 pub mod transforms;
@@ -125,6 +127,7 @@ pub mod reexports {
     pub mod cpu {
         pub use super::shared::*;
         pub use crate::pixmap::PixmapMut;
+        pub use crate::{edge_coverage, path_budget, strip_generator};
     }
 
     /// Public API types specific to Vello GPU.

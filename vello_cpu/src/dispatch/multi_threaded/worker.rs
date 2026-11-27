@@ -68,6 +68,10 @@ impl Worker {
             .drain(0..num_tasks)
         {
             match task {
+                RenderTaskType::Prepared(draw) => render_task
+                    .allocation_group
+                    .recorded_commands
+                    .push(RecordedCommand::Prepared(draw)),
                 RenderTaskType::FillRect {
                     rect,
                     paint,

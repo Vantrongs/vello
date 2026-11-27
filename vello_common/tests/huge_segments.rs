@@ -801,3 +801,122 @@ fn finite_curves_preserve_visible_coverage_and_allow_retry() {
         assert_eq!(pixels[off.1][off.0], 0, "{off:?}");
     }
 }
+
+#[test]
+fn wide_dashed_stroke_budget_boundary() {
+    use vello_common::{
+        path_budget::PathBudget,
+        strip_generator::{GenerationMode, StripGenerator, StripStorage},
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut path = BezPath::new();
+    path.move_to((5., 4.));
+    path.curve_to((90., 4.), (3., 88.), (95., 90.));
+    let style = Stroke::new(12.)
+        .with_join(Join::Round)
+        .with_dashes(1., [5., 3.]);
+    let run = |bytes: usize| {
+        let mut generator = StripGenerator::new(100, 100, Level::baseline());
+        let mut storage = StripStorage::new(GenerationMode::Append);
+        generator.generate_filled_path(
+            &path,
+            peniko::Fill::NonZero,
+            Affine::IDENTITY,
+            None,
+            &mut storage,
+            None,
+        );
+        let previous = (storage.strips.clone(), storage.alphas.clone());
+        let base = IN_USE.load(Relaxed);
+        PEAK.store(base, Relaxed);
+        let accepted = generator
+            .try_generate_stroke(
+                &path,
+                &style,
+                Affine::IDENTITY,
+                None,
+                &mut storage,
+                None,
+                &PathBudget::new(bytes),
+            )
+            .is_ok();
+        let peak = PEAK.load(Relaxed).saturating_sub(base);
+        if accepted {
+            assert!(storage.strips.len() > previous.0.len());
+        } else {
+            assert_eq!(storage.strips, previous.0);
+            assert_eq!(storage.alphas, previous.1);
+        }
+        (accepted, peak)
+    };
+    let (mut lo, mut hi) = (0usize, 1 << 20);
+    assert!(!run(lo).0 && run(hi).0);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if run(mid).0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let (ok, peak) = run(hi);
+    let (refused, rejected_peak) = run(lo);
+    assert!(ok && !refused);
+    eprintln!(
+        "wide dashed stroke accepted {hi} B (peak +{peak} B), refused {lo} B (peak +{rejected_peak} B)"
+    );
+}
+
+#[test]
+fn generated_curves_fit_the_element_line_bound() {
+    use vello_common::kurbo::{PathEl, Point, Rect};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut random = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1_u64 << 53) as f64
+    };
+    let shaped = [
+        [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)],
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 0.5), (0.0, 1.5)],
+        [(0.0, 0.0), (2.0, 1.0), (-1.0, 1.0), (1.0, 0.0)],
+        [(0.0, 0.0), (1.0, 0.0), (0.0, 0.0), (1.0, 0.0)],
+        [(0.0, 0.0), (0.0, 1.0), (0.5, 1.0), (1.5, 0.0)],
+        [(0.0, 0.0), (1.0, 0.001), (0.0, 0.002), (1.0, 0.003)],
+        [(0.0, 0.0), (1.0, 0.0), (1.0, 1e-6), (0.0, 0.0)],
+    ];
+    let mut curves = |size: f64, n: usize| {
+        let mut all: Vec<[Point; 4]> = (0..n)
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    Point::new((random() - 0.3) * size, (random() - 0.3) * size)
+                })
+            })
+            .collect();
+        all.extend(shaped.map(|c| c.map(|(x, y)| Point::new(x * size, y * size))));
+        all
+    };
+    let level = Level::new();
+
+    for size in [10.0, 1e3, 1e4, 65536.0, 131_072.0, 1e6, 1e9, 1e20] {
+        for [p0, p1, p2, p3] in curves(size, 400) {
+            for width in [100.0, 4096.0, 65535.0] {
+                let window = Rect::new(0.0, 0.0, width, width);
+                for el in [PathEl::CurveTo(p1, p2, p3), PathEl::QuadTo(p1, p2)] {
+                    let mut lines = Vec::new();
+                    fill(
+                        level,
+                        [PathEl::MoveTo(p0), el],
+                        Affine::IDENTITY,
+                        &mut lines,
+                        &mut FlattenCtx::default(),
+                        RectU16::new(0, 0, window.x1 as u16, window.y1 as u16),
+                    );
+                    assert!(lines.len() <= 4096, "{p0:?} {el:?}: {}", lines.len());
+                }
+            }
+        }
+    }
+}

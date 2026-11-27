@@ -10,9 +10,9 @@ use vello_common::record::Drawable;
 use vello_common::strip::Strip;
 use vello_common::util::strip_bbox;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RecordedFill {
-    pub(crate) thread_idx: u8,
+    pub(crate) thread_idx: u16,
     pub(crate) strip_range: Range<usize>,
     pub(crate) paint: Paint,
     pub(crate) blend_mode: BlendMode,
@@ -21,7 +21,7 @@ pub(crate) struct RecordedFill {
 
 impl RecordedFill {
     pub(crate) fn new(
-        thread_idx: u8,
+        thread_idx: u16,
         strip_range: Range<usize>,
         paint: Paint,
         blend_mode: BlendMode,

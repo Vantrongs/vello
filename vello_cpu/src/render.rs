@@ -157,6 +157,17 @@ pub struct RenderContext {
     dispatcher: Box<dyn Dispatcher>,
 }
 
+/// A synchronous stroke could not be recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StrokeError {
+    /// Preparing the path or recording its strips would exceed the supplied capacity.
+    #[error(transparent)]
+    Capacity(#[from] vello_common::path_budget::CapacityExceeded),
+    /// A per-draw filter requires a separate layer with a different raster viewport.
+    #[error("metered strokes require an unfiltered paint")]
+    ActiveFilter,
+}
+
 /// Settings to apply to the render context.
 #[derive(Copy, Clone, Debug)]
 pub struct RenderSettings {
@@ -296,6 +307,42 @@ impl RenderContext {
                 ctx.mask.clone(),
             );
         });
+    }
+
+    /// Synchronously prepare and record an unfiltered stroke within the capacity allowance.
+    /// An active filter requires a layer and cannot be drawn through this entry point.
+    pub fn try_stroke_path(
+        &mut self,
+        path: &BezPath,
+        budget: &vello_common::path_budget::PathBudget,
+    ) -> Result<(), StrokeError> {
+        if !self.paint_has_area() {
+            return Ok(());
+        }
+        if self.filter.is_some() {
+            return Err(StrokeError::ActiveFilter);
+        }
+        let paint_start = self.encoded_paints.len();
+        let Some(paint) = self.encode_current_paint() else {
+            return Ok(());
+        };
+        let transform = self
+            .root_transforms
+            .effective_path_transform(self.transforms());
+        let result = self.dispatcher.try_stroke_path(
+            path,
+            &self.state.stroke,
+            transform,
+            paint,
+            self.state.blend_mode,
+            self.aliasing_threshold,
+            self.mask.clone(),
+            budget,
+        );
+        if result.is_err() {
+            self.encoded_paints.truncate(paint_start);
+        }
+        result.map_err(Into::into)
     }
 
     /// Stroke a path.

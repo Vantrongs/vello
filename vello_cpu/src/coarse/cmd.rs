@@ -117,7 +117,7 @@ pub struct PaintFillAttrs {
     pub blend_mode: BlendMode,
     pub mask: Option<Mask>,
     pub draw_id: u32,
-    pub thread_idx: u8,
+    pub thread_idx: u16,
     /// See the comment in `CommandBucketer::bucket_commands`.
     pub origin: (u16, u16),
 }

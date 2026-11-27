@@ -329,6 +329,32 @@ impl Dispatcher for SingleThreadedDispatcher {
         self.record_fill(strip_start, paint, blend_mode, mask);
     }
 
+    fn try_stroke_path(
+        &mut self,
+        path: &BezPath,
+        stroke: &Stroke,
+        transform: Affine,
+        paint: Paint,
+        blend_mode: BlendMode,
+        aliasing_threshold: Option<u8>,
+        mask: Option<Mask>,
+        budget: &vello_common::path_budget::PathBudget,
+    ) -> Result<(), vello_common::path_budget::CapacityExceeded> {
+        let start = self.strip_storage.strips.len();
+        self.viewport.with_generator_and_clip(|generator, clip| {
+            generator.try_generate_stroke(
+                path,
+                stroke,
+                transform,
+                aliasing_threshold,
+                &mut self.strip_storage,
+                clip.map(|c| c.path),
+                budget,
+            )
+        })?;
+        self.record_fill(start, paint, blend_mode, mask);
+        Ok(())
+    }
     fn stroke_path(
         &mut self,
         path: &BezPath,

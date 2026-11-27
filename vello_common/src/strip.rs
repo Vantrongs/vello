@@ -5,6 +5,7 @@
 
 use crate::flatten::Line;
 use crate::geometry::RectU16;
+use crate::path_budget::Meter;
 use crate::peniko::Fill;
 use crate::tile::{Tile, Tiles};
 use crate::util::f32_to_u8;
@@ -296,6 +297,7 @@ impl Strip {
     ///      3. All rows vertically below the last visible tile.
     #[inline(always)]
     fn emit_culled_background<F>(
+        meter: Meter<'_>,
         start: u16,
         end: u16,
         viewport_width: u16,
@@ -309,24 +311,34 @@ impl Strip {
         windings.for_active_rows_in_range(start as usize, end as usize, |row| {
             if should_fill(windings.coarse[row]) {
                 let y_pos = row as u16 * Tile::HEIGHT;
+                if !meter.room(strips, 1) || !meter.room(alphas, 16) {
+                    return;
+                }
                 strips.push(Self::new(0, y_pos, alphas.len(), false));
                 // TODO: Would be nice to get rid of this, but the current clipping code only
                 // allows zero-width strips as a row terminator, not in-between.
                 alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
-                Self::emit_row_end(viewport_width, y_pos, true, strips, alphas);
+                Self::emit_row_end(meter, viewport_width, y_pos, true, strips, alphas);
             }
         });
     }
 
     fn emit_row_end(
+        meter: Meter<'_>,
         viewport_width: u16,
         y: u16,
         fill_gap: bool,
         strips: &mut Vec<Self>,
         alphas: &mut Vec<u8>,
     ) {
+        if meter.failed() {
+            return;
+        }
         let end = u32::from(viewport_width).next_multiple_of(u32::from(Tile::WIDTH));
         if end <= u32::from(u16::MAX) {
+            if !meter.room(strips, 1) {
+                return;
+            }
             strips.push(Self::new(end as u16, y, alphas.len(), fill_gap));
         } else if fill_gap {
             // An aligned endpoint of 65536 cannot be a strip start. Keep the
@@ -336,6 +348,9 @@ impl Strip {
                 + (Self::column_from_byte_offset(alphas.len()) - last.alpha_column());
             if alpha_end < end {
                 let last_x = u16::MAX / Tile::WIDTH * Tile::WIDTH;
+                if !meter.room(strips, 1) || !meter.room(alphas, 16) {
+                    return;
+                }
                 strips.push(Self::new(last_x, y, alphas.len(), true));
                 alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
             }
@@ -411,13 +426,35 @@ pub fn render(
     aliasing_threshold: Option<u8>,
     lines: &[Line],
 ) {
+    render_metered(
+        level,
+        tiles,
+        strip_buf,
+        alpha_buf,
+        fill_rule,
+        aliasing_threshold,
+        lines,
+        Meter::default(),
+    );
+}
+
+pub(crate) fn render_metered(
+    level: Level,
+    tiles: &Tiles,
+    strip_buf: &mut Vec<Strip>,
+    alpha_buf: &mut Vec<u8>,
+    fill_rule: Fill,
+    aliasing_threshold: Option<u8>,
+    lines: &[Line],
+    meter: Meter<'_>,
+) {
     dispatch!(level, simd => render_impl(simd,
                                          tiles,
                                          strip_buf,
                                          alpha_buf,
                                          fill_rule,
                                          aliasing_threshold,
-                                         lines));
+                                         lines, meter));
 }
 
 #[inline(always)]
@@ -429,6 +466,7 @@ fn render_impl<S: Simd>(
     fill_rule: Fill,
     aliasing_threshold: Option<u8>,
     lines: &[Line],
+    meter: Meter<'_>,
 ) {
     let row_windings = &tiles.windings.coarse;
     let has_culled_tiles = tiles.has_culled_tiles();
@@ -437,6 +475,9 @@ fn render_impl<S: Simd>(
     let maybe_emit_sentinel_strip = |strip_buf: &mut Vec<Strip>, alpha_buf: &Vec<u8>| {
         // Emit the final sentinel strip, if we produced at least one strip.
         if let Some(last_y) = strip_buf[strip_start..].last().map(|s| s.y) {
+            if !meter.room(strip_buf, 1) {
+                return;
+            }
             strip_buf.push(Strip::sentinel(last_y, alpha_buf.len()));
         }
     };
@@ -460,7 +501,11 @@ fn render_impl<S: Simd>(
         |y: u16, is_left_viewport: bool, strips: &mut Vec<Strip>, alphas: &mut Vec<u8>| {
             let coarse_wd = tiles.windings.coarse[y as usize];
 
-            if should_fill(coarse_wd) && !is_left_viewport {
+            if should_fill(coarse_wd)
+                && !is_left_viewport
+                && meter.room(strips, 1)
+                && meter.room(alphas, 16)
+            {
                 strips.push(Strip::new(0, y * Tile::HEIGHT, alphas.len(), false));
                 alphas.extend([255_u8; Tile::HEIGHT as usize * Tile::WIDTH as usize]);
             }
@@ -499,6 +544,7 @@ fn render_impl<S: Simd>(
     if has_culled_tiles {
         let row_max = prev_tile.y.min(row_windings.len() as u16);
         Strip::emit_culled_background(
+            meter,
             0,
             row_max,
             viewport_width,
@@ -527,6 +573,9 @@ fn render_impl<S: Simd>(
     );
 
     for (tile_idx, tile) in tiles.iter().copied().chain([Tile::SENTINEL]).enumerate() {
+        if meter.failed() {
+            return;
+        }
         let line = lines[tile.line_idx() as usize];
         let tile_left_x = f32::from(tile.x) * f32::from(Tile::WIDTH);
         let tile_top_y = f32::from(tile.y) * f32::from(Tile::HEIGHT);
@@ -586,6 +635,9 @@ fn render_impl<S: Simd>(
                 );
             }
 
+            if !meter.room(alpha_buf, u8_vals.as_slice().len()) {
+                return;
+            }
             alpha_buf.extend_from_slice(u8_vals.as_slice());
 
             #[expect(clippy::needless_range_loop, reason = "dimension clarity")]
@@ -601,6 +653,9 @@ fn render_impl<S: Simd>(
                 Strip::column_from_byte_offset(alpha_buf.len()) - strip.alpha_column(),
                 "The number of columns written to the alpha buffer should equal the number of columns spanned by this strip."
             );
+            if !meter.room(strip_buf, 1) {
+                return;
+            }
             strip_buf.push(strip);
 
             let is_sentinel = tile_idx == tiles.len() as usize;
@@ -609,6 +664,7 @@ fn render_impl<S: Simd>(
                 // Emit a final strip in the row if there is non-zero winding for the sparse fill
                 if winding_delta != 0 {
                     Strip::emit_row_end(
+                        meter,
                         viewport_width,
                         prev_tile.y * Tile::HEIGHT,
                         should_fill(winding_delta),
@@ -621,6 +677,7 @@ fn render_impl<S: Simd>(
                 // between the previous and current tile using the row windings.
                 if has_culled_tiles && !is_sentinel {
                     Strip::emit_culled_background(
+                        meter,
                         prev_tile.y + 1,
                         tile.y,
                         viewport_width,
@@ -825,6 +882,7 @@ fn render_impl<S: Simd>(
 
     if has_culled_tiles {
         Strip::emit_culled_background(
+            meter,
             (prev_tile.y + 1).min(row_windings.len() as u16),
             row_windings.len() as u16,
             viewport_width,
@@ -840,6 +898,7 @@ fn render_impl<S: Simd>(
 
 #[cfg(test)]
 mod tests {
+    use super::Meter;
     use super::{Strip, StripFillSegment, visit_strip_fill_segments};
     use crate::geometry::RectU16;
     use alloc::vec;
@@ -956,13 +1015,27 @@ mod tests {
     fn full_domain_row_end_keeps_last_tile_without_sentinel_alias() {
         let mut strips = vec![Strip::new(0, 0, 0, false)];
         let mut alphas = vec![255; 16];
-        Strip::emit_row_end(u16::MAX, 0, true, &mut strips, &mut alphas);
+        Strip::emit_row_end(
+            Meter::default(),
+            u16::MAX,
+            0,
+            true,
+            &mut strips,
+            &mut alphas,
+        );
         assert_eq!(strips.len(), 2);
         assert_eq!(strips[1].x, 65532);
         assert!(!strips[1].is_sentinel());
         assert!(strips[1].fill_gap());
         assert_eq!(alphas.len(), 32);
-        Strip::emit_row_end(u16::MAX, 0, true, &mut strips, &mut alphas);
+        Strip::emit_row_end(
+            Meter::default(),
+            u16::MAX,
+            0,
+            true,
+            &mut strips,
+            &mut alphas,
+        );
         assert_eq!(
             strips.len(),
             2,
