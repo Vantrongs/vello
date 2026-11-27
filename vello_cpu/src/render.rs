@@ -323,7 +323,23 @@ impl RenderContext {
             return Err(StrokeError::ActiveFilter);
         }
         let paint_start = self.encoded_paints.len();
-        let Some(paint) = self.encode_current_paint() else {
+        let paint_transform = self
+            .root_transforms
+            .effective_paint_transform(self.transforms());
+        let paint = match &self.state.paint {
+            PaintType::Solid(color) => Some((*color).into()),
+            PaintType::Gradient(gradient) => vello_common::encode::try_encode_gradient(
+                gradient,
+                &mut self.encoded_paints,
+                paint_transform,
+                budget,
+            )?,
+            PaintType::Image(image) => {
+                budget.reserve(&mut self.encoded_paints, 1)?;
+                image.encode_into(&mut self.encoded_paints, paint_transform, self.state.tint)
+            }
+        };
+        let Some(paint) = paint else {
             return Ok(());
         };
         let transform = self

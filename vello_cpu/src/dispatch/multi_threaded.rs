@@ -201,6 +201,7 @@ impl MultiThreadedDispatcher {
         let workers = self.workers.clone();
         let alpha_storage = self.alpha_storage.clone();
 
+        self.task_idx = 0;
         self.task_sender = Some(render_task_sender);
         self.recorded_command_receiver = Some(recorded_command_receiver);
 
@@ -662,7 +663,6 @@ impl Dispatcher for MultiThreadedDispatcher {
         self.strip_storage.clear();
         self.allocation_group.clear();
         self.batch_cost = 0.0;
-        self.task_idx = 0;
         self.layer_depth = 0;
         self.task_sender = None;
         self.recorded_command_receiver = None;
@@ -1059,6 +1059,50 @@ mod tests {
         assert_eq!(dispatcher.allocations.strips.entries.len(), 1);
         assert_eq!(dispatcher.allocations.render_tasks.entries.len(), 1);
         assert_eq!(dispatcher.allocations.recorded_commands.entries.len(), 1);
+    }
+
+    #[test]
+    fn batch_after_stroke_layer_flush_is_recycled_while_open() {
+        let mut dispatcher = MultiThreadedDispatcher::new(100, 100, 2, Level::new());
+        let rect = Rect::new(1., 1., 20., 20.);
+        let paint = Paint::Solid(PremulColor::from_alpha_color(BLUE));
+        dispatcher.push_layer(
+            None,
+            Fill::NonZero,
+            Affine::IDENTITY,
+            BlendMode::default(),
+            1.,
+            None,
+            None,
+            None,
+        );
+        dispatcher
+            .try_stroke_path(
+                &rect.to_path(0.1),
+                &crate::kurbo::Stroke::new(1.),
+                Affine::IDENTITY,
+                paint.clone(),
+                BlendMode::default(),
+                None,
+                None,
+                &vello_common::path_budget::PathBudget::new(1 << 20),
+            )
+            .unwrap();
+        dispatcher.fill_rect_fast(&rect, paint, BlendMode::default(), None);
+        dispatcher.flush_tasks();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dispatcher.pending_draws != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open channel did not deliver completed batch"
+            );
+            dispatcher.record_finished_commands(true);
+            std::thread::yield_now();
+        }
+        assert!(dispatcher.task_sender.is_some());
+        assert!(!dispatcher.allocations.render_tasks.entries.is_empty());
+        dispatcher.pop_layer();
+        dispatcher.flush();
     }
 
     #[test]

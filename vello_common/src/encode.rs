@@ -9,9 +9,9 @@ use crate::color::{ColorSpaceTag, HueDirection, Srgb, gradient};
 use crate::kurbo::{Affine, Point, Vec2};
 use crate::math::{FloatExt, compute_erf7};
 use crate::paint::{Image, ImageSource, IndexedPaint, Paint, PremulColor, Tint, TintMode};
+use crate::path_budget::{CapacityExceeded, Meter, PathBudget};
 use crate::peniko::{ColorStop, ColorStops, Extend, Gradient, GradientKind, ImageQuality};
 use crate::util::f32_to_u8;
-use alloc::borrow::Cow;
 use alloc::fmt::Debug;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -27,7 +27,7 @@ use peniko::{
     ImageSampler, InterpolationAlphaSpace, LinearGradientPosition, RadialGradientPosition,
     SweepGradientPosition,
 };
-use smallvec::ToSmallVec;
+
 // So we can just use `OnceCell` regardless of which feature is activated.
 #[cfg(feature = "multithreading")]
 use std::sync::OnceLock as OnceCell;
@@ -73,168 +73,174 @@ impl EncodeExt for Gradient {
         transform: Affine,
         _tint: Option<Tint>,
     ) -> Option<Paint> {
-        let inverse_transform = invert_paint_transform(transform)?;
-
-        // Make sure that the gradient is valid and not degenerate.
-        if let Err(paint) = validate(self) {
-            return Some(paint);
-        }
-
-        let mut may_have_transparency = self.stops.iter().any(|s| s.color.components[3] != 1.0);
-
-        let mut base_transform;
-
-        let mut stops = Cow::Borrowed(&self.stops.0);
-
-        let first_stop = &stops[0];
-        let last_stop = &stops[stops.len() - 1];
-
-        if first_stop.offset != 0.0 || last_stop.offset != 1.0 {
-            let mut vec = stops.to_smallvec();
-
-            if first_stop.offset != 0.0 {
-                let mut first_stop = *first_stop;
-                first_stop.offset = 0.0;
-                vec.insert(0, first_stop);
-            }
-
-            if last_stop.offset != 1.0 {
-                let mut last_stop = *last_stop;
-                last_stop.offset = 1.0;
-                vec.push(last_stop);
-            }
-
-            stops = Cow::Owned(vec);
-        }
-
-        let kind = match self.kind {
-            GradientKind::Linear(LinearGradientPosition { start: p0, end: p1 }) => {
-                // We update the transform currently in-place, such that the gradient line always
-                // starts at the point (0, 0) and ends at the point (1, 0). This simplifies the
-                // calculation for the current position along the gradient line a lot.
-                base_transform = ts_from_line_to_line(p0, p1, Point::ZERO, Point::new(1.0, 0.0));
-
-                EncodedKind::Linear(LinearKind)
-            }
-            GradientKind::Radial(RadialGradientPosition {
-                start_center: c0,
-                start_radius: r0,
-                end_center: c1,
-                end_radius: r1,
-            }) => {
-                // The implementation of radial gradients is translated from Skia.
-                // See:
-                // - <https://skia.org/docs/dev/design/conical/>
-                // - <https://github.com/google/skia/blob/main/src/shaders/gradients/SkConicalGradient.h>
-                // - <https://github.com/google/skia/blob/main/src/shaders/gradients/SkConicalGradient.cpp>
-                let d_radius = r1 - r0;
-
-                // <https://github.com/google/skia/blob/1e07a4b16973cf716cb40b72dd969e961f4dd950/src/shaders/gradients/SkConicalGradient.cpp#L83-L112>
-                let radial_kind = if ((c1 - c0).length() as f32).is_nearly_zero() {
-                    base_transform = Affine::translate((-c1.x, -c1.y));
-                    base_transform = base_transform.then_scale(1.0 / r0.max(r1) as f64);
-
-                    let scale = r1.max(r0) / d_radius;
-                    let bias = -r0 / d_radius;
-
-                    RadialKind::Radial { bias, scale }
-                } else {
-                    base_transform =
-                        ts_from_line_to_line(c0, c1, Point::ZERO, Point::new(1.0, 0.0));
-
-                    if (r1 - r0).is_nearly_zero() {
-                        let scaled_r0 = r1 / (c1 - c0).length() as f32;
-                        RadialKind::Strip {
-                            scaled_r0_squared: scaled_r0 * scaled_r0,
-                        }
-                    } else {
-                        let d_center = (c0 - c1).length() as f32;
-
-                        let focal_data =
-                            FocalData::create(r0 / d_center, r1 / d_center, &mut base_transform);
-
-                        RadialKind::focal(&focal_data)
-                    }
-                };
-
-                // Even if the gradient has no stops with transparency, we might have to force
-                // alpha-compositing in case the radial gradient is undefined in certain positions,
-                // in which case the resulting color will be transparent and thus the gradient overall
-                // must be treated as non-opaque.
-                may_have_transparency |= radial_kind.has_undefined();
-
-                EncodedKind::Radial(radial_kind)
-            }
-            GradientKind::Sweep(SweepGradientPosition {
-                center,
-                start_angle,
-                end_angle,
-            }) => {
-                // Make sure the center of the gradient falls on the origin (0, 0), to make
-                // angle calculation easier.
-                let x_offset = -center.x as f32;
-                let y_offset = -center.y as f32;
-                base_transform = Affine::translate((x_offset as f64, y_offset as f64));
-
-                EncodedKind::Sweep(SweepKind {
-                    start_angle,
-                    // Save the inverse so that we can use a multiplication in the shader instead.
-                    inv_angle_delta: 1.0 / (end_angle - start_angle),
-                })
-            }
-        };
-
-        let ranges = encode_stops(
-            &stops,
-            self.interpolation_cs,
-            self.hue_direction,
-            self.interpolation_alpha_space,
-        );
-
-        // This represents the transform that needs to be applied to the starting point of a
-        // command before starting with the rendering.
-        // First we need to account for the base transform of the shader, then
-        // we need to apply the _inverse_ paint transform to the point so that we can account
-        // for the paint transform of the render context.
-        let transform = base_transform * inverse_transform;
-
-        // One possible approach to calculating the positions would be to apply the above
-        // transform to each rendered pixel. Instead, renderers apply the transform to the first
-        // pixel of a span and then incrementally update the current x/y position.
-        //
-        // Pixels are rendered in column-major order: for a specific x, we calculate the values for
-        // all y coordinates before incrementing x. To update the position incrementally, we
-        // calculate how the transform affects the x/y unit vectors and use those as the step deltas.
-        let (x_advance, y_advance) = x_y_advances(&transform);
-
-        let cache_key = CacheKey(GradientCacheKey {
-            stops: self.stops.clone(),
-            interpolation_cs: self.interpolation_cs,
-            interpolation_alpha_space: self.interpolation_alpha_space,
-            hue_direction: self.hue_direction,
-        });
-
-        let has_undefined = kind.has_undefined();
-
-        let encoded = EncodedGradient {
-            cache_key,
-            kind,
-            has_undefined,
-            transform,
-            x_advance,
-            y_advance,
-            ranges,
-            extend: self.extend,
-            may_have_transparency,
-            u8_lut: OnceCell::new(),
-            f32_lut: OnceCell::new(),
-        };
-
-        let idx = paints.len();
-        paints.push(encoded.into());
-
-        Some(Paint::Indexed(IndexedPaint::new(idx)))
+        encode_gradient(self, paints, transform, Meter::Unlimited).unwrap()
     }
+}
+
+/// Encode a gradient while charging the stop, range and paint storage to `budget`.
+pub fn try_encode_gradient(
+    gradient: &Gradient,
+    paints: &mut Vec<EncodedPaint>,
+    transform: Affine,
+    budget: &PathBudget,
+) -> Result<Option<Paint>, CapacityExceeded> {
+    encode_gradient(gradient, paints, transform, Meter::Raster(budget))
+}
+
+fn encode_gradient(
+    gradient: &Gradient,
+    paints: &mut Vec<EncodedPaint>,
+    transform: Affine,
+    meter: Meter<'_>,
+) -> Result<Option<Paint>, CapacityExceeded> {
+    let Some(inverse_transform) = invert_paint_transform(transform) else {
+        return Ok(None);
+    };
+    if let Err(paint) = validate(gradient) {
+        return Ok(Some(paint));
+    }
+    let mut may_have_transparency = gradient.stops.iter().any(|s| s.color.components[3] != 1.0);
+    let mut base_transform;
+    let kind = match gradient.kind {
+        GradientKind::Linear(LinearGradientPosition { start: p0, end: p1 }) => {
+            // We update the transform currently in-place, such that the gradient line always
+            // starts at the point (0, 0) and ends at the point (1, 0). This simplifies the
+            // calculation for the current position along the gradient line a lot.
+            base_transform = ts_from_line_to_line(p0, p1, Point::ZERO, Point::new(1.0, 0.0));
+
+            EncodedKind::Linear(LinearKind)
+        }
+        GradientKind::Radial(RadialGradientPosition {
+            start_center: c0,
+            start_radius: r0,
+            end_center: c1,
+            end_radius: r1,
+        }) => {
+            // The implementation of radial gradients is translated from Skia.
+            // See:
+            // - <https://skia.org/docs/dev/design/conical/>
+            // - <https://github.com/google/skia/blob/main/src/shaders/gradients/SkConicalGradient.h>
+            // - <https://github.com/google/skia/blob/main/src/shaders/gradients/SkConicalGradient.cpp>
+            let d_radius = r1 - r0;
+
+            // <https://github.com/google/skia/blob/1e07a4b16973cf716cb40b72dd969e961f4dd950/src/shaders/gradients/SkConicalGradient.cpp#L83-L112>
+            let radial_kind = if ((c1 - c0).length() as f32).is_nearly_zero() {
+                base_transform = Affine::translate((-c1.x, -c1.y));
+                base_transform = base_transform.then_scale(1.0 / r0.max(r1) as f64);
+
+                let scale = r1.max(r0) / d_radius;
+                let bias = -r0 / d_radius;
+
+                RadialKind::Radial { bias, scale }
+            } else {
+                base_transform = ts_from_line_to_line(c0, c1, Point::ZERO, Point::new(1.0, 0.0));
+
+                if (r1 - r0).is_nearly_zero() {
+                    let scaled_r0 = r1 / (c1 - c0).length() as f32;
+                    RadialKind::Strip {
+                        scaled_r0_squared: scaled_r0 * scaled_r0,
+                    }
+                } else {
+                    let d_center = (c0 - c1).length() as f32;
+
+                    let focal_data =
+                        FocalData::create(r0 / d_center, r1 / d_center, &mut base_transform);
+
+                    RadialKind::focal(&focal_data)
+                }
+            };
+
+            // Even if the gradient has no stops with transparency, we might have to force
+            // alpha-compositing in case the radial gradient is undefined in certain positions,
+            // in which case the resulting color will be transparent and thus the gradient overall
+            // must be treated as non-opaque.
+            may_have_transparency |= radial_kind.has_undefined();
+
+            EncodedKind::Radial(radial_kind)
+        }
+        GradientKind::Sweep(SweepGradientPosition {
+            center,
+            start_angle,
+            end_angle,
+        }) => {
+            // Make sure the center of the gradient falls on the origin (0, 0), to make
+            // angle calculation easier.
+            let x_offset = -center.x as f32;
+            let y_offset = -center.y as f32;
+            base_transform = Affine::translate((x_offset as f64, y_offset as f64));
+
+            EncodedKind::Sweep(SweepKind {
+                start_angle,
+                // Save the inverse so that we can use a multiplication in the shader instead.
+                inv_angle_delta: 1.0 / (end_angle - start_angle),
+            })
+        }
+    };
+
+    let ranges = encode_stops(
+        &gradient.stops,
+        gradient.interpolation_cs,
+        gradient.hue_direction,
+        gradient.interpolation_alpha_space,
+        meter,
+    )?;
+
+    // This represents the transform that needs to be applied to the starting point of a
+    // command before starting with the rendering.
+    // First we need to account for the base transform of the shader, then
+    // we need to apply the _inverse_ paint transform to the point so that we can account
+    // for the paint transform of the render context.
+    let transform = base_transform * inverse_transform;
+
+    // One possible approach to calculating the positions would be to apply the above
+    // transform to each rendered pixel. Instead, renderers apply the transform to the first
+    // pixel of a span and then incrementally update the current x/y position.
+    //
+    // Pixels are rendered in column-major order: for a specific x, we calculate the values for
+    // all y coordinates before incrementing x. To update the position incrementally, we
+    // calculate how the transform affects the x/y unit vectors and use those as the step deltas.
+    let (x_advance, y_advance) = x_y_advances(&transform);
+
+    let stops = if gradient.stops.len() > gradient.stops.0.inline_size() {
+        let mut copy = Vec::new();
+        if !meter.room(&mut copy, gradient.stops.len()) {
+            return Err(CapacityExceeded);
+        }
+        copy.extend_from_slice(&gradient.stops);
+        ColorStops(smallvec::SmallVec::from_vec(copy))
+    } else {
+        gradient.stops.clone()
+    };
+    let cache_key = CacheKey(GradientCacheKey {
+        stops,
+        interpolation_cs: gradient.interpolation_cs,
+        interpolation_alpha_space: gradient.interpolation_alpha_space,
+        hue_direction: gradient.hue_direction,
+    });
+
+    let has_undefined = kind.has_undefined();
+
+    let encoded = EncodedGradient {
+        cache_key,
+        kind,
+        has_undefined,
+        transform,
+        x_advance,
+        y_advance,
+        ranges,
+        extend: gradient.extend,
+        may_have_transparency,
+        u8_lut: OnceCell::new(),
+        f32_lut: OnceCell::new(),
+    };
+
+    let idx = paints.len();
+    if !meter.room(paints, 1) {
+        return Err(CapacityExceeded);
+    }
+    paints.push(encoded.into());
+
+    Ok(Some(Paint::Indexed(IndexedPaint::new(idx))))
 }
 
 /// Returns a fallback paint in case the gradient is invalid.
@@ -332,7 +338,8 @@ fn encode_stops(
     cs: ColorSpaceTag,
     hue_dir: HueDirection,
     interpolation_alpha_space: InterpolationAlphaSpace,
-) -> Vec<GradientRange> {
+    meter: Meter<'_>,
+) -> Result<Vec<GradientRange>, CapacityExceeded> {
     #[derive(Debug)]
     struct EncodedColorStop {
         offset: f32,
@@ -372,77 +379,61 @@ fn encode_stops(
         }
     };
 
-    // Create additional (SRGB-encoded) stops in-between to approximate the color space we want to
-    // interpolate in.
-    if cs != ColorSpaceTag::Srgb {
-        let interpolated_stops = if interpolation_alpha_space
-            == InterpolationAlphaSpace::Premultiplied
-        {
-            stops
-                .windows(2)
-                .flat_map(|s| {
-                    let left_stop = &s[0];
-                    let right_stop = &s[1];
-
-                    let interpolated =
-                        gradient::<Srgb>(left_stop.color, right_stop.color, cs, hue_dir, 0.01);
-
-                    interpolated.map(|st| EncodedColorStop {
-                        offset: left_stop.offset + (right_stop.offset - left_stop.offset) * st.0,
-                        color: st.1.un_premultiply(),
-                    })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            stops
-                .windows(2)
-                .flat_map(|s| {
-                    let left_stop = &s[0];
-                    let right_stop = &s[1];
-
-                    let interpolated = gradient_unpremultiplied::<Srgb>(
-                        left_stop.color,
-                        right_stop.color,
-                        cs,
-                        hue_dir,
-                        0.01,
-                    );
-
-                    interpolated.map(|st| EncodedColorStop {
-                        offset: left_stop.offset + (right_stop.offset - left_stop.offset) * st.0,
-                        color: st.1,
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-
-        interpolated_stops
-            .windows(2)
-            .map(|s| {
-                let left_stop = &s[0];
-                let right_stop = &s[1];
-
-                create_range(left_stop, right_stop)
-            })
-            .collect()
-    } else {
-        stops
-            .windows(2)
-            .map(|c| {
-                let c0 = EncodedColorStop {
-                    offset: c[0].offset,
-                    color: c[0].color.to_alpha_color::<Srgb>(),
-                };
-
-                let c1 = EncodedColorStop {
-                    offset: c[1].offset,
-                    color: c[1].color.to_alpha_color::<Srgb>(),
-                };
-
-                create_range(&c0, &c1)
-            })
-            .collect()
+    let first = stops[0];
+    let last = stops[stops.len() - 1];
+    let pairs = (first.offset != 0.)
+        .then_some([
+            ColorStop {
+                offset: 0.,
+                ..first
+            },
+            first,
+        ])
+        .into_iter()
+        .chain(stops.windows(2).map(|s| [s[0], s[1]]))
+        .chain((last.offset != 1.).then_some([last, ColorStop { offset: 1., ..last }]));
+    let mut ranges = Vec::new();
+    let count = stops.len() - 1 + usize::from(first.offset != 0.) + usize::from(last.offset != 1.);
+    if !meter.room(&mut ranges, count) {
+        return Err(CapacityExceeded);
     }
+    ranges.reserve_exact(count);
+    let mut previous = None;
+    for [left, right] in pairs {
+        if cs == ColorSpaceTag::Srgb {
+            let stop = |s: ColorStop| EncodedColorStop {
+                offset: s.offset,
+                color: s.color.to_alpha_color::<Srgb>(),
+            };
+            ranges.push(create_range(&stop(left), &stop(right)));
+        } else {
+            let mut append = |t, color| {
+                let stop = EncodedColorStop {
+                    offset: left.offset + (right.offset - left.offset) * t,
+                    color,
+                };
+                if let Some(prev) = previous.replace(stop) {
+                    if !meter.room(&mut ranges, 1) {
+                        return Err(CapacityExceeded);
+                    }
+                    ranges.push(create_range(&prev, previous.as_ref().unwrap()));
+                }
+                Ok(())
+            };
+            if interpolation_alpha_space == InterpolationAlphaSpace::Premultiplied {
+                for (t, color) in gradient::<Srgb>(left.color, right.color, cs, hue_dir, 0.01) {
+                    append(t, color.un_premultiply())?;
+                }
+            } else {
+                for (t, color) in
+                    gradient_unpremultiplied::<Srgb>(left.color, right.color, cs, hue_dir, 0.01)
+                {
+                    append(t, color)?;
+                }
+            }
+        }
+    }
+    Ok(ranges)
 }
 
 pub(crate) fn x_y_advances(transform: &Affine) -> (Vec2, Vec2) {

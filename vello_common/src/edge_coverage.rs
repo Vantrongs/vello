@@ -20,6 +20,10 @@ pub trait EdgeBudget {
     fn remaining_bytes(&self) -> usize;
     /// Reserve work and storage, returning false if the query should stop.
     fn admit(&mut self, work: u64, bytes: usize) -> bool;
+    /// Account for capacity already allocated within the last remaining-byte allowance.
+    fn allocated(&mut self, bytes: usize) -> bool {
+        self.admit(0, bytes)
+    }
 }
 
 /// Intersection of paths indexed by whole device rows.
@@ -559,7 +563,7 @@ impl CanvasLines {
             None,
             &capacity,
         )?;
-        if !meter.admit(0, available - capacity.remaining()) {
+        if !meter.allocated(available - capacity.remaining()) {
             return Err(CapacityExceeded);
         }
         prepared.index_edges(self.origin, rows, meter)

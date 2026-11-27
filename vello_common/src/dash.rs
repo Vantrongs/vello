@@ -104,10 +104,10 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
                 active |= paints;
             }
         }
-        end += length;
         if !meter.room(&mut pattern, 1) {
             break;
         }
+        end += length;
         pattern.push(Entry {
             length,
             end,
@@ -115,7 +115,7 @@ pub(crate) fn dash<'a, T: Iterator<Item = (PathEl, bool)>>(
         });
     }
     let period = end;
-    let (dash_ix, dash_remaining) = if pattern.is_empty() {
+    let (dash_ix, dash_remaining) = if meter.failed() || pattern.is_empty() {
         (0, 0.)
     } else {
         let offset = dash_offset.rem_euclid(period) - phase_shift;
@@ -1115,5 +1115,21 @@ mod tests {
         assert!(a.windows(2).any(|w| w == whole), "{a:?}");
         let b = kurbo(&p, 4.0, &dashes);
         same_dashes_in_view(&a, &b, Line::new((0.0, 50.0), (0.0, 100.0)), 1e-6);
+    }
+
+    #[test]
+    fn phase_beyond_an_admitted_prefix_stops_the_iterator() {
+        let budget = crate::path_budget::PathBudget::new(4 * size_of::<Entry>());
+        let mut iter = dash(
+            core::iter::empty(),
+            4.5,
+            &[1.; 8],
+            Affine::IDENTITY,
+            false,
+            Meter::Raster(&budget),
+        );
+        assert_eq!(iter.dashes.len(), 4);
+        assert!(iter.meter.failed());
+        assert_eq!(iter.next(), None);
     }
 }

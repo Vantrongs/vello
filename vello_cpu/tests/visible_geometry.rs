@@ -1016,6 +1016,64 @@ fn refused_stroke_leaves_prior_paint_and_can_be_retried() {
 }
 
 #[test]
+fn partial_dash_table_refuses_before_selecting_phase() {
+    use vello_cpu::{StrokeError, kurbo::Stroke, path_budget::PathBudget};
+    let path = Rect::new(12., 13., 84., 92.).to_path(0.1);
+    for width in [0.25, 7.] {
+        let setup = |ctx: &mut RenderContext| {
+            ctx.fill_rect(&Rect::new(0., 0., 8., 8.));
+            ctx.set_stroke(Stroke::new(width).with_dashes(4.5, [1.; 16]));
+        };
+        let refuse = |ctx: &mut RenderContext| {
+            setup(ctx);
+            assert!(matches!(
+                ctx.try_stroke_path(&path, &PathBudget::new(96)),
+                Err(StrokeError::Capacity(_))
+            ));
+        };
+        assert_eq!(draw(refuse), draw(setup));
+        assert_eq!(
+            draw(|ctx| {
+                refuse(ctx);
+                ctx.try_stroke_path(&path, &PathBudget::new(1 << 20))
+                    .unwrap();
+            }),
+            draw(|ctx| {
+                setup(ctx);
+                ctx.stroke_path(&path);
+            })
+        );
+    }
+}
+
+#[test]
+fn refused_indexed_paint_does_not_allocate() {
+    use vello_cpu::{StrokeError, path_budget::PathBudget, peniko::Gradient};
+    let path = Rect::new(12., 13., 84., 92.).to_path(0.1);
+    let prior = |ctx: &mut RenderContext| ctx.fill_rect(&Rect::new(0., 0., 8., 8.));
+    for image in [false, true] {
+        let actual = draw(|ctx| {
+            prior(ctx);
+            if image {
+                ctx.set_paint(vello_cpu::Image {
+                    image: vello_cpu::ImageSource::Pixmap(std::sync::Arc::new(Pixmap::new(1, 1))),
+                    sampler: Default::default(),
+                });
+            } else {
+                let stops: Vec<_> = (0..32).map(|i| (i as f32 / 31., BLACK)).collect();
+                ctx.set_paint(
+                    Gradient::new_linear((0., 0.), (8., 0.)).with_stops(stops.as_slice()),
+                );
+            }
+            let (result, stats) = measure(|| ctx.try_stroke_path(&path, &PathBudget::new(0)));
+            assert!(matches!(result, Err(StrokeError::Capacity(_))));
+            assert_eq!(stats.peak, 0);
+        });
+        assert_eq!(actual, draw(prior));
+    }
+}
+
+#[test]
 fn failed_tile_or_strip_growth_preserves_every_storage_mode() {
     use vello_cpu::{
         Level,
